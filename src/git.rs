@@ -33,6 +33,11 @@ fn git_ok(dir: &Path, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// The URL of the repo's `origin` remote.
+pub fn remote_url(repo: &Path) -> Result<String> {
+    Ok(git(repo, &["remote", "get-url", "origin"])?.trim().to_string())
+}
+
 /// Fetch the latest refs from origin.
 pub fn fetch(repo: &Path) -> Result<()> {
     git(repo, &["fetch", "origin"]).map(|_| ())

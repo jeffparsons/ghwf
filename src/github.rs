@@ -5,25 +5,29 @@ use anyhow::{anyhow, bail, Context, Result};
 use url::Url;
 
 use crate::models::{Comment, Issue};
+use crate::{config, git};
+
+/// The `(owner, repo)` a command should operate on, when known from `ghwf.toml`.
+pub type RepoRef = (String, String);
 
 /// Fetch an issue (or PR) by number or full GitHub URL.
-pub fn fetch_issue(issue: &str) -> Result<Issue> {
-    let endpoint = issue_endpoint(issue)?;
+pub fn fetch_issue(issue: &str, config_repo: Option<&RepoRef>) -> Result<Issue> {
+    let endpoint = issue_endpoint(issue, config_repo)?;
     let json = gh_api(&[&endpoint])?;
     serde_json::from_str(&json).context("failed to parse issue JSON from `gh api`")
 }
 
 /// Fetch the conversation comments on an issue (or PR), following pagination.
-pub fn fetch_comments(issue: &str) -> Result<Vec<Comment>> {
-    let endpoint = format!("{}/comments", issue_endpoint(issue)?);
+pub fn fetch_comments(issue: &str, config_repo: Option<&RepoRef>) -> Result<Vec<Comment>> {
+    let endpoint = format!("{}/comments", issue_endpoint(issue, config_repo)?);
     // `--paginate` follows `Link` headers and merges the paged JSON arrays into one.
     let json = gh_api(&["--paginate", &endpoint])?;
     serde_json::from_str(&json).context("failed to parse comments JSON from `gh api`")
 }
 
 /// Post a comment to an issue's (or PR's) conversation thread.
-pub fn post_issue_comment(issue: &str, body: &str) -> Result<Comment> {
-    let endpoint = format!("{}/comments", issue_endpoint(issue)?);
+pub fn post_issue_comment(issue: &str, body: &str, config_repo: Option<&RepoRef>) -> Result<Comment> {
+    let endpoint = format!("{}/comments", issue_endpoint(issue, config_repo)?);
     // Send the request body as JSON on stdin so the comment text needs no shell
     // escaping; `gh` forwards it verbatim as the POST body.
     let payload = serde_json::json!({ "body": body }).to_string();
@@ -32,6 +36,34 @@ pub fn post_issue_comment(issue: &str, body: &str) -> Result<Comment> {
         &payload,
     )?;
     serde_json::from_str(&json).context("failed to parse created-comment JSON from `gh api`")
+}
+
+/// The `(owner, repo)` declared by a discovered `ghwf.toml`, derived from the
+/// configured repo's `origin` URL. `None` when there is no config.
+pub fn config_repo() -> Result<Option<RepoRef>> {
+    let Some(located) = config::find()? else {
+        return Ok(None);
+    };
+    let url = git::remote_url(&located.main_repo_path())?;
+    Ok(Some(parse_remote_url(&url)?))
+}
+
+/// Parse `(owner, repo)` from a GitHub remote URL, handling the SSH
+/// (`git@github.com:owner/repo.git`) and HTTPS (`https://github.com/owner/repo`)
+/// forms.
+fn parse_remote_url(url: &str) -> Result<RepoRef> {
+    let (_, after) = url
+        .trim()
+        .split_once("github.com")
+        .with_context(|| format!("`{url}` is not a github.com remote"))?;
+    let path = after.trim_start_matches([':', '/']);
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    match path.split_once('/') {
+        Some((owner, repo)) if !owner.is_empty() && !repo.is_empty() => {
+            Ok((owner.to_string(), repo.trim_end_matches('/').to_string()))
+        }
+        _ => bail!("could not parse owner/repo from remote `{url}`"),
+    }
 }
 
 /// Extract `(owner, repo)` from an issue's (or PR's) `html_url`.
@@ -113,11 +145,16 @@ pub fn create_draft_pr(
 
 /// Resolve an issue argument to a `gh api` issues endpoint path.
 ///
-/// A bare number is left for `gh` to resolve against the current repo via its
-/// `{owner}`/`{repo}` placeholders; a full URL is parsed into owner/repo/number.
-fn issue_endpoint(arg: &str) -> Result<String> {
-    if arg.parse::<u64>().is_ok() {
-        return Ok(format!("repos/{{owner}}/{{repo}}/issues/{arg}"));
+/// When a `ghwf.toml` is in effect (`config_repo` is `Some`) it is the source of
+/// truth: a bare number resolves against it, and a URL for a *different* repo is
+/// rejected. Without a config, a bare number is left for `gh` to resolve against
+/// the current repo via its `{owner}`/`{repo}` placeholders.
+fn issue_endpoint(arg: &str, config_repo: Option<&RepoRef>) -> Result<String> {
+    if let Ok(number) = arg.parse::<u64>() {
+        return Ok(match config_repo {
+            Some((owner, repo)) => format!("repos/{owner}/{repo}/issues/{number}"),
+            None => format!("repos/{{owner}}/{{repo}}/issues/{number}"),
+        });
     }
 
     let url = Url::parse(arg)
@@ -136,6 +173,16 @@ fn issue_endpoint(arg: &str) -> Result<String> {
     // Expect `/owner/repo/issues/number`.
     match segments.as_slice() {
         [owner, repo, "issues", number] if number.parse::<u64>().is_ok() => {
+            if let Some((cfg_owner, cfg_repo)) = config_repo {
+                // ghwf.toml is a hard boundary: refuse URLs for a different repo.
+                // TODO: allow an allowlist of alternative repos in ghwf.toml.
+                if !owner.eq_ignore_ascii_case(cfg_owner) || !repo.eq_ignore_ascii_case(cfg_repo) {
+                    bail!(
+                        "issue URL points at {owner}/{repo}, but ghwf.toml configures \
+                         {cfg_owner}/{cfg_repo}; ghwf only operates on the configured repo."
+                    );
+                }
+            }
             Ok(format!("repos/{owner}/{repo}/issues/{number}"))
         }
         _ => bail!("`{arg}` is not a github.com issue URL of the form owner/repo/issues/number"),
@@ -202,4 +249,32 @@ fn gh_api_stdin(args: &[&str], input: &str) -> Result<String> {
     }
 
     String::from_utf8(output.stdout).context("`gh api` returned non-UTF-8 output")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_remote_url;
+
+    #[test]
+    fn remote_url_ssh() {
+        let (owner, repo) = parse_remote_url("git@github.com:jeffparsons/ghwf.git").unwrap();
+        assert_eq!((owner.as_str(), repo.as_str()), ("jeffparsons", "ghwf"));
+    }
+
+    #[test]
+    fn remote_url_https_with_git_suffix() {
+        let (owner, repo) = parse_remote_url("https://github.com/jeffparsons/ghwf.git").unwrap();
+        assert_eq!((owner.as_str(), repo.as_str()), ("jeffparsons", "ghwf"));
+    }
+
+    #[test]
+    fn remote_url_https_no_suffix() {
+        let (owner, repo) = parse_remote_url("https://github.com/jeffparsons/ghwf").unwrap();
+        assert_eq!((owner.as_str(), repo.as_str()), ("jeffparsons", "ghwf"));
+    }
+
+    #[test]
+    fn remote_url_non_github_errors() {
+        assert!(parse_remote_url("git@gitlab.com:foo/bar.git").is_err());
+    }
 }

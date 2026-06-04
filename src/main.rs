@@ -51,8 +51,10 @@ fn main() -> Result<()> {
 }
 
 fn work_on(issue: &str, no_branch: bool) -> Result<()> {
-    let issue_data = github::fetch_issue(issue)?;
-    let comments = github::fetch_comments(issue)?;
+    // A discovered ghwf.toml is the source of truth for which repo to operate on.
+    let repo_ctx = github::config_repo()?;
+    let issue_data = github::fetch_issue(issue, repo_ctx.as_ref())?;
+    let comments = github::fetch_comments(issue, repo_ctx.as_ref())?;
     let (owner, repo) = github::parse_owner_repo(&issue_data.html_url)?;
     let number = issue_data.number;
 
@@ -178,8 +180,9 @@ fn create_issue_comment(issue: &str) -> Result<()> {
         _ => None,
     };
 
+    let repo_ctx = github::config_repo()?;
     let body = render::build_comment_body(&user_body, token.as_deref());
-    let comment = github::post_issue_comment(issue, &body)?;
+    let comment = github::post_issue_comment(issue, &body, repo_ctx.as_ref())?;
     println!("{}", render::comment_json(&comment)?);
     Ok(())
 }
