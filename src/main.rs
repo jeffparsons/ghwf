@@ -1,5 +1,8 @@
+mod config;
+mod git;
 mod github;
 mod models;
+mod prep;
 mod render;
 mod seen;
 mod state;
@@ -21,12 +24,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Fetch a GitHub issue and its conversation comments, as normalized JSON.
-    ///
-    /// Will soon do something more useful than that.
+    /// Advance the workflow on an issue and report what's new and what to do next.
     WorkOn {
         /// An issue number (resolved against the current repo) or a full GitHub issue URL.
         issue: String,
+        /// Work without a dedicated branch/worktree/PR (just write the plan file).
+        #[arg(long)]
+        no_branch: bool,
     },
     /// Post a comment to an issue (or PR), reading the body from stdin.
     ///
@@ -41,23 +45,41 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::WorkOn { issue } => work_on(&issue),
+        Commands::WorkOn { issue, no_branch } => work_on(&issue, no_branch),
         Commands::CreateIssueComment { issue } => create_issue_comment(&issue),
     }
 }
 
-fn work_on(issue: &str) -> Result<()> {
+fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     let issue_data = github::fetch_issue(issue)?;
     let comments = github::fetch_comments(issue)?;
     let (owner, repo) = github::parse_owner_repo(&issue_data.html_url)?;
     let number = issue_data.number;
 
-    // Advance the workflow phase if the user has posted a new `/proceed` directive.
-    let (phase, transition) = advance_phase(&owner, &repo, number, &comments)?;
+    // Load the issue's workflow state once; mutate and save it at the end.
+    let mut issue_state = state::load(&owner, &repo, number)?;
+    let transition = advance_phase(&mut issue_state, &comments);
 
-    // Identify this Claude session so we can scope the cache and suppress our own
-    // comments. Without a session (run outside Claude Code) we show everything and
-    // persist nothing.
+    // The phase-specific body. The prep-and-plan phase does real work here, and
+    // hard-errors if it needs a config that's missing.
+    let phase = issue_state.phase;
+    let body = match phase {
+        state::Phase::PrePlan => render::PRE_PLAN_BODY.to_string(),
+        state::Phase::PrepAndPlan => {
+            prep::run(&issue_data, &owner, &repo, number, no_branch, &mut issue_state)?
+        }
+        state::Phase::Implement => render::IMPLEMENT_BODY.to_string(),
+    };
+
+    // We didn't hard-need a config (or we'd have errored above); still nudge if
+    // it's absent.
+    config::warn_if_absent();
+
+    state::save(&owner, &repo, number, &issue_state)?;
+
+    // Identify this Claude session so we can scope the seen cache and suppress our
+    // own comments. Without a session (run outside Claude Code) we show everything
+    // and persist nothing.
     let session_id = match std::env::var(store::SESSION_ID_ENV) {
         Ok(id) if !id.is_empty() => Some(id),
         _ => None,
@@ -92,7 +114,7 @@ fn work_on(issue: &str) -> Result<()> {
         }
     }
 
-    println!("{}", render::render_phase_banner(phase, transition));
+    println!("{}", render::render_phase_banner(phase, transition, &body));
     println!();
     println!("{}", render::render_work_on(&issue_data, issue_changed, &new));
 
@@ -112,16 +134,11 @@ fn work_on(issue: &str) -> Result<()> {
 }
 
 /// Process any new `/proceed` directives in the comments, advancing the issue's
-/// phase accordingly. Returns the resulting phase and a description of the
-/// transition if one happened this run.
-type Transition = (state::Phase, state::Phase, Option<String>);
+/// phase in `issue_state`. Returns a description of the transition if one happened.
 fn advance_phase(
-    owner: &str,
-    repo: &str,
-    number: u64,
+    issue_state: &mut state::IssueState,
     comments: &[models::Comment],
-) -> Result<(state::Phase, Option<Transition>)> {
-    let mut issue_state = state::load(owner, repo, number)?;
+) -> Option<(state::Phase, state::Phase, Option<String>)> {
     let initial = issue_state.phase;
     let mut trigger = None;
 
@@ -143,11 +160,7 @@ fn advance_phase(
         }
     }
 
-    let transition =
-        (issue_state.phase != initial).then_some((initial, issue_state.phase, trigger));
-    let phase = issue_state.phase;
-    state::save(owner, repo, number, &issue_state)?;
-    Ok((phase, transition))
+    (issue_state.phase != initial).then_some((initial, issue_state.phase, trigger))
 }
 
 fn create_issue_comment(issue: &str) -> Result<()> {

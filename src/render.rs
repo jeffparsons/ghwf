@@ -53,11 +53,25 @@ pub fn strip_ghwf_marker(body: &str) -> String {
     }
 }
 
-/// Render the phase banner shown atop `work-on` output: the current phase, what
-/// Claude should do in it, and a note when a transition just happened.
+/// Guidance shown to Claude during the pre-plan phase.
+pub const PRE_PLAN_BODY: &str =
+    "Pre-plan — gathering the information needed to write a plan.\n\n\
+     Discuss on the issue itself. Post questions and clarifications as comments with \
+     `ghwf create-issue-comment <issue>`. When you have enough information, post a comment \
+     that summarises your understanding and clearly states you are ready to write a plan.\n\n\
+     Do not start planning or advance the workflow yourself. Wait for the user to comment \
+     `/proceed` on the issue; ghwf will then advance to the prep-and-plan phase.";
+
+/// Guidance shown during the implement phase (not yet implemented).
+pub const IMPLEMENT_BODY: &str =
+    "Implement is not yet implemented in ghwf — coming in a later commit.";
+
+/// Render the phase banner shown atop `work-on` output: the current phase, an
+/// optional transition note, then the phase-specific `body`.
 pub fn render_phase_banner(
     phase: Phase,
     transition: Option<(Phase, Phase, Option<String>)>,
+    body: &str,
 ) -> String {
     let mut out = format!("Phase: {}", phase.label());
 
@@ -73,23 +87,7 @@ pub fn render_phase_banner(
     }
 
     out.push_str("\n\n");
-    out.push_str(match phase {
-        Phase::PrePlan => {
-            "Pre-plan — gathering the information needed to write a plan.\n\n\
-             Discuss on the issue itself. Post questions and clarifications as comments with \
-             `ghwf create-issue-comment <issue>`. When you have enough information, post a comment \
-             that summarises your understanding and clearly states you are ready to write a plan.\n\n\
-             Do not start planning or advance the workflow yourself. Wait for the user to comment \
-             `/proceed` on the issue; ghwf will then advance to the prep-and-plan phase."
-        }
-        Phase::PrepAndPlan => {
-            "Prep-and-plan is not yet implemented in ghwf — coming in a later commit."
-        }
-        Phase::Implement => {
-            "Implement is not yet implemented in ghwf — coming in a later commit."
-        }
-    });
-
+    out.push_str(body);
     out
 }
 
