@@ -1,4 +1,5 @@
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
 use url::Url;
@@ -18,6 +19,19 @@ pub fn fetch_comments(issue: &str) -> Result<Vec<Comment>> {
     // `--paginate` follows `Link` headers and merges the paged JSON arrays into one.
     let json = gh_api(&["--paginate", &endpoint])?;
     serde_json::from_str(&json).context("failed to parse comments JSON from `gh api`")
+}
+
+/// Post a comment to an issue's (or PR's) conversation thread.
+pub fn post_issue_comment(issue: &str, body: &str) -> Result<Comment> {
+    let endpoint = format!("{}/comments", issue_endpoint(issue)?);
+    // Send the request body as JSON on stdin so the comment text needs no shell
+    // escaping; `gh` forwards it verbatim as the POST body.
+    let payload = serde_json::json!({ "body": body }).to_string();
+    let json = gh_api_stdin(
+        &["--method", "POST", &endpoint, "--input", "-"],
+        &payload,
+    )?;
+    serde_json::from_str(&json).context("failed to parse created-comment JSON from `gh api`")
 }
 
 /// Resolve an issue argument to a `gh api` issues endpoint path.
@@ -58,6 +72,37 @@ fn gh_api(args: &[&str]) -> Result<String> {
         .args(args)
         .output()
         .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("`gh api {}` failed:\n{}", args.join(" "), stderr.trim());
+    }
+
+    String::from_utf8(output.stdout).context("`gh api` returned non-UTF-8 output")
+}
+
+/// Run `gh api` with the given trailing arguments, feeding `input` on stdin, and
+/// return its stdout.
+fn gh_api_stdin(args: &[&str], input: &str) -> Result<String> {
+    let mut child = Command::new("gh")
+        .arg("api")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("failed to open stdin for `gh`"))?
+        .write_all(input.as_bytes())
+        .context("failed to write request body to `gh`")?;
+
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for `gh` to finish")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
