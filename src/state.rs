@@ -40,6 +40,7 @@ pub enum Phase {
     PrePlan,
     PrepAndPlan,
     Implement,
+    Review,
 }
 
 impl Phase {
@@ -48,7 +49,8 @@ impl Phase {
         match self {
             Phase::PrePlan => Some(Phase::PrepAndPlan),
             Phase::PrepAndPlan => Some(Phase::Implement),
-            Phase::Implement => None,
+            Phase::Implement => Some(Phase::Review),
+            Phase::Review => None,
         }
     }
 
@@ -58,6 +60,7 @@ impl Phase {
             Phase::PrePlan => "pre-plan",
             Phase::PrepAndPlan => "prep-and-plan",
             Phase::Implement => "implement",
+            Phase::Review => "review",
         }
     }
 }
@@ -87,6 +90,10 @@ pub struct PrepState {
     pub worktree_path: Option<PathBuf>,
     // The draft PR's number, once opened.
     pub pr_number: Option<u64>,
+    // Whether the PR has been flipped from draft to ready-for-review (on entering
+    // the review phase). Kept idempotent so we only mark it once.
+    #[serde(default)]
+    pub pr_ready: bool,
 }
 
 /// True if `body` contains a `/proceed` directive at the start of a line.
@@ -120,6 +127,17 @@ pub fn load(owner: &str, repo: &str, number: u64) -> Result<IssueState> {
     }
 }
 
+/// Persist the state for an issue.
+pub fn save(owner: &str, repo: &str, number: u64, state: &IssueState) -> Result<()> {
+    let path = state_path(owner, repo, number)?;
+    let dir = path
+        .parent()
+        .expect("state path always has a parent directory");
+    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let json = serde_json::to_string_pretty(state).context("failed to serialize issue state")?;
+    fs::write(&path, json).with_context(|| format!("failed to write issue state {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::branch_and_slug;
@@ -137,15 +155,4 @@ mod tests {
         assert_eq!(branch, "issue_42_fix_the_foo_bar_bug");
         assert_eq!(slug, "fix-the-foo-bar-bug");
     }
-}
-
-/// Persist the state for an issue.
-pub fn save(owner: &str, repo: &str, number: u64, state: &IssueState) -> Result<()> {
-    let path = state_path(owner, repo, number)?;
-    let dir = path
-        .parent()
-        .expect("state path always has a parent directory");
-    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    let json = serde_json::to_string_pretty(state).context("failed to serialize issue state")?;
-    fs::write(&path, json).with_context(|| format!("failed to write issue state {}", path.display()))
 }

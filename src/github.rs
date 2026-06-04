@@ -66,6 +66,19 @@ fn parse_remote_url(url: &str) -> Result<RepoRef> {
     }
 }
 
+/// Resolve an issue argument to its concrete `(owner, repo, number)`.
+///
+/// A bare number against a configured repo needs no network call; URLs and the
+/// no-config case fall back to a `gh api` fetch.
+pub fn resolve_issue_ref(arg: &str, config_repo: Option<&RepoRef>) -> Result<(String, String, u64)> {
+    if let (Some((owner, repo)), Ok(number)) = (config_repo, arg.parse::<u64>()) {
+        return Ok((owner.clone(), repo.clone(), number));
+    }
+    let issue = fetch_issue(arg, config_repo)?;
+    let (owner, repo) = parse_owner_repo(&issue.html_url)?;
+    Ok((owner, repo, issue.number))
+}
+
 /// Extract `(owner, repo)` from an issue's (or PR's) `html_url`.
 ///
 /// We take only the first two path segments, so this works whether the URL ends
@@ -141,6 +154,18 @@ pub fn create_draft_pr(
         .and_then(|n| n.parse().ok())
         .with_context(|| format!("could not parse PR number from `gh pr create` output: {url:?}"))?;
     Ok(number)
+}
+
+/// Mark a draft PR as ready for review.
+pub fn mark_pr_ready(owner: &str, repo: &str, number: u64) -> Result<()> {
+    gh(&[
+        "pr",
+        "ready",
+        &number.to_string(),
+        "-R",
+        &format!("{owner}/{repo}"),
+    ])
+    .map(|_| ())
 }
 
 /// Resolve an issue argument to a `gh api` issues endpoint path.

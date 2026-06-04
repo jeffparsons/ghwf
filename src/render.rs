@@ -62,10 +62,6 @@ pub const PRE_PLAN_BODY: &str =
      Do not start planning or advance the workflow yourself. Wait for the user to comment \
      `/proceed` on the issue; ghwf will then advance to the prep-and-plan phase.";
 
-/// Guidance shown during the implement phase (not yet implemented).
-pub const IMPLEMENT_BODY: &str =
-    "Implement is not yet implemented in ghwf — coming in a later commit.";
-
 /// Render the phase banner shown atop `work-on` output: the current phase, an
 /// optional transition note, then the phase-specific `body`.
 pub fn render_phase_banner(
@@ -91,25 +87,35 @@ pub fn render_phase_banner(
     out
 }
 
-/// Render the markdown digest of what's new or changed on an issue.
-pub fn render_work_on(issue: &Issue, issue_changed: bool, new: &[CommentView]) -> String {
-    if !issue_changed && new.is_empty() {
+/// Render the markdown digest of what's new or changed on the digest `subject` —
+/// an issue or a PR. `noun` ("issue" / "PR") tailors the prose for each.
+pub fn render_work_on(
+    subject: &Issue,
+    noun: &str,
+    body_changed: bool,
+    new: &[CommentView],
+) -> String {
+    if !body_changed && new.is_empty() {
         return format!(
-            "No new activity on #{} \"{}\" since you last ran `ghwf work-on`.",
-            issue.number, issue.title
+            "No new activity on {noun} #{} \"{}\" since you last ran `ghwf work-on`.",
+            subject.number, subject.title
         );
     }
 
-    let mut out = format!("## #{}: {}  ({})\n", issue.number, issue.title, issue.state);
+    let mut out = format!("## #{}: {}  ({})\n", subject.number, subject.title, subject.state);
 
-    if issue_changed {
-        out.push_str(&format!("\nIssue body by {}:\n\n", issue.user.login));
-        out.push_str(&blockquote(issue.body.as_deref().unwrap_or("")));
+    if body_changed {
+        out.push_str(&format!(
+            "\n{} body by {}:\n\n",
+            capitalize_first(noun),
+            subject.user.login
+        ));
+        out.push_str(&blockquote(subject.body.as_deref().unwrap_or("")));
         out.push('\n');
     }
 
     if !new.is_empty() {
-        if issue_changed {
+        if body_changed {
             out.push_str("\n<hr>\n");
         }
         out.push_str("\nNew comments since you last ran `ghwf work-on`:\n");
@@ -128,6 +134,16 @@ pub fn render_work_on(issue: &Issue, issue_changed: bool, new: &[CommentView]) -
     }
 
     out.trim_end().to_string()
+}
+
+/// Uppercase the first character, leaving the rest untouched (so acronyms like
+/// "PR" stay "PR" rather than becoming "Pr").
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 /// Prefix every line with a markdown blockquote marker.
