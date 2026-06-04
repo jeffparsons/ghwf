@@ -1,21 +1,19 @@
 use anyhow::{Context, Result};
-use serde::Serialize;
 
 use crate::models::{Comment, Issue};
 
-/// The normalized output of `work-on`: an issue together with its comments.
-///
-/// This is the single place the output format lives; a markdown rendering will
-/// slot in here later.
-#[derive(Serialize)]
-pub struct WorkOn {
-    pub issue: Issue,
-    pub comments: Vec<Comment>,
-}
+/// Opening of the hidden metadata marker embedded in Claude-authored comments.
+const MARKER_PREFIX: &str = "<!-- ghwf:v1 session=";
+/// Closing of the hidden metadata marker.
+const MARKER_SUFFIX: &str = " -->";
 
-/// Render a `WorkOn` as pretty-printed JSON.
-pub fn to_json(out: &WorkOn) -> Result<String> {
-    serde_json::to_string_pretty(out).context("failed to serialize work-on output as JSON")
+/// A new-or-changed comment prepared for rendering.
+pub struct CommentView<'a> {
+    pub comment: &'a Comment,
+    /// The comment body with the hidden ghwf marker stripped, ready to display.
+    pub body: String,
+    /// True if this comment was seen before but its content has since changed.
+    pub updated: bool,
 }
 
 /// Render a single comment (e.g. one just created) as pretty-printed JSON.
@@ -32,7 +30,80 @@ pub fn comment_json(comment: &Comment) -> Result<String> {
 pub fn build_comment_body(user_body: &str, session_token: Option<&str>) -> String {
     let mut body = format!("**Claude says:**\n<hr>\n\n{}", user_body.trim());
     if let Some(token) = session_token {
-        body.push_str(&format!("\n\n<!-- ghwf:v1 session={token} -->"));
+        body.push_str(&format!("\n\n{MARKER_PREFIX}{token}{MARKER_SUFFIX}"));
     }
     body
+}
+
+/// Extract the session token from a comment's hidden ghwf marker, if present.
+pub fn extract_session_token(body: &str) -> Option<String> {
+    let start = body.find(MARKER_PREFIX)? + MARKER_PREFIX.len();
+    let rest = &body[start..];
+    let end = rest.find(MARKER_SUFFIX)?;
+    Some(rest[..end].to_string())
+}
+
+/// Remove the hidden ghwf marker (and the blank line before it) from a comment
+/// body, leaving just the displayable content.
+pub fn strip_ghwf_marker(body: &str) -> String {
+    match body.find(MARKER_PREFIX) {
+        Some(idx) => body[..idx].trim_end().to_string(),
+        None => body.to_string(),
+    }
+}
+
+/// Render the markdown digest of what's new or changed on an issue.
+pub fn render_work_on(issue: &Issue, issue_changed: bool, new: &[CommentView]) -> String {
+    if !issue_changed && new.is_empty() {
+        return format!(
+            "No new activity on #{} \"{}\" since you last ran `ghwf work-on`.",
+            issue.number, issue.title
+        );
+    }
+
+    let mut out = format!("## #{}: {}  ({})\n", issue.number, issue.title, issue.state);
+
+    if issue_changed {
+        out.push_str(&format!("\nIssue body by {}:\n\n", issue.user.login));
+        out.push_str(&blockquote(issue.body.as_deref().unwrap_or("")));
+        out.push('\n');
+    }
+
+    if !new.is_empty() {
+        if issue_changed {
+            out.push_str("\n<hr>\n");
+        }
+        out.push_str("\nNew comments since you last ran `ghwf work-on`:\n");
+        for (i, view) in new.iter().enumerate() {
+            if i > 0 {
+                out.push_str("\n<hr>\n");
+            }
+            let tag = if view.updated { " (updated)" } else { "" };
+            out.push_str(&format!(
+                "\n**{}** at {} said{}:\n\n",
+                view.comment.user.login, view.comment.created_at, tag
+            ));
+            out.push_str(&blockquote(&view.body));
+            out.push('\n');
+        }
+    }
+
+    out.trim_end().to_string()
+}
+
+/// Prefix every line with a markdown blockquote marker.
+fn blockquote(text: &str) -> String {
+    if text.trim().is_empty() {
+        return ">".to_string();
+    }
+    text.lines()
+        .map(|line| {
+            if line.is_empty() {
+                ">".to_string()
+            } else {
+                format!("> {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }

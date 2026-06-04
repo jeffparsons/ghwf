@@ -1,6 +1,7 @@
 mod github;
 mod models;
 mod render;
+mod seen;
 mod store;
 
 use std::io::Read;
@@ -8,7 +9,7 @@ use std::io::Read;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 
-use render::WorkOn;
+use render::CommentView;
 
 #[derive(Parser)]
 #[command(name = "ghwf", about = "GitHub WorkFlow")]
@@ -45,11 +46,62 @@ fn main() -> Result<()> {
 }
 
 fn work_on(issue: &str) -> Result<()> {
-    let out = WorkOn {
-        issue: github::fetch_issue(issue)?,
-        comments: github::fetch_comments(issue)?,
+    let issue_data = github::fetch_issue(issue)?;
+    let comments = github::fetch_comments(issue)?;
+    let (owner, repo) = github::parse_owner_repo(&issue_data.html_url)?;
+    let number = issue_data.number;
+
+    // Identify this Claude session so we can scope the cache and suppress our own
+    // comments. Without a session (run outside Claude Code) we show everything and
+    // persist nothing.
+    let session_id = match std::env::var(store::SESSION_ID_ENV) {
+        Ok(id) if !id.is_empty() => Some(id),
+        _ => None,
     };
-    println!("{}", render::to_json(&out)?);
+    let my_token = match &session_id {
+        Some(id) => Some(store::session_token(id)?),
+        None => None,
+    };
+
+    let record = match &session_id {
+        Some(id) => seen::load(id, &owner, &repo, number)?,
+        None => seen::SeenRecord::default(),
+    };
+
+    let issue_body_hash = store::content_hash(issue_data.body.as_deref().unwrap_or(""));
+    let issue_changed = record.issue_body_hash.as_deref() != Some(&issue_body_hash);
+
+    let mut new = Vec::new();
+    for comment in &comments {
+        // Don't feed this session's own comments back to it.
+        if my_token.is_some() && render::extract_session_token(&comment.body) == my_token {
+            continue;
+        }
+        let hash = store::content_hash(&comment.body);
+        let previous = record.comments.get(&comment.id);
+        if previous != Some(&hash) {
+            new.push(CommentView {
+                comment,
+                body: render::strip_ghwf_marker(&comment.body),
+                updated: previous.is_some(),
+            });
+        }
+    }
+
+    println!("{}", render::render_work_on(&issue_data, issue_changed, &new));
+
+    // Record the current state so the next run only surfaces later changes.
+    if let Some(id) = &session_id {
+        let updated = seen::SeenRecord {
+            issue_body_hash: Some(issue_body_hash),
+            comments: comments
+                .iter()
+                .map(|c| (c.id, store::content_hash(&c.body)))
+                .collect(),
+        };
+        seen::save(id, &owner, &repo, number, &updated)?;
+    }
+
     Ok(())
 }
 

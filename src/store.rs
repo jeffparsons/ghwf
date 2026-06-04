@@ -10,7 +10,7 @@ pub const SESSION_ID_ENV: &str = "CLAUDE_CODE_SESSION_ID";
 
 /// Per-user data directory for ghwf, e.g. `~/Library/Application Support/ghwf`
 /// on macOS, `~/.local/share/ghwf` on Linux. Created if absent.
-fn data_dir() -> Result<PathBuf> {
+pub(crate) fn data_dir() -> Result<PathBuf> {
     let dirs = directories::ProjectDirs::from("", "", "ghwf")
         .ok_or_else(|| anyhow!("could not determine a home directory for ghwf's data"))?;
     let dir = dirs.data_local_dir().to_path_buf();
@@ -61,6 +61,16 @@ fn record_session(token: &str, session_id: &str) -> Result<()> {
     let path = dir.join(token);
     fs::write(&path, session_id)
         .with_context(|| format!("failed to record session mapping at {}", path.display()))
+}
+
+/// A short content hash used to detect changes to an issue body or comment.
+///
+/// 16 hex chars (64 bits) is plenty to detect edits; this is change-detection,
+/// not a security boundary.
+pub fn content_hash(s: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(s.as_bytes());
+    hex(&hasher.finalize()).chars().take(16).collect()
 }
 
 /// Lower-case hex encoding of a byte slice.

@@ -34,6 +34,24 @@ pub fn post_issue_comment(issue: &str, body: &str) -> Result<Comment> {
     serde_json::from_str(&json).context("failed to parse created-comment JSON from `gh api`")
 }
 
+/// Extract `(owner, repo)` from an issue's (or PR's) `html_url`.
+///
+/// We take only the first two path segments, so this works whether the URL ends
+/// in `/issues/N` or `/pull/N`; callers pair it with `Issue.number`.
+pub fn parse_owner_repo(html_url: &str) -> Result<(String, String)> {
+    let url = Url::parse(html_url)
+        .with_context(|| format!("could not parse issue html_url `{html_url}`"))?;
+    let segments: Vec<&str> = url
+        .path_segments()
+        .ok_or_else(|| anyhow!("issue html_url `{html_url}` has no path"))?
+        .filter(|s| !s.is_empty())
+        .collect();
+    match segments.as_slice() {
+        [owner, repo, ..] => Ok((owner.to_string(), repo.to_string())),
+        _ => bail!("issue html_url `{html_url}` is missing owner/repo"),
+    }
+}
+
 /// Resolve an issue argument to a `gh api` issues endpoint path.
 ///
 /// A bare number is left for `gh` to resolve against the current repo via its

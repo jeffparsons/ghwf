@@ -24,6 +24,7 @@ pub struct Issue {
 /// A comment on an issue's (or PR's) conversation thread.
 #[derive(Deserialize, Serialize)]
 pub struct Comment {
+    pub id: u64,
     pub user: User,
     pub body: String,
     pub created_at: String,
