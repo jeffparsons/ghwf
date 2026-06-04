@@ -2,6 +2,7 @@ mod github;
 mod models;
 mod render;
 mod seen;
+mod state;
 mod store;
 
 use std::io::Read;
@@ -51,6 +52,9 @@ fn work_on(issue: &str) -> Result<()> {
     let (owner, repo) = github::parse_owner_repo(&issue_data.html_url)?;
     let number = issue_data.number;
 
+    // Advance the workflow phase if the user has posted a new `/proceed` directive.
+    let (phase, transition) = advance_phase(&owner, &repo, number, &comments)?;
+
     // Identify this Claude session so we can scope the cache and suppress our own
     // comments. Without a session (run outside Claude Code) we show everything and
     // persist nothing.
@@ -88,6 +92,8 @@ fn work_on(issue: &str) -> Result<()> {
         }
     }
 
+    println!("{}", render::render_phase_banner(phase, transition));
+    println!();
     println!("{}", render::render_work_on(&issue_data, issue_changed, &new));
 
     // Record the current state so the next run only surfaces later changes.
@@ -103,6 +109,45 @@ fn work_on(issue: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Process any new `/proceed` directives in the comments, advancing the issue's
+/// phase accordingly. Returns the resulting phase and a description of the
+/// transition if one happened this run.
+type Transition = (state::Phase, state::Phase, Option<String>);
+fn advance_phase(
+    owner: &str,
+    repo: &str,
+    number: u64,
+    comments: &[models::Comment],
+) -> Result<(state::Phase, Option<Transition>)> {
+    let mut issue_state = state::load(owner, repo, number)?;
+    let initial = issue_state.phase;
+    let mut trigger = None;
+
+    for comment in comments {
+        // Only the user's comments are directives; skip Claude/ghwf-authored ones.
+        if render::extract_session_token(&comment.body).is_some() {
+            continue;
+        }
+        if issue_state.consumed_directives.contains(&comment.id) {
+            continue;
+        }
+        if state::is_proceed_directive(&comment.body) {
+            // Consume the directive regardless, so it never re-fires.
+            issue_state.consumed_directives.insert(comment.id);
+            if let Some(next) = issue_state.phase.next() {
+                issue_state.phase = next;
+                trigger = Some(comment.user.login.clone());
+            }
+        }
+    }
+
+    let transition =
+        (issue_state.phase != initial).then_some((initial, issue_state.phase, trigger));
+    let phase = issue_state.phase;
+    state::save(owner, repo, number, &issue_state)?;
+    Ok((phase, transition))
 }
 
 fn create_issue_comment(issue: &str) -> Result<()> {

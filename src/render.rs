@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 
 use crate::models::{Comment, Issue};
+use crate::state::Phase;
 
 /// Opening of the hidden metadata marker embedded in Claude-authored comments.
 const MARKER_PREFIX: &str = "<!-- ghwf:v1 session=";
@@ -50,6 +51,46 @@ pub fn strip_ghwf_marker(body: &str) -> String {
         Some(idx) => body[..idx].trim_end().to_string(),
         None => body.to_string(),
     }
+}
+
+/// Render the phase banner shown atop `work-on` output: the current phase, what
+/// Claude should do in it, and a note when a transition just happened.
+pub fn render_phase_banner(
+    phase: Phase,
+    transition: Option<(Phase, Phase, Option<String>)>,
+) -> String {
+    let mut out = format!("Phase: {}", phase.label());
+
+    if let Some((from, to, trigger)) = transition {
+        let by = trigger
+            .map(|login| format!(" from {login}"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "\nPhase advanced: {} → {} (triggered by `/proceed`{by}).",
+            from.label(),
+            to.label()
+        ));
+    }
+
+    out.push_str("\n\n");
+    out.push_str(match phase {
+        Phase::PrePlan => {
+            "Pre-plan — gathering the information needed to write a plan.\n\n\
+             Discuss on the issue itself. Post questions and clarifications as comments with \
+             `ghwf create-issue-comment <issue>`. When you have enough information, post a comment \
+             that summarises your understanding and clearly states you are ready to write a plan.\n\n\
+             Do not start planning or advance the workflow yourself. Wait for the user to comment \
+             `/proceed` on the issue; ghwf will then advance to the prep-and-plan phase."
+        }
+        Phase::PrepAndPlan => {
+            "Prep-and-plan is not yet implemented in ghwf — coming in a later commit."
+        }
+        Phase::Implement => {
+            "Implement is not yet implemented in ghwf — coming in a later commit."
+        }
+    });
+
+    out
 }
 
 /// Render the markdown digest of what's new or changed on an issue.
