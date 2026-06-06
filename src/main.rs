@@ -9,6 +9,7 @@ mod render;
 mod seen;
 mod state;
 mod store;
+mod wait;
 mod worktree;
 
 use std::io::Read;
@@ -48,6 +49,18 @@ enum Commands {
         /// An issue number (resolved against the current repo) or a full GitHub issue URL.
         issue: String,
     },
+    /// Block until new activity appears on an issue (or its PR), or the timeout
+    /// elapses.
+    ///
+    /// Exits 0 when activity is detected (run `ghwf work-on` to process it),
+    /// 2 on timeout (nothing new — run `wait` again), and 1 on error.
+    Wait {
+        /// An issue number (resolved against the current repo) or a full GitHub issue URL.
+        issue: String,
+        /// Give up after this many seconds, with exit code 2.
+        #[arg(long, default_value_t = 540)]
+        timeout: u64,
+    },
 }
 
 fn main() -> Result<()> {
@@ -56,6 +69,7 @@ fn main() -> Result<()> {
         Commands::WorkOn { issue, no_branch } => work_on(&issue, no_branch),
         Commands::CreateIssueComment { issue } => create_issue_comment(&issue),
         Commands::WorktreePath { issue } => worktree_path(&issue),
+        Commands::Wait { issue, timeout } => wait::run(&issue, timeout),
     }
 }
 
@@ -104,16 +118,25 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         Some(pr) => Some(github::fetch_comments(&pr.to_string(), repo_ctx.as_ref())?),
         None => None,
     };
-    let outcome = advance_phase(&mut issue_state, &issue_comments, early_pr_comments.as_deref());
+    let outcome = advance_phase(
+        &mut issue_state,
+        &issue_comments,
+        early_pr_comments.as_deref(),
+    );
 
     // The phase-specific banner body. Prep-and-plan does real work here (and
     // hard-errors if it needs a config that's missing); implement/review are light.
     let phase = issue_state.phase;
     let body = match phase {
-        state::Phase::PrePlan => render::PRE_PLAN_BODY.to_string(),
-        state::Phase::PrepAndPlan => {
-            prep::run(&issue_data, &owner, &repo, number, no_branch, &mut issue_state)?
-        }
+        state::Phase::PrePlan => render::pre_plan_body(number),
+        state::Phase::PrepAndPlan => prep::run(
+            &issue_data,
+            &owner,
+            &repo,
+            number,
+            no_branch,
+            &mut issue_state,
+        )?,
         state::Phase::Implement => {
             implement::run(&issue_data, &owner, &repo, number, &issue_state)?
         }
@@ -153,9 +176,21 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     let status_posted = status.is_some();
     if let Some(text) = status {
         let status_body = render::build_status_comment_body(&text);
-        post_status(&number.to_string(), &status_body, repo_ctx.as_ref(), "issue");
+        let mut posted = post_status(
+            &number.to_string(),
+            &status_body,
+            repo_ctx.as_ref(),
+            "issue",
+        );
         if let Some(pr) = pr_number {
-            post_status(&pr.to_string(), &status_body, repo_ctx.as_ref(), "PR");
+            posted = post_status(&pr.to_string(), &status_body, repo_ctx.as_ref(), "PR").or(posted);
+        }
+        // Remember the newest own post for feed-lag self-calibration in `wait`.
+        if let Some(comment) = posted {
+            issue_state.last_posted = Some(state::PostedRef {
+                id: comment.id,
+                created_at: comment.created_at,
+            });
         }
         issue_state.intro_posted = true;
     }
@@ -175,6 +210,29 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     }
 
     let my_token = store::session_token(&session_id)?;
+
+    // Start the wait baseline while the issue data is still in hand: the
+    // fingerprint catches edits no comment list shows, and `since` accumulates
+    // the max server-side `updated_at` observed this run (plan §3). Comments
+    // fetched later for the digest fold in below.
+    let mut wait_state = state::WaitState {
+        since: issue_data.updated_at.clone(),
+        issue_fingerprint: state::issue_fingerprint(
+            &issue_data.title,
+            issue_data.body.as_deref(),
+            &issue_data.state,
+        ),
+        ..Default::default()
+    };
+    for comment in issue_comments
+        .iter()
+        .chain(early_pr_comments.iter().flatten())
+    {
+        wait_state
+            .comments
+            .insert(comment.id, store::content_hash(&comment.body));
+        state::fold_since(&mut wait_state.since, &comment.updated_at);
+    }
 
     // Choose which thread to digest: during implement/review, the PR conversation
     // thread (review feedback); otherwise the issue thread. Both share the issues
@@ -199,6 +257,23 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         (issue_data, issue_comments, None, "issue")
     };
 
+    // Fold in whatever the digest fetched: PR data and comments when the
+    // digest subject is the PR, and inline review comments when present.
+    // (Issue-thread re-inserts are identical no-ops.)
+    state::fold_since(&mut wait_state.since, &subject.updated_at);
+    for comment in &subject_comments {
+        wait_state
+            .comments
+            .insert(comment.id, store::content_hash(&comment.body));
+        state::fold_since(&mut wait_state.since, &comment.updated_at);
+    }
+    for comment in review_comments.iter().flatten() {
+        wait_state
+            .review_comments
+            .insert(comment.id, store::content_hash(&comment.body));
+        state::fold_since(&mut wait_state.since, &comment.updated_at);
+    }
+
     let record = seen::load(&session_id, &owner, &repo, number)?;
 
     let body_hash = store::content_hash(subject.body.as_deref().unwrap_or(""));
@@ -207,7 +282,7 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     let mut new = Vec::new();
     for comment in &subject_comments {
         // Don't feed ghwf status updates or this session's own comments back.
-        if hidden_from_digest(&comment.body, &my_token) {
+        if render::hidden_from_digest(&comment.body, Some(&my_token)) {
             continue;
         }
         let hash = store::content_hash(&comment.body);
@@ -225,7 +300,7 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     for comment in review_comments.iter().flatten() {
         // Same filter as above, for symmetry — though ghwf never authors
         // inline review comments today.
-        if hidden_from_digest(&comment.body, &my_token) {
+        if render::hidden_from_digest(&comment.body, Some(&my_token)) {
             continue;
         }
         let hash = store::content_hash(&comment.body);
@@ -274,25 +349,30 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     };
     seen::save(&session_id, &owner, &repo, number, &updated)?;
 
+    // Record the wait baseline last, so it reflects everything this run
+    // fetched. A fresh baseline invalidates any stored poll ETags (the poll
+    // URLs embed `since`), so they start empty.
+    issue_state.wait = Some(wait_state);
+    state::save(&owner, &repo, number, &issue_state)?;
+
     Ok(())
 }
 
 /// Post a ghwf status update to a conversation thread, best-effort: a failure
-/// warns on stderr but never fails the run.
-fn post_status(subject: &str, body: &str, repo_ctx: Option<&github::RepoRef>, noun: &str) {
-    if let Err(err) = github::post_issue_comment(subject, body, repo_ctx) {
-        eprintln!("warning: failed to post the status update to the {noun}: {err:#}");
-    }
-}
-
-/// Whether a comment must be hidden from the digest shown to Claude: ghwf
-/// status updates always (they are machinery, whichever session posted them),
-/// and Claude-authored comments only when this session wrote them.
-fn hidden_from_digest(body: &str, my_token: &str) -> bool {
-    match render::extract_marker(body) {
-        Some(render::Marker::Status) => true,
-        Some(render::Marker::Session(token)) => token == my_token,
-        None => false,
+/// warns on stderr but never fails the run. Returns the created comment so the
+/// caller can record it for feed-lag self-calibration.
+fn post_status(
+    subject: &str,
+    body: &str,
+    repo_ctx: Option<&github::RepoRef>,
+    noun: &str,
+) -> Option<models::Comment> {
+    match github::post_issue_comment(subject, body, repo_ctx) {
+        Ok(comment) => Some(comment),
+        Err(err) => {
+            eprintln!("warning: failed to post the status update to the {noun}: {err:#}");
+            None
+        }
     }
 }
 
@@ -335,7 +415,12 @@ fn advance_phase(
     let mut tagged: Vec<(&models::Comment, &'static str)> = issue_comments
         .iter()
         .map(|comment| (comment, "issue"))
-        .chain(pr_comments.into_iter().flatten().map(|comment| (comment, "PR")))
+        .chain(
+            pr_comments
+                .into_iter()
+                .flatten()
+                .map(|comment| (comment, "PR")),
+        )
         .collect();
     tagged.sort_by(|a, b| a.0.created_at.cmp(&b.0.created_at));
 
@@ -402,8 +487,34 @@ fn create_issue_comment(issue: &str) -> Result<()> {
     let repo_ctx = github::config_repo()?;
     let body = render::build_comment_body(&user_body, token.as_deref());
     let comment = github::post_issue_comment(issue, &body, repo_ctx.as_ref())?;
+
+    // Remember the post for feed-lag self-calibration in `wait`, best-effort.
+    if let Err(err) = record_last_posted(issue, &comment, repo_ctx.as_ref()) {
+        eprintln!("warning: failed to record the post for wait calibration: {err:#}");
+    }
+
     println!("{}", render::comment_json(&comment)?);
     Ok(())
+}
+
+/// Record a ghwf-authored comment as the workflow issue's `last_posted`. The
+/// thread argument may name the issue itself or its PR; the PR case maps back
+/// to the issue whose prep state records that PR number.
+fn record_last_posted(
+    issue: &str,
+    comment: &models::Comment,
+    repo_ctx: Option<&github::RepoRef>,
+) -> Result<()> {
+    let (owner, repo, number) = github::resolve_issue_ref(issue, repo_ctx)?;
+    let Some((number, mut state)) = state::find_workflow_issue(&owner, &repo, number)? else {
+        // No workflow has engaged this thread yet; nothing to calibrate.
+        return Ok(());
+    };
+    state.last_posted = Some(state::PostedRef {
+        id: comment.id,
+        created_at: comment.created_at.clone(),
+    });
+    state::save(&owner, &repo, number, &state)
 }
 
 #[cfg(test)]
@@ -473,7 +584,11 @@ mod tests {
     #[test]
     fn premature_directive_is_noted_not_fired() {
         let mut state = state_in(Phase::PrePlan);
-        let comments = [comment(1, "/approve-implementation", "2026-01-01T00:00:00Z")];
+        let comments = [comment(
+            1,
+            "/approve-implementation",
+            "2026-01-01T00:00:00Z",
+        )];
         let outcome = advance_phase(&mut state, &comments, None);
         assert_eq!(state.phase, Phase::PrePlan);
         assert!(outcome.transitions.is_empty());
@@ -508,14 +623,17 @@ mod tests {
 
     #[test]
     fn digest_hides_status_always_and_own_session_comments_only() {
-        use super::hidden_from_digest;
+        use crate::render::hidden_from_digest;
         let status = crate::render::build_status_comment_body("update");
-        assert!(hidden_from_digest(&status, "mine"));
+        assert!(hidden_from_digest(&status, Some("mine")));
         let mine = crate::render::build_comment_body("hi", Some("mine"));
         let theirs = crate::render::build_comment_body("hi", Some("theirs"));
-        assert!(hidden_from_digest(&mine, "mine"));
-        assert!(!hidden_from_digest(&theirs, "mine"));
-        assert!(!hidden_from_digest("plain user comment", "mine"));
+        assert!(hidden_from_digest(&mine, Some("mine")));
+        assert!(!hidden_from_digest(&theirs, Some("mine")));
+        assert!(!hidden_from_digest("plain user comment", Some("mine")));
+        // Outside a Claude session only status comments hide.
+        assert!(hidden_from_digest(&status, None));
+        assert!(!hidden_from_digest(&mine, None));
     }
 
     #[test]

@@ -33,15 +33,17 @@ pub fn ensure_worktree(
         let worktree_path = located.worktrees_dir_path().join(&branch);
         git::fetch(&main_repo)?;
         let default = github::default_branch(owner, repo)?;
-        git::add_worktree(&main_repo, &worktree_path, &branch, &format!("origin/{default}"))?;
+        git::add_worktree(
+            &main_repo,
+            &worktree_path,
+            &branch,
+            &format!("origin/{default}"),
+        )?;
         prep.branch = Some(branch);
         prep.worktree_path = Some(worktree_path);
     }
 
-    let worktree = prep
-        .worktree_path
-        .clone()
-        .expect("worktree path set above");
+    let worktree = prep.worktree_path.clone().expect("worktree path set above");
     let branch = prep.branch.clone().expect("branch set above");
     Ok((worktree, branch))
 }
@@ -69,7 +71,9 @@ pub fn run(
     let prep = state.prep.as_ref().expect("prep state was just set");
 
     if no_branch_flag && !prep.no_branch {
-        eprintln!("warning: this issue is already being worked in branch mode; ignoring --no-branch.");
+        eprintln!(
+            "warning: this issue is already being worked in branch mode; ignoring --no-branch."
+        );
     }
 
     let (_, slug) = state::branch_and_slug(number, &issue.title);
@@ -103,7 +107,10 @@ pub fn run(
     }
 
     // 5. Open the draft PR if there isn't one yet.
-    let prep = state.prep.as_mut().expect("prep state exists in branch mode");
+    let prep = state
+        .prep
+        .as_mut()
+        .expect("prep state exists in branch mode");
     if prep.pr_number.is_none() {
         let pr = match github::find_pr(owner, repo, &branch)? {
             Some(n) => n,
@@ -147,7 +154,20 @@ fn complete_body(worktree: &Path, branch: &str, pr_url: &str, number: u64) -> St
          - Draft PR: {pr_url}\n\n\
          If you haven't already, post a hand-off comment on issue #{number} and on the PR \
          saying the plan is ready for review, and that commenting `/approve-plan` on either \
-         thread advances to the implement phase. Then wait for that approval.",
+         thread advances to the implement phase.\n\n{}",
         worktree.display(),
+        crate::render::wait_instruction(number),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::complete_body;
+    use std::path::Path;
+
+    #[test]
+    fn complete_body_includes_wait_instruction() {
+        let body = complete_body(Path::new("/wt"), "b", "https://github.com/o/r/pull/18", 7);
+        assert!(body.contains("`ghwf wait 7`"));
+    }
 }

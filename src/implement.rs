@@ -1,8 +1,8 @@
 use anyhow::Result;
 
+use crate::github;
 use crate::models::Issue;
 use crate::state::{self, IssueState};
-use crate::github;
 
 /// Build the implement-phase banner: where the work lives and what to do next.
 ///
@@ -41,23 +41,19 @@ pub fn run(
 }
 
 /// Build the review-phase banner, flipping the draft PR to ready-for-review once.
-pub fn review(
-    owner: &str,
-    repo: &str,
-    number: u64,
-    state: &mut IssueState,
-) -> Result<String> {
+pub fn review(owner: &str, repo: &str, number: u64, state: &mut IssueState) -> Result<String> {
     let Some(prep) = state.prep.as_mut() else {
         return Ok(no_prep_body(number));
     };
 
     if prep.no_branch {
-        return Ok(review_no_branch_body());
+        return Ok(review_no_branch_body(number));
     }
 
     let Some(pr) = prep.pr_number else {
-        return Ok("Review — awaiting human review. (No ghwf PR was recorded to mark ready.)"
-            .to_string());
+        return Ok(
+            "Review — awaiting human review. (No ghwf PR was recorded to mark ready.)".to_string(),
+        );
     };
 
     // Flip draft → ready exactly once, then remember we did.
@@ -83,7 +79,8 @@ fn branch_body(worktree: &str, plan_rel: &str, pr_url: Option<&str>, number: u64
          PR updates automatically). Address any PR feedback shown below. When the work is \
          complete and ready for human review, post a hand-off comment on issue #{number} \
          and on the PR prompting the user to comment `/approve-implementation` on either \
-         thread."
+         thread.\n\n{}",
+        crate::render::wait_instruction(number)
     )
 }
 
@@ -92,7 +89,8 @@ fn no_branch_body(number: u64, plan_rel: &str) -> String {
         "Implement (--no-branch) — code the change per `{plan_rel}`.\n\n\
          You are managing the branch and commits yourself; there is no ghwf worktree or PR. \
          When the work is complete, post a comment on issue #{number} prompting the user to \
-         comment `/approve-implementation`."
+         comment `/approve-implementation`.\n\n{}",
+        crate::render::wait_instruction(number)
     )
 }
 
@@ -101,15 +99,18 @@ fn review_body(pr_url: &str, number: u64) -> String {
         "Review — awaiting human review.\n\n\
          The PR has been marked ready for review: {pr_url}\n\n\
          Nothing more is needed from you unless review feedback arrives; it will appear below \
-         on future `ghwf work-on {number}` runs."
+         on future `ghwf work-on {number}` runs.\n\n{}",
+        crate::render::wait_instruction(number)
     )
 }
 
-fn review_no_branch_body() -> String {
-    "Review — the work is complete.\n\n\
-     There is no ghwf PR to mark ready (this issue was worked with --no-branch); hand off for \
-     human review however you normally would."
-        .to_string()
+fn review_no_branch_body(number: u64) -> String {
+    format!(
+        "Review — the work is complete.\n\n\
+         There is no ghwf PR to mark ready (this issue was worked with --no-branch); hand off \
+         for human review however you normally would.\n\n{}",
+        crate::render::wait_instruction(number)
+    )
 }
 
 fn no_prep_body(number: u64) -> String {
@@ -117,4 +118,21 @@ fn no_prep_body(number: u64) -> String {
         "No prep state is recorded for issue #{number}. Run `ghwf work-on {number}` through the \
          earlier phases (pre-plan, prep-and-plan) first."
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{branch_body, no_branch_body, review_body, review_no_branch_body};
+
+    #[test]
+    fn waiting_bodies_include_wait_instruction() {
+        for body in [
+            branch_body("/wt", "plans/7-x.md", None, 7),
+            no_branch_body(7, "plans/7-x.md"),
+            review_body("https://github.com/o/r/pull/18", 7),
+            review_no_branch_body(7),
+        ] {
+            assert!(body.contains("`ghwf wait 7`"), "missing in: {body}");
+        }
+    }
 }

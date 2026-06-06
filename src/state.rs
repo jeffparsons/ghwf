@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -151,6 +151,60 @@ pub struct IssueState {
     // Populated once the prep-and-plan phase begins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prep: Option<PrepState>,
+    // What the last `work-on` run observed, for `wait` to poll against.
+    // Absent until a `work-on` run records one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<WaitState>,
+    // The most recent comment ghwf itself posted to either thread. Lives here
+    // rather than on `WaitState` because `work-on` rebuilds that wholesale
+    // when recording a baseline, and a status update posted mid-run must
+    // survive. Feed-mode self-calibration in `wait` reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_posted: Option<PostedRef>,
+}
+
+/// A reference to a comment ghwf posted, for feed-lag self-calibration.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PostedRef {
+    pub id: u64,
+    pub created_at: String,
+}
+
+/// What `work-on` last observed on the issue and its PR, recorded for `wait`
+/// to poll against.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct WaitState {
+    // Watermark for `?since=` polling: the max `updated_at` across everything
+    // the recording run fetched. Server-side timestamps, so local clock skew
+    // can't lose activity; ISO-8601 Zulu strings compare lexicographically.
+    pub since: String,
+    // Content hash over the issue's title, body, and state, for detecting
+    // edits the comment lists can't show.
+    pub issue_fingerprint: String,
+    // Comment id -> body hash for both conversation threads merged (ids are
+    // globally unique across them).
+    pub comments: BTreeMap<u64, String>,
+    // Inline review comment id -> body hash.
+    pub review_comments: BTreeMap<u64, String>,
+    // Endpoint key -> last ETag, updated by `wait` as it polls. The events
+    // feed's ETag lives here too, under the key `events`.
+    #[serde(default)]
+    pub etags: BTreeMap<String, String>,
+}
+
+/// The fingerprint recorded in `WaitState::issue_fingerprint`.
+pub fn issue_fingerprint(title: &str, body: Option<&str>, state: &str) -> String {
+    // A separator no GitHub field can contain, so field boundaries can't be
+    // confused.
+    store::content_hash(&format!("{title}\u{0}{}\u{0}{state}", body.unwrap_or("")))
+}
+
+/// Advance a `since` watermark to `candidate` when it is later. GitHub's
+/// ISO-8601 Zulu timestamps compare lexicographically.
+pub fn fold_since(since: &mut String, candidate: &str) {
+    if candidate > since.as_str() {
+        *since = candidate.to_string();
+    }
 }
 
 /// State accumulated during the prep-and-plan phase for an issue.
@@ -184,12 +238,51 @@ fn state_path(owner: &str, repo: &str, number: u64) -> Result<PathBuf> {
 
 /// Load the state for an issue, or a fresh default if none exists.
 pub fn load(owner: &str, repo: &str, number: u64) -> Result<IssueState> {
+    Ok(load_if_exists(owner, repo, number)?.unwrap_or_default())
+}
+
+/// Load the state for an issue, or `None` if none has been recorded.
+pub fn load_if_exists(owner: &str, repo: &str, number: u64) -> Result<Option<IssueState>> {
     let path = state_path(owner, repo, number)?;
     match fs::read_to_string(&path) {
         Ok(json) => serde_json::from_str(&json)
+            .map(Some)
             .with_context(|| format!("failed to parse issue state {}", path.display())),
-        Err(_) => Ok(IssueState::default()),
+        Err(_) => Ok(None),
     }
+}
+
+/// Find the workflow issue a conversation thread belongs to: `number` itself
+/// when it has recorded state, otherwise the issue whose recorded PR is
+/// `number` (a comment posted on the PR thread). `None` when neither matches.
+pub fn find_workflow_issue(
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<Option<(u64, IssueState)>> {
+    if let Some(state) = load_if_exists(owner, repo, number)? {
+        return Ok(Some((number, state)));
+    }
+    let dir = store::data_dir()?.join("issues").join(owner).join(repo);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Ok(None);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(issue_number) = stem.parse::<u64>() else {
+            continue;
+        };
+        let Some(state) = load_if_exists(owner, repo, issue_number)? else {
+            continue;
+        };
+        if state.prep.as_ref().and_then(|p| p.pr_number) == Some(number) {
+            return Ok(Some((issue_number, state)));
+        }
+    }
+    Ok(None)
 }
 
 /// Persist the state for an issue.
@@ -200,12 +293,62 @@ pub fn save(owner: &str, repo: &str, number: u64, state: &IssueState) -> Result<
         .expect("state path always has a parent directory");
     fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let json = serde_json::to_string_pretty(state).context("failed to serialize issue state")?;
-    fs::write(&path, json).with_context(|| format!("failed to write issue state {}", path.display()))
+    fs::write(&path, json)
+        .with_context(|| format!("failed to write issue state {}", path.display()))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{branch_and_slug, parse_directive, Directive, Phase};
+    use super::{
+        branch_and_slug, issue_fingerprint, parse_directive, Directive, IssueState, Phase,
+        PostedRef, WaitState,
+    };
+
+    #[test]
+    fn old_state_files_load_without_wait_fields() {
+        let state: IssueState =
+            serde_json::from_str(r#"{"phase":"implement","consumed_directives":[1]}"#).unwrap();
+        assert!(state.wait.is_none());
+        assert!(state.last_posted.is_none());
+    }
+
+    #[test]
+    fn wait_state_round_trips() {
+        let state = IssueState {
+            wait: Some(WaitState {
+                since: "2026-06-06T10:00:00Z".to_string(),
+                issue_fingerprint: "abc".to_string(),
+                comments: [(1, "h1".to_string())].into(),
+                review_comments: [(2, "h2".to_string())].into(),
+                etags: [("issue".to_string(), "W/\"x\"".to_string())].into(),
+            }),
+            last_posted: Some(PostedRef {
+                id: 7,
+                created_at: "2026-06-06T11:00:00Z".to_string(),
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: IssueState = serde_json::from_str(&json).unwrap();
+        let wait = back.wait.unwrap();
+        assert_eq!(wait.since, "2026-06-06T10:00:00Z");
+        assert_eq!(wait.comments.get(&1).map(String::as_str), Some("h1"));
+        assert_eq!(wait.etags.get("issue").map(String::as_str), Some("W/\"x\""));
+        assert_eq!(back.last_posted.unwrap().id, 7);
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_fields_and_absent_body() {
+        let a = issue_fingerprint("title", Some("body"), "open");
+        assert_eq!(a, issue_fingerprint("title", Some("body"), "open"));
+        assert_ne!(a, issue_fingerprint("title", Some("body"), "closed"));
+        assert_ne!(a, issue_fingerprint("title", None, "open"));
+        // Field boundaries can't bleed into each other.
+        assert_ne!(
+            issue_fingerprint("ab", Some("c"), "open"),
+            issue_fingerprint("a", Some("bc"), "open")
+        );
+    }
 
     #[test]
     fn parse_each_command() {
@@ -217,7 +360,10 @@ mod tests {
             parse_directive("/approve-preplan"),
             Some(Directive::ApprovePrePlan)
         );
-        assert_eq!(parse_directive("/approve-plan"), Some(Directive::ApprovePlan));
+        assert_eq!(
+            parse_directive("/approve-plan"),
+            Some(Directive::ApprovePlan)
+        );
         assert_eq!(
             parse_directive("/approve-implementation"),
             Some(Directive::ApproveImplementation)

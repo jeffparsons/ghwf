@@ -30,6 +30,27 @@ went wrong and which command applies.
 Pass `--no-branch` to skip the branch/worktree/PR entirely and just write the plan
 file — handy for trivial tasks or when you're already on a feature branch.
 
+## Waiting for approval and feedback
+
+`ghwf wait <issue>` blocks until something new happens on the issue or its PR,
+so an agent can hand off and sleep instead of being re-prompted by hand. The
+contract:
+
+- **exit 0** — new activity arrived (a comment, an edit, a state change); run
+  `ghwf work-on <issue>` to process it. ghwf's own status updates and the
+  current session's comments never count as activity.
+- **exit 2** — the timeout elapsed with nothing new (`--timeout <secs>`,
+  default 540 — just under a 10-minute shell command timeout); run
+  `ghwf wait <issue>` again.
+- **exit 1** — an error.
+
+Polling is cheap: conditional requests (`If-None-Match` with ETags recorded in
+the issue's local state) against the endpoints `work-on` reads, starting at
+5 s and backing off to 60 s while idle. Once quiet at the cap, `wait` switches
+to watching the repo events feed — one rate-limit-free request per cycle —
+after verifying the feed currently shows ghwf's own latest post (it can lag),
+with a full direct sweep every ~5 min as the backstop.
+
 ## Configuration
 
 ghwf needs a `ghwf.toml`, found by walking up from the current directory:

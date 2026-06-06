@@ -36,15 +36,16 @@ pub fn fetch_review_comments(owner: &str, repo: &str, pr: u64) -> Result<Vec<Rev
 }
 
 /// Post a comment to an issue's (or PR's) conversation thread.
-pub fn post_issue_comment(issue: &str, body: &str, config_repo: Option<&RepoRef>) -> Result<Comment> {
+pub fn post_issue_comment(
+    issue: &str,
+    body: &str,
+    config_repo: Option<&RepoRef>,
+) -> Result<Comment> {
     let endpoint = format!("{}/comments", issue_endpoint(issue, config_repo)?);
     // Send the request body as JSON on stdin so the comment text needs no shell
     // escaping; `gh` forwards it verbatim as the POST body.
     let payload = serde_json::json!({ "body": body }).to_string();
-    let json = gh_api_stdin(
-        &["--method", "POST", &endpoint, "--input", "-"],
-        &payload,
-    )?;
+    let json = gh_api_stdin(&["--method", "POST", &endpoint, "--input", "-"], &payload)?;
     serde_json::from_str(&json).context("failed to parse created-comment JSON from `gh api`")
 }
 
@@ -80,7 +81,10 @@ fn parse_remote_url(url: &str) -> Result<RepoRef> {
 ///
 /// A bare number against a configured repo needs no network call; URLs and the
 /// no-config case fall back to a `gh api` fetch.
-pub fn resolve_issue_ref(arg: &str, config_repo: Option<&RepoRef>) -> Result<(String, String, u64)> {
+pub fn resolve_issue_ref(
+    arg: &str,
+    config_repo: Option<&RepoRef>,
+) -> Result<(String, String, u64)> {
     if let (Some((owner, repo)), Ok(number)) = (config_repo, arg.parse::<u64>()) {
         return Ok((owner.clone(), repo.clone(), number));
     }
@@ -139,7 +143,9 @@ pub fn find_pr(owner: &str, repo: &str, branch: &str) -> Result<Option<u64>> {
     ])?;
     match out.trim() {
         "" => Ok(None),
-        n => Ok(Some(n.parse().context("could not parse PR number from `gh`")?)),
+        n => Ok(Some(
+            n.parse().context("could not parse PR number from `gh`")?,
+        )),
     }
 }
 
@@ -154,15 +160,28 @@ pub fn create_draft_pr(
 ) -> Result<u64> {
     // `gh pr create` prints the new PR's URL; the trailing path segment is its number.
     let url = gh(&[
-        "pr", "create", "-R", &format!("{owner}/{repo}"), "--draft", "--base", base, "--head",
-        head, "--title", title, "--body", body,
+        "pr",
+        "create",
+        "-R",
+        &format!("{owner}/{repo}"),
+        "--draft",
+        "--base",
+        base,
+        "--head",
+        head,
+        "--title",
+        title,
+        "--body",
+        body,
     ])?;
     let number = url
         .trim()
         .rsplit('/')
         .next()
         .and_then(|n| n.parse().ok())
-        .with_context(|| format!("could not parse PR number from `gh pr create` output: {url:?}"))?;
+        .with_context(|| {
+            format!("could not parse PR number from `gh pr create` output: {url:?}")
+        })?;
     Ok(number)
 }
 
@@ -239,6 +258,139 @@ fn gh(args: &[&str]) -> Result<String> {
     String::from_utf8(output.stdout).context("`gh` returned non-UTF-8 output")
 }
 
+/// The outcome of a conditional `gh api` GET. Both variants carry the
+/// `X-Poll-Interval` header (in seconds) when the endpoint sent one — only the
+/// events feed does.
+pub enum Conditional {
+    /// 304 — unchanged since the presented ETag.
+    NotModified { poll_interval: Option<u64> },
+    /// 2xx — a fresh body, with the response's ETag for the next poll.
+    Fresh {
+        etag: Option<String>,
+        poll_interval: Option<u64>,
+        body: String,
+    },
+}
+
+/// Run a conditional GET against an API endpoint, presenting `etag` (if any)
+/// as `If-None-Match`.
+///
+/// Distinguishing a 304 from a real failure needs the response head, so this
+/// runs `gh api -i` and classifies by the parsed status line; `gh`'s non-zero
+/// exit on a 304 is expected. Rate-limit responses (403/429) surface as a
+/// dedicated error so pollers can back off rather than die.
+pub fn gh_api_conditional(endpoint: &str, etag: Option<&str>) -> Result<Conditional> {
+    let mut args: Vec<String> = vec!["-i".to_string()];
+    if let Some(etag) = etag {
+        args.push("-H".to_string());
+        args.push(format!("If-None-Match: {etag}"));
+    }
+    args.push(endpoint.to_string());
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    let output = Command::new("gh")
+        .arg("api")
+        .args(&arg_refs)
+        .output()
+        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+
+    let stdout = String::from_utf8(output.stdout).context("`gh api` returned non-UTF-8 output")?;
+    // Classify by the response head when there is one; only fall back to the
+    // generic failure path when `gh` produced no parseable response at all.
+    match parse_http_head(&stdout) {
+        Some(head) if head.status == 304 => Ok(Conditional::NotModified {
+            poll_interval: head.poll_interval,
+        }),
+        Some(head) if (200..300).contains(&head.status) => Ok(Conditional::Fresh {
+            etag: head.etag,
+            poll_interval: head.poll_interval,
+            body: head.body,
+        }),
+        Some(head) => bail!(RateAware {
+            status: head.status,
+            message: format!("`gh api {endpoint}` returned HTTP {}", head.status),
+        }),
+        None => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("`gh api {endpoint}` failed:\n{}", stderr.trim());
+        }
+    }
+}
+
+/// An HTTP error carrying its status code, so pollers can tell rate limiting
+/// (403/429) apart from other failures.
+#[derive(Debug)]
+pub struct RateAware {
+    pub status: u16,
+    pub message: String,
+}
+
+impl std::fmt::Display for RateAware {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for RateAware {}
+
+/// Whether an error from `gh_api_conditional` was a rate-limit response.
+pub fn is_rate_limited(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<RateAware>(),
+        Some(RateAware {
+            status: 403 | 429,
+            ..
+        })
+    )
+}
+
+/// The parsed head (and body) of a `gh api -i` response.
+struct HttpHead {
+    status: u16,
+    etag: Option<String>,
+    poll_interval: Option<u64>,
+    body: String,
+}
+
+/// Parse `gh api -i` output: an `HTTP/x.y STATUS …` status line, header lines
+/// up to the first blank line, then the body. `None` if the output doesn't
+/// start with an HTTP status line.
+fn parse_http_head(output: &str) -> Option<HttpHead> {
+    let mut lines = output.split_inclusive('\n');
+    let status_line = lines.next()?;
+    let mut parts = status_line.split_whitespace();
+    if !parts.next()?.starts_with("HTTP/") {
+        return None;
+    }
+    let status: u16 = parts.next()?.parse().ok()?;
+
+    let mut etag = None;
+    let mut poll_interval = None;
+    let mut consumed = status_line.len();
+    for line in lines {
+        consumed += line.len();
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            // Header names are case-insensitive; the server sends `Etag:`.
+            if name.eq_ignore_ascii_case("etag") {
+                etag = Some(value.trim().to_string());
+            } else if name.eq_ignore_ascii_case("x-poll-interval") {
+                poll_interval = value.trim().parse().ok();
+            }
+        }
+    }
+
+    Some(HttpHead {
+        status,
+        etag,
+        poll_interval,
+        body: output[consumed..].to_string(),
+    })
+}
+
 /// Run `gh api` with the given trailing arguments and return its stdout.
 fn gh_api(args: &[&str]) -> Result<String> {
     let output = Command::new("gh")
@@ -288,7 +440,38 @@ fn gh_api_stdin(args: &[&str], input: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_remote_url;
+    use super::{parse_http_head, parse_remote_url};
+
+    #[test]
+    fn http_head_200_with_etag_and_body() {
+        let raw = "HTTP/2.0 200 OK\r\nDate: Sat, 06 Jun 2026 10:00:00 GMT\r\nEtag: W/\"abc\"\r\n\r\n[{\"id\":1}]";
+        let head = parse_http_head(raw).unwrap();
+        assert_eq!(head.status, 200);
+        assert_eq!(head.etag.as_deref(), Some("W/\"abc\""));
+        assert_eq!(head.body, "[{\"id\":1}]");
+    }
+
+    #[test]
+    fn http_head_etag_lookup_is_case_insensitive() {
+        let raw = "HTTP/1.1 200 OK\nETAG: \"x\"\n\nbody";
+        let head = parse_http_head(raw).unwrap();
+        assert_eq!(head.etag.as_deref(), Some("\"x\""));
+    }
+
+    #[test]
+    fn http_head_304_has_no_body() {
+        let raw = "HTTP/2.0 304 Not Modified\r\nEtag: \"abc\"\r\n\r\n";
+        let head = parse_http_head(raw).unwrap();
+        assert_eq!(head.status, 304);
+        assert!(head.body.is_empty());
+    }
+
+    #[test]
+    fn http_head_garbage_is_none() {
+        assert!(parse_http_head("").is_none());
+        assert!(parse_http_head("not an http response").is_none());
+        assert!(parse_http_head("HTTP/2.0 notanumber\n\n").is_none());
+    }
 
     #[test]
     fn remote_url_ssh() {

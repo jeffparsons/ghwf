@@ -55,7 +55,9 @@ pub fn comment_json(comment: &Comment) -> Result<String> {
 pub fn build_comment_body(user_body: &str, session_token: Option<&str>) -> String {
     let mut body = format!("**Claude says:**\n<hr>\n\n{}", user_body.trim());
     if let Some(token) = session_token {
-        body.push_str(&format!("\n\n{SESSION_MARKER_PREFIX}{token}{MARKER_SUFFIX}"));
+        body.push_str(&format!(
+            "\n\n{SESSION_MARKER_PREFIX}{token}{MARKER_SUFFIX}"
+        ));
     }
     body
 }
@@ -77,6 +79,19 @@ pub fn extract_marker(body: &str) -> Option<Marker> {
     Some(Marker::Session(rest[..end].to_string()))
 }
 
+/// Whether a comment must be hidden from digests and wake decisions: ghwf
+/// status updates always (they are machinery, whichever session posted them),
+/// and Claude-authored comments only when the current session wrote them.
+/// `my_token` is `None` outside a Claude session, where only status comments
+/// hide.
+pub fn hidden_from_digest(body: &str, my_token: Option<&str>) -> bool {
+    match extract_marker(body) {
+        Some(Marker::Status) => true,
+        Some(Marker::Session(token)) => Some(token.as_str()) == my_token,
+        None => false,
+    }
+}
+
 /// Remove the hidden ghwf marker (and the blank line before it) from a comment
 /// body, leaving just the displayable content.
 pub fn strip_ghwf_marker(body: &str) -> String {
@@ -86,16 +101,32 @@ pub fn strip_ghwf_marker(body: &str) -> String {
     }
 }
 
+/// How Claude should wait for the next human response, appended to every
+/// banner body that ends in a waiting state.
+pub fn wait_instruction(number: u64) -> String {
+    format!(
+        "Once you have posted your comment(s) and have nothing else to do, run \
+         `ghwf wait {number}` — it blocks until there is new activity (up to ~9 minutes; \
+         give it a 10-minute command timeout). Exit 0 means new activity arrived: run \
+         `ghwf work-on {number}` to process it. Exit 2 means nothing yet: run \
+         `ghwf wait {number}` again. Do not poll with your own sleep loops."
+    )
+}
+
 /// Guidance shown to Claude during the pre-plan phase.
-pub const PRE_PLAN_BODY: &str =
-    "Pre-plan — gathering the information needed to write a plan.\n\n\
-     Discuss on the issue itself. Post questions and clarifications as comments with \
-     `ghwf create-issue-comment <issue>`. When you have enough information, post a comment \
-     that summarises your understanding, clearly states you are ready to write a plan, and \
-     ends by prompting the user to comment `/approve-pre-plan` (alias `/approve-preplan`) \
-     on the issue when they're happy to advance.\n\n\
-     Do not start planning or advance the workflow yourself. Wait for the user's \
-     `/approve-pre-plan`; ghwf will then advance to the prep-and-plan phase.";
+pub fn pre_plan_body(number: u64) -> String {
+    format!(
+        "Pre-plan — gathering the information needed to write a plan.\n\n\
+         Discuss on the issue itself. Post questions and clarifications as comments with \
+         `ghwf create-issue-comment <issue>`. When you have enough information, post a comment \
+         that summarises your understanding, clearly states you are ready to write a plan, and \
+         ends by prompting the user to comment `/approve-pre-plan` (alias `/approve-preplan`) \
+         on the issue when they're happy to advance.\n\n\
+         Do not start planning or advance the workflow yourself. Wait for the user's \
+         `/approve-pre-plan`; ghwf will then advance to the prep-and-plan phase.\n\n{}",
+        wait_instruction(number)
+    )
+}
 
 /// A phase transition fired by an approval directive, for banner reporting.
 pub struct Transition {
@@ -301,7 +332,10 @@ pub fn render_work_on(
         );
     }
 
-    let mut out = format!("## #{}: {}  ({})\n", subject.number, subject.title, subject.state);
+    let mut out = format!(
+        "## #{}: {}  ({})\n",
+        subject.number, subject.title, subject.state
+    );
 
     if body_changed {
         out.push_str(&format!(
@@ -430,8 +464,19 @@ mod tests {
     }
 
     #[test]
+    fn pre_plan_body_includes_wait_instruction() {
+        let body = super::pre_plan_body(7);
+        assert!(body.contains("`ghwf wait 7`"));
+        assert!(body.contains("`ghwf work-on 7`"));
+    }
+
+    #[test]
     fn banner_transition_names_command_and_author() {
-        let transitions = [transition(Phase::PrepAndPlan, Phase::Implement, "/approve-plan")];
+        let transitions = [transition(
+            Phase::PrepAndPlan,
+            Phase::Implement,
+            "/approve-plan",
+        )];
         let out = render_phase_banner(Phase::Implement, &transitions, &[], false, "body");
         assert!(out.contains(
             "Phase advanced: prep-and-plan → implement (triggered by `/approve-plan` from user)."
@@ -440,7 +485,11 @@ mod tests {
 
     #[test]
     fn banner_premature_note_suggests_current_command() {
-        let notes = [note(NoteKind::Premature, "/approve-implementation", Phase::PrePlan)];
+        let notes = [note(
+            NoteKind::Premature,
+            "/approve-implementation",
+            Phase::PrePlan,
+        )];
         let out = render_phase_banner(Phase::PrePlan, &[], &notes, false, "body");
         assert!(out.contains("`/approve-implementation` from user (on the PR) was ignored"));
         assert!(out.contains("only in the pre-plan phase"));
@@ -470,9 +519,12 @@ mod tests {
 
     #[test]
     fn status_transition_names_command_and_next_step() {
-        let transitions = [transition(Phase::PrepAndPlan, Phase::Implement, "/approve-plan")];
-        let out =
-            render_status_comment(Phase::Implement, &transitions, &[], false, None).unwrap();
+        let transitions = [transition(
+            Phase::PrepAndPlan,
+            Phase::Implement,
+            "/approve-plan",
+        )];
+        let out = render_status_comment(Phase::Implement, &transitions, &[], false, None).unwrap();
         assert!(out.contains(
             "Phase advanced: prep-and-plan → implement (triggered by `/approve-plan` from user)."
         ));
@@ -483,7 +535,12 @@ mod tests {
 
     #[test]
     fn status_intro_renders_for_every_phase() {
-        for phase in [Phase::PrePlan, Phase::PrepAndPlan, Phase::Implement, Phase::Review] {
+        for phase in [
+            Phase::PrePlan,
+            Phase::PrepAndPlan,
+            Phase::Implement,
+            Phase::Review,
+        ] {
             let out = render_status_comment(phase, &[], &[], true, None).unwrap();
             assert!(out.contains("ghwf is tracking this issue"));
             assert!(out.contains(&format!("**{}** phase", phase.label())));
@@ -492,7 +549,11 @@ mod tests {
 
     #[test]
     fn status_premature_note_names_correct_command() {
-        let notes = [note(NoteKind::Premature, "/approve-implementation", Phase::PrePlan)];
+        let notes = [note(
+            NoteKind::Premature,
+            "/approve-implementation",
+            Phase::PrePlan,
+        )];
         let out = render_status_comment(Phase::PrePlan, &[], &notes, false, None).unwrap();
         assert!(out.contains("was ignored"));
         assert!(out.contains("the command that advances it is `/approve-pre-plan`"));
@@ -500,7 +561,11 @@ mod tests {
 
     #[test]
     fn status_same_run_duplicate_stale_is_skipped() {
-        let transitions = [transition(Phase::PrepAndPlan, Phase::Implement, "/approve-plan")];
+        let transitions = [transition(
+            Phase::PrepAndPlan,
+            Phase::Implement,
+            "/approve-plan",
+        )];
         let stale = [note(NoteKind::Stale, "/approve-plan", Phase::Implement)];
         let out =
             render_status_comment(Phase::Implement, &transitions, &stale, false, None).unwrap();
