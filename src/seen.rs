@@ -14,7 +14,10 @@ use crate::store;
 #[derive(Default, Serialize, Deserialize)]
 pub struct SeenRecord {
     pub issue_body_hash: Option<String>,
-    // Comment id -> content hash of its body.
+    // Conversation comment id -> content hash of its body. Covers the issue
+    // thread and, once a PR exists, the PR conversation thread too —
+    // conversation comment ids share one global namespace, so one map is
+    // unambiguous.
     pub comments: BTreeMap<u64, String>,
     // Inline review comment id -> content hash of its body. These ids come
     // from a different namespace than conversation comment ids, hence the
@@ -55,8 +58,7 @@ pub fn save(
     let dir = path
         .parent()
         .expect("record path always has a parent directory");
-    fs::create_dir_all(dir)
-        .with_context(|| format!("failed to create {}", dir.display()))?;
+    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let json = serde_json::to_string_pretty(record).context("failed to serialize seen-record")?;
     fs::write(&path, json)
         .with_context(|| format!("failed to write seen-record {}", path.display()))

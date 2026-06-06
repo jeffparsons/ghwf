@@ -52,7 +52,11 @@ pub fn run(issue_arg: &str, no_branch: bool) -> Result<()> {
     // Find or create the worktree. The launcher creates it immediately — even
     // before planning — so the session it starts is anchored there and stays
     // resumable across every phase.
-    let worktree = match issue_state.prep.as_ref().and_then(|p| p.worktree_path.clone()) {
+    let worktree = match issue_state
+        .prep
+        .as_ref()
+        .and_then(|p| p.worktree_path.clone())
+    {
         Some(path) => {
             if !path.is_dir() {
                 bail!(
@@ -73,9 +77,13 @@ pub fn run(issue_arg: &str, no_branch: bool) -> Result<()> {
                  is anchored there and can be resumed for later phases."
             );
             let issue_data = github::fetch_issue(issue_arg, repo_ctx.as_ref())?;
-            let (path, branch) = prep::ensure_worktree(&issue_data, &owner, &repo, &mut issue_state)?;
+            let (path, branch) =
+                prep::ensure_worktree(&issue_data, &owner, &repo, &mut issue_state)?;
             state::save(&owner, &repo, number, &issue_state)?;
-            println!("Created worktree `{}` on branch `{branch}`.", path.display());
+            println!(
+                "Created worktree `{}` on branch `{branch}`.",
+                path.display()
+            );
             path
         }
     };
