@@ -3,10 +3,23 @@ use anyhow::{Context, Result};
 use crate::models::{Comment, Issue, ReviewComment};
 use crate::state::Phase;
 
-/// Opening of the hidden metadata marker embedded in Claude-authored comments.
-const MARKER_PREFIX: &str = "<!-- ghwf:v1 session=";
+/// Opening shared by every hidden ghwf metadata marker, for detection/stripping.
+const MARKER_SCAN_PREFIX: &str = "<!-- ghwf:v1 ";
+/// Opening of the session marker embedded in Claude-authored comments.
+const SESSION_MARKER_PREFIX: &str = "<!-- ghwf:v1 session=";
 /// Closing of the hidden metadata marker.
 const MARKER_SUFFIX: &str = " -->";
+/// The complete marker embedded in ghwf-authored status comments.
+const STATUS_MARKER: &str = "<!-- ghwf:v1 status -->";
+
+/// The hidden metadata marker found in a ghwf-posted comment.
+pub enum Marker {
+    /// Claude-authored via `create-issue-comment`, tagged with the authoring
+    /// session's token.
+    Session(String),
+    /// A ghwf-authored status update.
+    Status,
+}
 
 /// A new-or-changed comment prepared for rendering.
 pub struct CommentView<'a> {
@@ -42,23 +55,32 @@ pub fn comment_json(comment: &Comment) -> Result<String> {
 pub fn build_comment_body(user_body: &str, session_token: Option<&str>) -> String {
     let mut body = format!("**Claude says:**\n<hr>\n\n{}", user_body.trim());
     if let Some(token) = session_token {
-        body.push_str(&format!("\n\n{MARKER_PREFIX}{token}{MARKER_SUFFIX}"));
+        body.push_str(&format!("\n\n{SESSION_MARKER_PREFIX}{token}{MARKER_SUFFIX}"));
     }
     body
 }
 
-/// Extract the session token from a comment's hidden ghwf marker, if present.
-pub fn extract_session_token(body: &str) -> Option<String> {
-    let start = body.find(MARKER_PREFIX)? + MARKER_PREFIX.len();
+/// Assemble the body of a ghwf-authored status comment: a visible attribution
+/// header, the status text, and the hidden status marker.
+pub fn build_status_comment_body(text: &str) -> String {
+    format!("**ghwf:**\n<hr>\n\n{}\n\n{STATUS_MARKER}", text.trim())
+}
+
+/// Extract the hidden ghwf marker from a comment body, if present.
+pub fn extract_marker(body: &str) -> Option<Marker> {
+    if body.contains(STATUS_MARKER) {
+        return Some(Marker::Status);
+    }
+    let start = body.find(SESSION_MARKER_PREFIX)? + SESSION_MARKER_PREFIX.len();
     let rest = &body[start..];
     let end = rest.find(MARKER_SUFFIX)?;
-    Some(rest[..end].to_string())
+    Some(Marker::Session(rest[..end].to_string()))
 }
 
 /// Remove the hidden ghwf marker (and the blank line before it) from a comment
 /// body, leaving just the displayable content.
 pub fn strip_ghwf_marker(body: &str) -> String {
-    match body.find(MARKER_PREFIX) {
+    match body.find(MARKER_SCAN_PREFIX) {
         Some(idx) => body[..idx].trim_end().to_string(),
         None => body.to_string(),
     }
@@ -115,6 +137,7 @@ pub fn render_phase_banner(
     phase: Phase,
     transitions: &[Transition],
     notes: &[DirectiveNote],
+    status_posted: bool,
     body: &str,
 ) -> String {
     let mut out = format!("Phase: {}", phase.label());
@@ -132,15 +155,10 @@ pub fn render_phase_banner(
     for note in notes {
         out.push_str(&format!("\n{}", render_note(note)));
     }
-    // Stale notes are harmless echoes; the others are mistakes the user should
-    // hear about.
-    if notes
-        .iter()
-        .any(|n| matches!(n.kind, NoteKind::Premature | NoteKind::Retired))
-    {
+    if status_posted {
         out.push_str(
-            "\nRelay the ignored-directive notes above to the user in a comment, so they \
-             know the correct command.",
+            "\nghwf has posted a status update covering the above to the conversation \
+             thread(s); do not relay it yourself.",
         );
     }
 
@@ -178,6 +196,92 @@ fn render_note(note: &DirectiveNote) -> String {
              retired; the workflow is in the {} phase, and {next_step}.",
             phase_at.label()
         ),
+    }
+}
+
+/// Render the text of a ghwf status update for the conversation threads: what
+/// just happened (transitions and misfired directives), the current phase, and
+/// what the next approval command triggers. `None` when there is nothing worth
+/// posting.
+///
+/// A stale note whose command also fired a transition this run is the
+/// duplicate-across-threads echo — skipped; the transition line already tells
+/// the story.
+pub fn render_status_comment(
+    phase: Phase,
+    transitions: &[Transition],
+    notes: &[DirectiveNote],
+    intro: bool,
+    pr_url: Option<&str>,
+) -> Option<String> {
+    let notes: Vec<&DirectiveNote> = notes
+        .iter()
+        .filter(|note| {
+            !(matches!(note.kind, NoteKind::Stale)
+                && transitions.iter().any(|t| t.command == note.command))
+        })
+        .collect();
+    if !intro && transitions.is_empty() && notes.is_empty() {
+        return None;
+    }
+
+    let mut paragraphs: Vec<String> = Vec::new();
+    if intro {
+        paragraphs.push(
+            "ghwf is tracking this issue; status updates like this one are posted as the \
+             workflow advances."
+                .to_string(),
+        );
+    }
+    for transition in transitions {
+        paragraphs.push(format!(
+            "Phase advanced: {} → {} (triggered by `{}` from {}).",
+            transition.from.label(),
+            transition.to.label(),
+            transition.command,
+            transition.by
+        ));
+    }
+    for note in notes {
+        paragraphs.push(render_note(note));
+    }
+    paragraphs.push(phase_status_prose(phase, pr_url));
+    Some(paragraphs.join("\n\n"))
+}
+
+/// The user-facing description of where the workflow stands and what the next
+/// approval command triggers — the single source of that prose for status
+/// updates.
+fn phase_status_prose(phase: Phase, pr_url: Option<&str>) -> String {
+    match phase {
+        Phase::PrePlan => "The workflow is in the **pre-plan** phase: Claude gathers the \
+             information needed to write a plan and posts its understanding here.\n\n\
+             Next: comment `/approve-pre-plan` (alias `/approve-preplan`) to advance to \
+             prep-and-plan, where a branch and worktree are created and Claude writes an \
+             implementation plan, opened as a draft PR."
+            .to_string(),
+        Phase::PrepAndPlan => "The workflow is in the **prep-and-plan** phase: Claude is \
+             writing the implementation plan; ghwf opens it as a draft PR.\n\n\
+             Next: comment `/approve-plan` (on this issue or the PR) to advance to \
+             implement, where Claude codes the change."
+            .to_string(),
+        Phase::Implement => "The workflow is in the **implement** phase: Claude codes the \
+             change in the worktree, pushing to the draft PR as it goes.\n\n\
+             Next: comment `/approve-implementation` (on this issue or the PR) to advance \
+             to review — the PR flips to ready-for-review."
+            .to_string(),
+        Phase::Review => match pr_url {
+            Some(url) => format!(
+                "The workflow is in the **review** phase: the PR has been marked ready \
+                 for human review: {url}\n\n\
+                 There is no further approval command — merging or closing the PR \
+                 concludes the workflow."
+            ),
+            None => "The workflow is in the **review** phase: the work is complete and \
+                 awaiting human review.\n\n\
+                 There is no further approval command."
+                .to_string(),
+        },
     }
 }
 
@@ -280,8 +384,9 @@ fn blockquote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        render_phase_banner, render_work_on, CommentView, DirectiveNote, NoteKind,
-        ReviewCommentView, Transition,
+        build_comment_body, build_status_comment_body, extract_marker, render_phase_banner,
+        render_status_comment, render_work_on, strip_ghwf_marker, CommentView, DirectiveNote,
+        Marker, NoteKind, ReviewCommentView, Transition,
     };
     use crate::models::{Comment, Issue, ReviewComment, User};
     use crate::state::Phase;
@@ -296,15 +401,38 @@ mod tests {
         }
     }
 
+    fn transition(from: Phase, to: Phase, command: &'static str) -> Transition {
+        Transition {
+            from,
+            to,
+            command,
+            by: "user".to_string(),
+        }
+    }
+
+    #[test]
+    fn marker_session_round_trips() {
+        let body = build_comment_body("hello", Some("tok"));
+        assert!(matches!(extract_marker(&body), Some(Marker::Session(t)) if t == "tok"));
+    }
+
+    #[test]
+    fn marker_status_round_trips_and_strips() {
+        let body = build_status_comment_body("update");
+        assert!(matches!(extract_marker(&body), Some(Marker::Status)));
+        assert!(body.starts_with("**ghwf:**\n<hr>\n\nupdate"));
+        assert_eq!(strip_ghwf_marker(&body), "**ghwf:**\n<hr>\n\nupdate");
+    }
+
+    #[test]
+    fn unmarked_body_has_no_marker() {
+        assert!(extract_marker("just text").is_none());
+    }
+
     #[test]
     fn banner_transition_names_command_and_author() {
-        let transition = Transition {
-            from: Phase::PrepAndPlan,
-            to: Phase::Implement,
-            command: "/approve-plan",
-            by: "user".to_string(),
-        };
-        let out = render_phase_banner(Phase::Implement, &[transition], &[], "body");
+        let transitions = [transition(Phase::PrepAndPlan, Phase::Implement, "/approve-plan")];
+        let out = render_phase_banner(Phase::Implement, &transitions, &[], false, "body");
         assert!(out.contains(
             "Phase advanced: prep-and-plan → implement (triggered by `/approve-plan` from user)."
         ));
@@ -313,27 +441,84 @@ mod tests {
     #[test]
     fn banner_premature_note_suggests_current_command() {
         let notes = [note(NoteKind::Premature, "/approve-implementation", Phase::PrePlan)];
-        let out = render_phase_banner(Phase::PrePlan, &[], &notes, "body");
+        let out = render_phase_banner(Phase::PrePlan, &[], &notes, false, "body");
         assert!(out.contains("`/approve-implementation` from user (on the PR) was ignored"));
         assert!(out.contains("only in the pre-plan phase"));
         assert!(out.contains("the command that advances it is `/approve-pre-plan`"));
-        assert!(out.contains("Relay the ignored-directive notes"));
     }
 
     #[test]
     fn banner_retired_note_in_terminal_phase() {
         let notes = [note(NoteKind::Retired, "/proceed", Phase::Review)];
-        let out = render_phase_banner(Phase::Review, &[], &notes, "body");
+        let out = render_phase_banner(Phase::Review, &[], &notes, false, "body");
         assert!(out.contains("`/proceed` is retired"));
         assert!(out.contains("there is nothing further to approve"));
     }
 
     #[test]
-    fn banner_stale_note_alone_has_no_relay_instruction() {
-        let notes = [note(NoteKind::Stale, "/approve-plan", Phase::Implement)];
-        let out = render_phase_banner(Phase::Implement, &[], &notes, "body");
-        assert!(out.contains("already past the phase it approves"));
-        assert!(!out.contains("Relay the ignored-directive notes"));
+    fn banner_status_posted_line_only_when_posted() {
+        let out = render_phase_banner(Phase::Implement, &[], &[], true, "body");
+        assert!(out.contains("posted a status update"));
+        let out = render_phase_banner(Phase::Implement, &[], &[], false, "body");
+        assert!(!out.contains("posted a status update"));
+    }
+
+    #[test]
+    fn status_nothing_to_report_is_none() {
+        assert!(render_status_comment(Phase::PrePlan, &[], &[], false, None).is_none());
+    }
+
+    #[test]
+    fn status_transition_names_command_and_next_step() {
+        let transitions = [transition(Phase::PrepAndPlan, Phase::Implement, "/approve-plan")];
+        let out =
+            render_status_comment(Phase::Implement, &transitions, &[], false, None).unwrap();
+        assert!(out.contains(
+            "Phase advanced: prep-and-plan → implement (triggered by `/approve-plan` from user)."
+        ));
+        assert!(out.contains("**implement** phase"));
+        assert!(out.contains("`/approve-implementation`"));
+        assert!(out.contains("flips to ready-for-review"));
+    }
+
+    #[test]
+    fn status_intro_renders_for_every_phase() {
+        for phase in [Phase::PrePlan, Phase::PrepAndPlan, Phase::Implement, Phase::Review] {
+            let out = render_status_comment(phase, &[], &[], true, None).unwrap();
+            assert!(out.contains("ghwf is tracking this issue"));
+            assert!(out.contains(&format!("**{}** phase", phase.label())));
+        }
+    }
+
+    #[test]
+    fn status_premature_note_names_correct_command() {
+        let notes = [note(NoteKind::Premature, "/approve-implementation", Phase::PrePlan)];
+        let out = render_status_comment(Phase::PrePlan, &[], &notes, false, None).unwrap();
+        assert!(out.contains("was ignored"));
+        assert!(out.contains("the command that advances it is `/approve-pre-plan`"));
+    }
+
+    #[test]
+    fn status_same_run_duplicate_stale_is_skipped() {
+        let transitions = [transition(Phase::PrepAndPlan, Phase::Implement, "/approve-plan")];
+        let stale = [note(NoteKind::Stale, "/approve-plan", Phase::Implement)];
+        let out =
+            render_status_comment(Phase::Implement, &transitions, &stale, false, None).unwrap();
+        assert!(!out.contains("was ignored"));
+        // Alone — a genuinely late approval, not a same-run echo — it is reported.
+        let out = render_status_comment(Phase::Implement, &[], &stale, false, None).unwrap();
+        assert!(out.contains("was ignored"));
+    }
+
+    #[test]
+    fn status_review_names_pr_and_terminality() {
+        let url = "https://github.com/o/r/pull/9";
+        let out = render_status_comment(Phase::Review, &[], &[], true, Some(url)).unwrap();
+        assert!(out.contains(url));
+        assert!(out.contains("no further approval command"));
+        // Without a PR the prose still closes the workflow out.
+        let out = render_status_comment(Phase::Review, &[], &[], true, None).unwrap();
+        assert!(out.contains("no further approval command"));
     }
 
     fn issue() -> Issue {

@@ -143,6 +143,11 @@ pub struct IssueState {
     // are globally unique across the issue and PR conversation threads, so one
     // set dedupes both sources.
     pub consumed_directives: BTreeSet<u64>,
+    // Whether the one-time intro status update has been posted to the issue.
+    // Defaults to false for pre-existing state files, so issues already
+    // mid-flight get one phase-aware intro on their next `work-on`.
+    #[serde(default)]
+    pub intro_posted: bool,
     // Populated once the prep-and-plan phase begins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prep: Option<PrepState>,
