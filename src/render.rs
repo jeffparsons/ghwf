@@ -69,33 +69,116 @@ pub const PRE_PLAN_BODY: &str =
     "Pre-plan — gathering the information needed to write a plan.\n\n\
      Discuss on the issue itself. Post questions and clarifications as comments with \
      `ghwf create-issue-comment <issue>`. When you have enough information, post a comment \
-     that summarises your understanding and clearly states you are ready to write a plan.\n\n\
-     Do not start planning or advance the workflow yourself. Wait for the user to comment \
-     `/proceed` on the issue; ghwf will then advance to the prep-and-plan phase.";
+     that summarises your understanding, clearly states you are ready to write a plan, and \
+     ends by prompting the user to comment `/approve-pre-plan` (alias `/approve-preplan`) \
+     on the issue when they're happy to advance.\n\n\
+     Do not start planning or advance the workflow yourself. Wait for the user's \
+     `/approve-pre-plan`; ghwf will then advance to the prep-and-plan phase.";
 
-/// Render the phase banner shown atop `work-on` output: the current phase, an
-/// optional transition note, then the phase-specific `body`.
+/// A phase transition fired by an approval directive, for banner reporting.
+pub struct Transition {
+    pub from: Phase,
+    pub to: Phase,
+    /// The canonical spelling of the directive that fired.
+    pub command: &'static str,
+    /// Who posted it.
+    pub by: String,
+}
+
+/// Why a consumed directive did not fire.
+pub enum NoteKind {
+    /// Approves a phase the workflow has already moved past (e.g. the same
+    /// approval posted on both threads).
+    Stale,
+    /// Approves a phase the workflow has not reached yet.
+    Premature,
+    /// The retired generic `/proceed`.
+    Retired,
+}
+
+/// A consumed-but-not-fired directive, for banner reporting.
+pub struct DirectiveNote {
+    pub kind: NoteKind,
+    /// The canonical spelling of the directive.
+    pub command: &'static str,
+    /// Who posted it.
+    pub by: String,
+    /// Which conversation thread it was posted on ("issue" / "PR").
+    pub source: &'static str,
+    /// The workflow phase at the moment the directive was processed.
+    pub phase_at: Phase,
+}
+
+/// Render the phase banner shown atop `work-on` output: the current phase, any
+/// transitions and directive notes from this run, then the phase-specific `body`.
 pub fn render_phase_banner(
     phase: Phase,
-    transition: Option<(Phase, Phase, Option<String>)>,
+    transitions: &[Transition],
+    notes: &[DirectiveNote],
     body: &str,
 ) -> String {
     let mut out = format!("Phase: {}", phase.label());
 
-    if let Some((from, to, trigger)) = transition {
-        let by = trigger
-            .map(|login| format!(" from {login}"))
-            .unwrap_or_default();
+    for transition in transitions {
         out.push_str(&format!(
-            "\nPhase advanced: {} → {} (triggered by `/proceed`{by}).",
-            from.label(),
-            to.label()
+            "\nPhase advanced: {} → {} (triggered by `{}` from {}).",
+            transition.from.label(),
+            transition.to.label(),
+            transition.command,
+            transition.by
         ));
+    }
+
+    for note in notes {
+        out.push_str(&format!("\n{}", render_note(note)));
+    }
+    // Stale notes are harmless echoes; the others are mistakes the user should
+    // hear about.
+    if notes
+        .iter()
+        .any(|n| matches!(n.kind, NoteKind::Premature | NoteKind::Retired))
+    {
+        out.push_str(
+            "\nRelay the ignored-directive notes above to the user in a comment, so they \
+             know the correct command.",
+        );
     }
 
     out.push_str("\n\n");
     out.push_str(body);
     out
+}
+
+/// One banner line explaining a consumed-but-not-fired directive.
+fn render_note(note: &DirectiveNote) -> String {
+    let DirectiveNote {
+        command,
+        by,
+        source,
+        phase_at,
+        ..
+    } = note;
+    // What would advance the workflow from where it stands.
+    let next_step = match phase_at.approval_command() {
+        Some(cmd) => format!("the command that advances it is `{cmd}`"),
+        None => "there is nothing further to approve".to_string(),
+    };
+    match note.kind {
+        NoteKind::Stale => format!(
+            "Note: `{command}` from {by} (on the {source}) was ignored — the workflow is \
+             already past the phase it approves."
+        ),
+        NoteKind::Premature => format!(
+            "Note: `{command}` from {by} (on the {source}) was ignored — the workflow is \
+             only in the {} phase; {next_step}.",
+            phase_at.label()
+        ),
+        NoteKind::Retired => format!(
+            "Note: `{command}` from {by} (on the {source}) was ignored — `/proceed` is \
+             retired; the workflow is in the {} phase, and {next_step}.",
+            phase_at.label()
+        ),
+    }
 }
 
 /// Render the markdown digest of what's new or changed on the digest `subject` —
@@ -196,8 +279,62 @@ fn blockquote(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_work_on, CommentView, ReviewCommentView};
+    use super::{
+        render_phase_banner, render_work_on, CommentView, DirectiveNote, NoteKind,
+        ReviewCommentView, Transition,
+    };
     use crate::models::{Comment, Issue, ReviewComment, User};
+    use crate::state::Phase;
+
+    fn note(kind: NoteKind, command: &'static str, phase_at: Phase) -> DirectiveNote {
+        DirectiveNote {
+            kind,
+            command,
+            by: "user".to_string(),
+            source: "PR",
+            phase_at,
+        }
+    }
+
+    #[test]
+    fn banner_transition_names_command_and_author() {
+        let transition = Transition {
+            from: Phase::PrepAndPlan,
+            to: Phase::Implement,
+            command: "/approve-plan",
+            by: "user".to_string(),
+        };
+        let out = render_phase_banner(Phase::Implement, &[transition], &[], "body");
+        assert!(out.contains(
+            "Phase advanced: prep-and-plan → implement (triggered by `/approve-plan` from user)."
+        ));
+    }
+
+    #[test]
+    fn banner_premature_note_suggests_current_command() {
+        let notes = [note(NoteKind::Premature, "/approve-implementation", Phase::PrePlan)];
+        let out = render_phase_banner(Phase::PrePlan, &[], &notes, "body");
+        assert!(out.contains("`/approve-implementation` from user (on the PR) was ignored"));
+        assert!(out.contains("only in the pre-plan phase"));
+        assert!(out.contains("the command that advances it is `/approve-pre-plan`"));
+        assert!(out.contains("Relay the ignored-directive notes"));
+    }
+
+    #[test]
+    fn banner_retired_note_in_terminal_phase() {
+        let notes = [note(NoteKind::Retired, "/proceed", Phase::Review)];
+        let out = render_phase_banner(Phase::Review, &[], &notes, "body");
+        assert!(out.contains("`/proceed` is retired"));
+        assert!(out.contains("there is nothing further to approve"));
+    }
+
+    #[test]
+    fn banner_stale_note_alone_has_no_relay_instruction() {
+        let notes = [note(NoteKind::Stale, "/approve-plan", Phase::Implement)];
+        let out = render_phase_banner(Phase::Implement, &[], &notes, "body");
+        assert!(out.contains("already past the phase it approves"));
+        assert!(!out.contains("Relay the ignored-directive notes"));
+    }
 
     fn issue() -> Issue {
         Issue {

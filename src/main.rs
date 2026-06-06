@@ -95,8 +95,16 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
 
     // Load the issue's workflow state once; mutate and save it at the end.
     let mut issue_state = state::load(&owner, &repo, number)?;
-    // `/proceed` directives are always read from the issue thread.
-    let transition = advance_phase(&mut issue_state, &issue_comments);
+
+    // Approval directives are honoured from the issue thread and, once a PR
+    // exists, its conversation thread too — fetched now, before directive
+    // processing, and reused for the digest below.
+    let pr_number = issue_state.prep.as_ref().and_then(|p| p.pr_number);
+    let early_pr_comments = match pr_number {
+        Some(pr) => Some(github::fetch_comments(&pr.to_string(), repo_ctx.as_ref())?),
+        None => None,
+    };
+    let outcome = advance_phase(&mut issue_state, &issue_comments, early_pr_comments.as_deref());
 
     // The phase-specific banner body. Prep-and-plan does real work here (and
     // hard-errors if it needs a config that's missing); implement/review are light.
@@ -145,6 +153,7 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     // Choose which thread to digest: during implement/review, the PR conversation
     // thread (review feedback); otherwise the issue thread. Both share the issues
     // comments endpoint, so the machinery below is identical either way.
+    // Re-read the PR number: the prep-and-plan phase body may have just opened it.
     let pr_number = issue_state.prep.as_ref().and_then(|p| p.pr_number);
     let digest_pr =
         matches!(phase, state::Phase::Implement | state::Phase::Review) && pr_number.is_some();
@@ -154,7 +163,12 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         let pr = pr_number.expect("pr number checked above");
         let pr_arg = pr.to_string();
         let pr_data = github::fetch_issue(&pr_arg, repo_ctx.as_ref())?;
-        let pr_comments = github::fetch_comments(&pr_arg, repo_ctx.as_ref())?;
+        // Reuse the comments fetched for directive scanning; the fallback only
+        // applies if the PR appeared during this run's phase body.
+        let pr_comments = match early_pr_comments {
+            Some(comments) => comments,
+            None => github::fetch_comments(&pr_arg, repo_ctx.as_ref())?,
+        };
         let pr_review_comments = github::fetch_review_comments(&owner, &repo, pr)?;
         (pr_data, pr_comments, Some(pr_review_comments), "PR")
     } else {
@@ -202,7 +216,10 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         }
     }
 
-    println!("{}", render::render_phase_banner(phase, transition, &body));
+    println!(
+        "{}",
+        render::render_phase_banner(phase, &outcome.transitions, &outcome.notes, &body)
+    );
     println!();
     println!(
         "{}",
@@ -245,16 +262,36 @@ fn needs_worktree_guard(phase: state::Phase, issue_state: &state::IssueState) ->
     matches!(phase, state::Phase::PrepAndPlan | state::Phase::Implement)
 }
 
-/// Process any new `/proceed` directives in the comments, advancing the issue's
-/// phase in `issue_state`. Returns a description of the transition if one happened.
+/// What directive processing did this run: phase transitions that fired, and
+/// consumed directives that didn't (with why).
+#[derive(Default)]
+struct AdvanceOutcome {
+    transitions: Vec<render::Transition>,
+    notes: Vec<render::DirectiveNote>,
+}
+
+/// Process any new approval directives on the issue and PR conversation
+/// threads, advancing the issue's phase in `issue_state`.
+///
+/// Every directive in an unconsumed user comment is consumed exactly once; one
+/// that doesn't approve the current phase is recorded as a note (stale,
+/// premature, or retired `/proceed`) instead of firing.
 fn advance_phase(
     issue_state: &mut state::IssueState,
-    comments: &[models::Comment],
-) -> Option<(state::Phase, state::Phase, Option<String>)> {
-    let initial = issue_state.phase;
-    let mut trigger = None;
+    issue_comments: &[models::Comment],
+    pr_comments: Option<&[models::Comment]>,
+) -> AdvanceOutcome {
+    // Merge both threads chronologically, so successive approvals posted
+    // together fire in the order they were written.
+    let mut tagged: Vec<(&models::Comment, &'static str)> = issue_comments
+        .iter()
+        .map(|comment| (comment, "issue"))
+        .chain(pr_comments.into_iter().flatten().map(|comment| (comment, "PR")))
+        .collect();
+    tagged.sort_by(|a, b| a.0.created_at.cmp(&b.0.created_at));
 
-    for comment in comments {
+    let mut outcome = AdvanceOutcome::default();
+    for (comment, source) in tagged {
         // Only the user's comments are directives; skip Claude/ghwf-authored ones.
         if render::extract_session_token(&comment.body).is_some() {
             continue;
@@ -262,17 +299,39 @@ fn advance_phase(
         if issue_state.consumed_directives.contains(&comment.id) {
             continue;
         }
-        if state::is_proceed_directive(&comment.body) {
-            // Consume the directive regardless, so it never re-fires.
-            issue_state.consumed_directives.insert(comment.id);
-            if let Some(next) = issue_state.phase.next() {
-                issue_state.phase = next;
-                trigger = Some(comment.user.login.clone());
-            }
-        }
-    }
+        let Some(directive) = state::parse_directive(&comment.body) else {
+            continue;
+        };
+        // Consume the directive whatever happens next, so it never re-fires.
+        issue_state.consumed_directives.insert(comment.id);
 
-    (issue_state.phase != initial).then_some((initial, issue_state.phase, trigger))
+        let phase = issue_state.phase;
+        let kind = match directive.approves() {
+            // Approves the current phase: advance.
+            Some(approved) if approved == phase => {
+                let to = phase.next().expect("approvable phases have a successor");
+                issue_state.phase = to;
+                outcome.transitions.push(render::Transition {
+                    from: phase,
+                    to,
+                    command: directive.command(),
+                    by: comment.user.login.clone(),
+                });
+                continue;
+            }
+            Some(approved) if approved < phase => render::NoteKind::Stale,
+            Some(_) => render::NoteKind::Premature,
+            None => render::NoteKind::Retired,
+        };
+        outcome.notes.push(render::DirectiveNote {
+            kind,
+            command: directive.command(),
+            by: comment.user.login.clone(),
+            source,
+            phase_at: phase,
+        });
+    }
+    outcome
 }
 
 fn create_issue_comment(issue: &str) -> Result<()> {
@@ -295,4 +354,123 @@ fn create_issue_comment(issue: &str) -> Result<()> {
     let comment = github::post_issue_comment(issue, &body, repo_ctx.as_ref())?;
     println!("{}", render::comment_json(&comment)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::advance_phase;
+    use crate::models::{Comment, User};
+    use crate::render::NoteKind;
+    use crate::state::{IssueState, Phase};
+
+    fn comment(id: u64, body: &str, created_at: &str) -> Comment {
+        Comment {
+            id,
+            user: User {
+                login: "user".to_string(),
+            },
+            body: body.to_string(),
+            created_at: created_at.to_string(),
+            updated_at: created_at.to_string(),
+            html_url: format!("https://github.com/o/r/issues/1#issuecomment-{id}"),
+            author_association: "OWNER".to_string(),
+        }
+    }
+
+    fn state_in(phase: Phase) -> IssueState {
+        IssueState {
+            phase,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn matching_directive_advances_and_consumes() {
+        let mut state = state_in(Phase::PrePlan);
+        let comments = [comment(1, "/approve-pre-plan", "2026-01-01T00:00:00Z")];
+        let outcome = advance_phase(&mut state, &comments, None);
+        assert_eq!(state.phase, Phase::PrepAndPlan);
+        assert_eq!(outcome.transitions.len(), 1);
+        assert_eq!(outcome.transitions[0].command, "/approve-pre-plan");
+        assert!(state.consumed_directives.contains(&1));
+        assert!(outcome.notes.is_empty());
+    }
+
+    #[test]
+    fn pr_thread_directive_advances() {
+        let mut state = state_in(Phase::PrepAndPlan);
+        let pr = [comment(2, "/approve-plan", "2026-01-01T00:00:00Z")];
+        let outcome = advance_phase(&mut state, &[], Some(&pr));
+        assert_eq!(state.phase, Phase::Implement);
+        assert_eq!(outcome.transitions.len(), 1);
+        assert_eq!(outcome.transitions[0].by, "user");
+    }
+
+    #[test]
+    fn duplicate_across_threads_is_stale() {
+        let mut state = state_in(Phase::PrepAndPlan);
+        let issue = [comment(1, "/approve-plan", "2026-01-01T00:00:00Z")];
+        let pr = [comment(2, "/approve-plan", "2026-01-01T00:01:00Z")];
+        let outcome = advance_phase(&mut state, &issue, Some(&pr));
+        assert_eq!(state.phase, Phase::Implement);
+        assert_eq!(outcome.transitions.len(), 1);
+        assert_eq!(outcome.notes.len(), 1);
+        assert!(matches!(outcome.notes[0].kind, NoteKind::Stale));
+        assert_eq!(outcome.notes[0].source, "PR");
+        assert!(state.consumed_directives.contains(&2));
+    }
+
+    #[test]
+    fn premature_directive_is_noted_not_fired() {
+        let mut state = state_in(Phase::PrePlan);
+        let comments = [comment(1, "/approve-implementation", "2026-01-01T00:00:00Z")];
+        let outcome = advance_phase(&mut state, &comments, None);
+        assert_eq!(state.phase, Phase::PrePlan);
+        assert!(outcome.transitions.is_empty());
+        assert!(matches!(outcome.notes[0].kind, NoteKind::Premature));
+        // Consumed: it must never fire later once the phase catches up.
+        assert!(state.consumed_directives.contains(&1));
+    }
+
+    #[test]
+    fn retired_proceed_is_noted_not_fired() {
+        let mut state = state_in(Phase::PrePlan);
+        let comments = [comment(1, "/proceed", "2026-01-01T00:00:00Z")];
+        let outcome = advance_phase(&mut state, &comments, None);
+        assert_eq!(state.phase, Phase::PrePlan);
+        assert!(outcome.transitions.is_empty());
+        assert!(matches!(outcome.notes[0].kind, NoteKind::Retired));
+        assert!(state.consumed_directives.contains(&1));
+    }
+
+    #[test]
+    fn consumed_and_claude_comments_are_skipped() {
+        let mut state = state_in(Phase::PrePlan);
+        state.consumed_directives.insert(1);
+        let claude_body = crate::render::build_comment_body("/approve-pre-plan", Some("tok"));
+        let comments = [
+            comment(1, "/approve-pre-plan", "2026-01-01T00:00:00Z"),
+            comment(2, &claude_body, "2026-01-01T00:01:00Z"),
+        ];
+        let outcome = advance_phase(&mut state, &comments, None);
+        assert_eq!(state.phase, Phase::PrePlan);
+        assert!(outcome.transitions.is_empty());
+        assert!(outcome.notes.is_empty());
+        assert!(!state.consumed_directives.contains(&2));
+    }
+
+    #[test]
+    fn successive_approvals_advance_twice_in_chronological_order() {
+        let mut state = state_in(Phase::PrePlan);
+        // The earlier approval arrives via the PR slice and the later via the
+        // issue slice: the chronological merge must fire pre-plan's first.
+        let issue = [comment(2, "/approve-plan", "2026-01-01T00:01:00Z")];
+        let pr = [comment(1, "/approve-pre-plan", "2026-01-01T00:00:00Z")];
+        let outcome = advance_phase(&mut state, &issue, Some(&pr));
+        assert_eq!(state.phase, Phase::Implement);
+        assert_eq!(outcome.transitions.len(), 2);
+        assert_eq!(outcome.transitions[0].command, "/approve-pre-plan");
+        assert_eq!(outcome.transitions[1].command, "/approve-plan");
+        assert!(outcome.notes.is_empty());
+    }
 }
