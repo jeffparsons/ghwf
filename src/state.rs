@@ -82,8 +82,9 @@ pub struct IssueState {
 pub struct PrepState {
     // Whether this issue is being worked without a dedicated branch/worktree/PR.
     pub no_branch: bool,
-    // The Claude session that started prep-and-plan, when known.
-    pub session_id: Option<String>,
+    // The Claude session most recently seen running `work-on` inside this
+    // issue's worktree. The outside-Claude launcher resumes it by id.
+    pub worktree_session_id: Option<String>,
     // The branch name, once the worktree has been created.
     pub branch: Option<String>,
     // The worktree path, once created.

@@ -2,6 +2,7 @@ mod config;
 mod git;
 mod github;
 mod implement;
+mod launch;
 mod models;
 mod prep;
 mod render;
@@ -77,6 +78,14 @@ fn worktree_path(issue: &str) -> Result<()> {
 }
 
 fn work_on(issue: &str, no_branch: bool) -> Result<()> {
+    // Identify this Claude session so we can scope the seen cache and suppress
+    // our own comments. Without one we're running outside Claude Code: act as a
+    // launcher instead, preparing the worktree and starting Claude in it.
+    let session_id = match std::env::var(store::SESSION_ID_ENV) {
+        Ok(id) if !id.is_empty() => id,
+        _ => return launch::run(issue, no_branch),
+    };
+
     // A discovered ghwf.toml is the source of truth for which repo to operate on.
     let repo_ctx = github::config_repo()?;
     let issue_data = github::fetch_issue(issue, repo_ctx.as_ref())?;
@@ -107,6 +116,16 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     // it's absent.
     config::warn_if_absent();
 
+    // Record this session as the worktree's session when running inside it, so
+    // the outside-Claude launcher can later resume it by id.
+    if let Some(prep) = issue_state.prep.as_mut() {
+        if let Some(worktree) = prep.worktree_path.clone() {
+            if worktree::cwd_is_inside(&worktree) {
+                prep.worktree_session_id = Some(session_id.clone());
+            }
+        }
+    }
+
     state::save(&owner, &repo, number, &issue_state)?;
 
     // Hard-error if this phase needs the issue's worktree but Claude isn't running
@@ -118,20 +137,10 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
             .and_then(|p| p.worktree_path.as_ref())
             .expect("guard requires a recorded worktree path");
         let config_dir = config::find()?.map(|located| located.dir);
-        worktree::ensure_inside(worktree, config_dir.as_deref())?;
+        worktree::ensure_inside(worktree, config_dir.as_deref(), number)?;
     }
 
-    // Identify this Claude session so we can scope the seen cache and suppress our
-    // own comments. Without a session (run outside Claude Code) we show everything
-    // and persist nothing.
-    let session_id = match std::env::var(store::SESSION_ID_ENV) {
-        Ok(id) if !id.is_empty() => Some(id),
-        _ => None,
-    };
-    let my_token = match &session_id {
-        Some(id) => Some(store::session_token(id)?),
-        None => None,
-    };
+    let my_token = store::session_token(&session_id)?;
 
     // Choose which thread to digest: during implement/review, the PR conversation
     // thread (review feedback); otherwise the issue thread. Both share the issues
@@ -148,10 +157,7 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         (issue_data, issue_comments, "issue")
     };
 
-    let record = match &session_id {
-        Some(id) => seen::load(id, &owner, &repo, number)?,
-        None => seen::SeenRecord::default(),
-    };
+    let record = seen::load(&session_id, &owner, &repo, number)?;
 
     let body_hash = store::content_hash(subject.body.as_deref().unwrap_or(""));
     let body_changed = record.issue_body_hash.as_deref() != Some(&body_hash);
@@ -159,7 +165,7 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     let mut new = Vec::new();
     for comment in &subject_comments {
         // Don't feed this session's own comments back to it.
-        if my_token.is_some() && render::extract_session_token(&comment.body) == my_token {
+        if render::extract_session_token(&comment.body).as_deref() == Some(my_token.as_str()) {
             continue;
         }
         let hash = store::content_hash(&comment.body);
@@ -181,16 +187,14 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     );
 
     // Record the current state so the next run only surfaces later changes.
-    if let Some(id) = &session_id {
-        let updated = seen::SeenRecord {
-            issue_body_hash: Some(body_hash),
-            comments: subject_comments
-                .iter()
-                .map(|c| (c.id, store::content_hash(&c.body)))
-                .collect(),
-        };
-        seen::save(id, &owner, &repo, number, &updated)?;
-    }
+    let updated = seen::SeenRecord {
+        issue_body_hash: Some(body_hash),
+        comments: subject_comments
+            .iter()
+            .map(|c| (c.id, store::content_hash(&c.body)))
+            .collect(),
+    };
+    seen::save(&session_id, &owner, &repo, number, &updated)?;
 
     Ok(())
 }
