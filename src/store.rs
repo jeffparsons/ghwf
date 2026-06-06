@@ -56,8 +56,7 @@ pub fn session_token(session_id: &str) -> Result<String> {
 /// to the session that authored it. The reverse direction is just a recompute.
 fn record_session(token: &str, session_id: &str) -> Result<()> {
     let dir = data_dir()?.join("sessions");
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create {}", dir.display()))?;
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let path = dir.join(token);
     fs::write(&path, session_id)
         .with_context(|| format!("failed to record session mapping at {}", path.display()))

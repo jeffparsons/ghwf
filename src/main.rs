@@ -234,34 +234,28 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         state::fold_since(&mut wait_state.since, &comment.updated_at);
     }
 
-    // Choose which thread to digest: during implement/review, the PR conversation
-    // thread (review feedback); otherwise the issue thread. Both share the issues
-    // comments endpoint, so the machinery below is identical either way.
-    let digest_pr =
-        matches!(phase, state::Phase::Implement | state::Phase::Review) && pr_number.is_some();
-    // Inline review comments only exist for a PR digest; `None` for the
-    // issue-thread phases, which must leave the cached map untouched.
-    let (subject, subject_comments, review_comments, subject_noun) = if digest_pr {
-        let pr = pr_number.expect("pr number checked above");
-        let pr_arg = pr.to_string();
-        let pr_data = github::fetch_issue(&pr_arg, repo_ctx.as_ref())?;
-        // Reuse the comments fetched for directive scanning; the fallback only
-        // applies if the PR appeared during this run's phase body.
-        let pr_comments = match early_pr_comments {
-            Some(comments) => comments,
-            None => github::fetch_comments(&pr_arg, repo_ctx.as_ref())?,
-        };
-        let pr_review_comments = github::fetch_review_comments(&owner, &repo, pr)?;
-        (pr_data, pr_comments, Some(pr_review_comments), "PR")
-    } else {
-        (issue_data, issue_comments, None, "issue")
+    // The issue is always the digest's primary subject. Once a PR exists, its
+    // conversation thread and inline review comments are digested too, in
+    // every phase — matching exactly what `wait` polls. The PR object itself
+    // (body/title) is never digested.
+    let (pr_comments, review_comments) = match pr_number {
+        Some(pr) => {
+            // Reuse the comments fetched for directive scanning; the fallback
+            // only applies if the PR appeared during this run's phase body.
+            let pr_comments = match early_pr_comments {
+                Some(comments) => comments,
+                None => github::fetch_comments(&pr.to_string(), repo_ctx.as_ref())?,
+            };
+            let pr_review_comments = github::fetch_review_comments(&owner, &repo, pr)?;
+            (Some(pr_comments), Some(pr_review_comments))
+        }
+        None => (None, None),
     };
 
-    // Fold in whatever the digest fetched: PR data and comments when the
-    // digest subject is the PR, and inline review comments when present.
-    // (Issue-thread re-inserts are identical no-ops.)
-    state::fold_since(&mut wait_state.since, &subject.updated_at);
-    for comment in &subject_comments {
+    // Fold in whatever the digest fetched beyond the early fetches: PR
+    // comments when the PR appeared only during this run's phase body, and
+    // inline review comments. (Re-inserts are identical no-ops.)
+    for comment in pr_comments.iter().flatten() {
         wait_state
             .comments
             .insert(comment.id, store::content_hash(&comment.body));
@@ -276,30 +270,19 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
 
     let record = seen::load(&session_id, &owner, &repo, number)?;
 
-    let body_hash = store::content_hash(subject.body.as_deref().unwrap_or(""));
+    let body_hash = store::content_hash(issue_data.body.as_deref().unwrap_or(""));
     let body_changed = record.issue_body_hash.as_deref() != Some(&body_hash);
 
-    let mut new = Vec::new();
-    for comment in &subject_comments {
-        // Don't feed ghwf status updates or this session's own comments back.
-        if render::hidden_from_digest(&comment.body, Some(&my_token)) {
-            continue;
-        }
-        let hash = store::content_hash(&comment.body);
-        let previous = record.comments.get(&comment.id);
-        if previous != Some(&hash) {
-            new.push(CommentView {
-                comment,
-                body: render::strip_ghwf_marker(&comment.body),
-                updated: previous.is_some(),
-            });
-        }
-    }
+    let new_issue = collect_new_comments(&issue_comments, &record.comments, &my_token);
+    let new_pr = match pr_comments.as_deref() {
+        Some(comments) => collect_new_comments(comments, &record.comments, &my_token),
+        None => Vec::new(),
+    };
 
     let mut new_review = Vec::new();
     for comment in review_comments.iter().flatten() {
-        // Same filter as above, for symmetry — though ghwf never authors
-        // inline review comments today.
+        // Same filter as conversation comments, for symmetry — though ghwf
+        // never authors inline review comments today.
         if render::hidden_from_digest(&comment.body, Some(&my_token)) {
             continue;
         }
@@ -328,14 +311,22 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     println!();
     println!(
         "{}",
-        render::render_work_on(&subject, subject_noun, body_changed, &new, &new_review)
+        render::render_work_on(
+            &issue_data,
+            body_changed,
+            &new_issue,
+            pr_number,
+            &new_pr,
+            &new_review
+        )
     );
 
     // Record the current state so the next run only surfaces later changes.
     let updated = seen::SeenRecord {
         issue_body_hash: Some(body_hash),
-        comments: subject_comments
+        comments: issue_comments
             .iter()
+            .chain(pr_comments.iter().flatten())
             .map(|c| (c.id, store::content_hash(&c.body)))
             .collect(),
         review_comments: match review_comments.as_ref() {
@@ -343,7 +334,8 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
                 .iter()
                 .map(|c| (c.id, store::content_hash(&c.body)))
                 .collect(),
-            // Not fetched this run; carry the cached map over unchanged.
+            // No PR yet, so not fetched this run; carry the cached map over
+            // unchanged.
             None => record.review_comments,
         },
     };
@@ -374,6 +366,32 @@ fn post_status(
             None
         }
     }
+}
+
+/// Collect one thread's new-or-changed conversation comments, diffed against
+/// the seen-record's comment map by content hash. Hidden comments (ghwf status
+/// updates, this session's own posts) are skipped.
+fn collect_new_comments<'a>(
+    comments: &'a [models::Comment],
+    seen: &std::collections::BTreeMap<u64, String>,
+    my_token: &str,
+) -> Vec<CommentView<'a>> {
+    let mut new = Vec::new();
+    for comment in comments {
+        if render::hidden_from_digest(&comment.body, Some(my_token)) {
+            continue;
+        }
+        let hash = store::content_hash(&comment.body);
+        let previous = seen.get(&comment.id);
+        if previous != Some(&hash) {
+            new.push(CommentView {
+                comment,
+                body: render::strip_ghwf_marker(&comment.body),
+                updated: previous.is_some(),
+            });
+        }
+    }
+    new
 }
 
 /// Whether this phase requires Claude to be inside the issue's worktree.
@@ -619,6 +637,41 @@ mod tests {
         assert!(outcome.transitions.is_empty());
         assert!(outcome.notes.is_empty());
         assert!(!state.consumed_directives.contains(&1));
+    }
+
+    #[test]
+    fn collect_new_comments_diffs_against_seen_map() {
+        use super::collect_new_comments;
+        use std::collections::BTreeMap;
+
+        let comments = [
+            comment(1, "already seen", "2026-01-01T00:00:00Z"),
+            comment(2, "now edited", "2026-01-01T00:01:00Z"),
+            comment(3, "brand new", "2026-01-01T00:02:00Z"),
+            comment(
+                4,
+                &crate::render::build_status_comment_body("machinery"),
+                "2026-01-01T00:03:00Z",
+            ),
+            comment(
+                5,
+                &crate::render::build_comment_body("mine", Some("mine")),
+                "2026-01-01T00:04:00Z",
+            ),
+        ];
+
+        let seen: BTreeMap<u64, String> = [
+            (1, crate::store::content_hash("already seen")),
+            (2, crate::store::content_hash("original")),
+        ]
+        .into();
+
+        let new = collect_new_comments(&comments, &seen, "mine");
+        assert_eq!(new.len(), 2);
+        assert_eq!(new[0].comment.id, 2);
+        assert!(new[0].updated);
+        assert_eq!(new[1].comment.id, 3);
+        assert!(!new[1].updated);
     }
 
     #[test]

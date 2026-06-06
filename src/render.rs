@@ -316,58 +316,55 @@ fn phase_status_prose(phase: Phase, pr_url: Option<&str>) -> String {
     }
 }
 
-/// Render the markdown digest of what's new or changed on the digest `subject` —
-/// an issue or a PR. `noun` ("issue" / "PR") tailors the prose for each.
+/// Render the markdown digest of what's new or changed across the threads —
+/// the issue and, once a PR exists, its conversation thread and inline review
+/// comments too. The issue is always the primary subject (header + body); the
+/// PR's body is never digested.
 pub fn render_work_on(
-    subject: &Issue,
-    noun: &str,
+    issue: &Issue,
     body_changed: bool,
-    new: &[CommentView],
+    new_issue: &[CommentView],
+    pr_number: Option<u64>,
+    new_pr: &[CommentView],
     new_review: &[ReviewCommentView],
 ) -> String {
-    if !body_changed && new.is_empty() && new_review.is_empty() {
-        return format!(
-            "No new activity on {noun} #{} \"{}\" since you last ran `ghwf work-on`.",
-            subject.number, subject.title
-        );
+    if !body_changed && new_issue.is_empty() && new_pr.is_empty() && new_review.is_empty() {
+        let threads = match pr_number {
+            Some(pr) => format!("issue #{} \"{}\" or PR #{pr}", issue.number, issue.title),
+            None => format!("issue #{} \"{}\"", issue.number, issue.title),
+        };
+        return format!("No new activity on {threads} since you last ran `ghwf work-on`.");
     }
 
-    let mut out = format!(
-        "## #{}: {}  ({})\n",
-        subject.number, subject.title, subject.state
-    );
+    let mut out = format!("## #{}: {}  ({})\n", issue.number, issue.title, issue.state);
 
     if body_changed {
-        out.push_str(&format!(
-            "\n{} body by {}:\n\n",
-            capitalize_first(noun),
-            subject.user.login
-        ));
-        out.push_str(&blockquote(subject.body.as_deref().unwrap_or("")));
+        out.push_str(&format!("\nIssue body by {}:\n\n", issue.user.login));
+        out.push_str(&blockquote(issue.body.as_deref().unwrap_or("")));
         out.push('\n');
     }
 
-    if !new.is_empty() {
-        if body_changed {
-            out.push_str("\n<hr>\n");
-        }
-        out.push_str("\nNew comments since you last ran `ghwf work-on`:\n");
-        for (i, view) in new.iter().enumerate() {
-            if i > 0 {
-                out.push_str("\n<hr>\n");
-            }
-            let tag = if view.updated { " (updated)" } else { "" };
-            out.push_str(&format!(
-                "\n**{}** at {} said{}:\n\n",
-                view.comment.user.login, view.comment.created_at, tag
-            ));
-            out.push_str(&blockquote(&view.body));
-            out.push('\n');
-        }
+    let mut prior_section = body_changed;
+    push_comment_section(
+        &mut out,
+        &mut prior_section,
+        "New comments on the issue thread since you last ran `ghwf work-on`:",
+        new_issue,
+    );
+    if let Some(pr) = pr_number {
+        push_comment_section(
+            &mut out,
+            &mut prior_section,
+            &format!(
+                "New comments on the PR (#{pr}) conversation thread since you last ran \
+                 `ghwf work-on`:"
+            ),
+            new_pr,
+        );
     }
 
     if !new_review.is_empty() {
-        if body_changed || !new.is_empty() {
+        if prior_section {
             out.push_str("\n<hr>\n");
         }
         out.push_str("\nNew inline review comments since you last ran `ghwf work-on`:\n");
@@ -388,13 +385,33 @@ pub fn render_work_on(
     out.trim_end().to_string()
 }
 
-/// Uppercase the first character, leaving the rest untouched (so acronyms like
-/// "PR" stay "PR" rather than becoming "Pr").
-fn capitalize_first(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
+/// Append one thread's new-comments section under `heading`, `<hr>`-separating
+/// it from any prior section. `prior_section` tracks whether one was rendered.
+fn push_comment_section(
+    out: &mut String,
+    prior_section: &mut bool,
+    heading: &str,
+    views: &[CommentView],
+) {
+    if views.is_empty() {
+        return;
+    }
+    if *prior_section {
+        out.push_str("\n<hr>\n");
+    }
+    *prior_section = true;
+    out.push_str(&format!("\n{heading}\n"));
+    for (i, view) in views.iter().enumerate() {
+        if i > 0 {
+            out.push_str("\n<hr>\n");
+        }
+        let tag = if view.updated { " (updated)" } else { "" };
+        out.push_str(&format!(
+            "\n**{}** at {} said{}:\n\n",
+            view.comment.user.login, view.comment.created_at, tag
+        ));
+        out.push_str(&blockquote(&view.body));
+        out.push('\n');
     }
 }
 
@@ -642,45 +659,68 @@ mod tests {
         }
     }
 
+    fn comment_view(comment: &Comment) -> CommentView<'_> {
+        CommentView {
+            comment,
+            body: comment.body.clone(),
+            updated: false,
+        }
+    }
+
     #[test]
     fn no_activity_requires_all_inputs_empty() {
-        let out = render_work_on(&issue(), "PR", false, &[], &[]);
-        assert!(out.starts_with("No new activity on PR #9"));
+        let out = render_work_on(&issue(), false, &[], None, &[], &[]);
+        assert!(out.starts_with("No new activity on issue #9 \"A PR\" since"));
+    }
+
+    #[test]
+    fn no_activity_names_both_threads_with_pr() {
+        let out = render_work_on(&issue(), false, &[], Some(20), &[], &[]);
+        assert!(out.starts_with("No new activity on issue #9 \"A PR\" or PR #20 since"));
     }
 
     #[test]
     fn review_comments_alone_are_activity() {
         let review = review_comment();
-        let out = render_work_on(&issue(), "PR", false, &[], &[review_view(&review)]);
+        let out = render_work_on(&issue(), false, &[], Some(20), &[], &[review_view(&review)]);
         assert!(out.contains("New inline review comments since you last ran `ghwf work-on`:"));
         assert!(out.contains("**reviewer** at 2026-01-02T00:00:00Z said on `src/main.rs:42`:"));
         assert!(out.contains("> rename this"));
     }
 
     #[test]
-    fn conversation_and_review_sections_compose() {
-        let conversation = comment();
-        let conversation_view = CommentView {
-            comment: &conversation,
-            body: conversation.body.clone(),
-            updated: false,
-        };
+    fn issue_pr_and_review_sections_compose_in_order() {
+        let issue_comment = comment();
+        let pr_comment = comment();
         let review = review_comment();
         let out = render_work_on(
             &issue(),
-            "PR",
             false,
-            &[conversation_view],
+            &[comment_view(&issue_comment)],
+            Some(20),
+            &[comment_view(&pr_comment)],
             &[review_view(&review)],
         );
-        let conversation_at = out
-            .find("New comments since")
-            .expect("conversation section present");
+        let issue_at = out
+            .find("New comments on the issue thread since")
+            .expect("issue section present");
+        let pr_at = out
+            .find("New comments on the PR (#20) conversation thread since")
+            .expect("PR section present");
         let review_at = out
             .find("New inline review comments since")
             .expect("review section present");
-        assert!(conversation_at < review_at);
-        assert!(out[conversation_at..review_at].contains("<hr>"));
+        assert!(issue_at < pr_at);
+        assert!(pr_at < review_at);
+        assert!(out[issue_at..pr_at].contains("<hr>"));
+        assert!(out[pr_at..review_at].contains("<hr>"));
+    }
+
+    #[test]
+    fn body_section_is_always_the_issues() {
+        let out = render_work_on(&issue(), true, &[], Some(20), &[], &[]);
+        assert!(out.contains("Issue body by author:"));
+        assert!(out.contains("> body"));
     }
 
     #[test]
@@ -688,7 +728,7 @@ mod tests {
         let review = review_comment();
         let mut view = review_view(&review);
         view.updated = true;
-        let out = render_work_on(&issue(), "PR", false, &[], &[view]);
+        let out = render_work_on(&issue(), false, &[], Some(20), &[], &[view]);
         assert!(out.contains("said on `src/main.rs:42` (updated):"));
     }
 }
