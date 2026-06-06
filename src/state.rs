@@ -28,12 +28,70 @@ fn slug_words(title: &str) -> Vec<String> {
         .collect()
 }
 
-/// The directive a user posts (at the start of a comment line) to advance the
-/// workflow to the next phase.
-pub const PROCEED_DIRECTIVE: &str = "/proceed";
+/// A workflow-advancing command a user posts at the start of a comment line.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Directive {
+    ApprovePrePlan,
+    ApprovePlan,
+    ApproveImplementation,
+    // The retired generic command; still recognised so its retirement can be
+    // explained rather than the comment being silently ignored.
+    Proceed,
+}
 
-/// A phase of work on an issue. Named in the imperative mood.
-#[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Every recognised command spelling. No command is a prefix of another, so
+/// match order doesn't matter beyond the word-boundary rule.
+const DIRECTIVE_COMMANDS: &[(&str, Directive)] = &[
+    ("/approve-pre-plan", Directive::ApprovePrePlan),
+    // Alias.
+    ("/approve-preplan", Directive::ApprovePrePlan),
+    ("/approve-plan", Directive::ApprovePlan),
+    ("/approve-implementation", Directive::ApproveImplementation),
+    ("/proceed", Directive::Proceed),
+];
+
+impl Directive {
+    /// The phase this directive approves (i.e. advances out of), or `None` for
+    /// the retired generic `/proceed`.
+    pub fn approves(self) -> Option<Phase> {
+        match self {
+            Directive::ApprovePrePlan => Some(Phase::PrePlan),
+            Directive::ApprovePlan => Some(Phase::PrepAndPlan),
+            Directive::ApproveImplementation => Some(Phase::Implement),
+            Directive::Proceed => None,
+        }
+    }
+
+    /// The canonical spelling, for reporting.
+    pub fn command(self) -> &'static str {
+        match self {
+            Directive::ApprovePrePlan => "/approve-pre-plan",
+            Directive::ApprovePlan => "/approve-plan",
+            Directive::ApproveImplementation => "/approve-implementation",
+            Directive::Proceed => "/proceed",
+        }
+    }
+}
+
+/// The first directive in `body`, if any.
+///
+/// A command must begin a line and be followed by end-of-line or whitespace,
+/// so `/approve-plan now` counts but `/approve-plans` and conversational
+/// mid-sentence mentions do not.
+pub fn parse_directive(body: &str) -> Option<Directive> {
+    body.lines().find_map(|line| {
+        DIRECTIVE_COMMANDS.iter().find_map(|&(command, directive)| {
+            line.strip_prefix(command)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+                .then_some(directive)
+        })
+    })
+}
+
+/// A phase of work on an issue. Named in the imperative mood. Variant order is
+/// workflow order, so the derived `Ord` lets directives be classified as stale
+/// (approving an earlier phase) or premature (a later one).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Phase {
     #[default]
@@ -63,6 +121,17 @@ impl Phase {
             Phase::Review => "review",
         }
     }
+
+    /// The canonical command that approves this phase (advancing to the next),
+    /// or `None` for the terminal phase.
+    pub fn approval_command(self) -> Option<&'static str> {
+        match self {
+            Phase::PrePlan => Some("/approve-pre-plan"),
+            Phase::PrepAndPlan => Some("/approve-plan"),
+            Phase::Implement => Some("/approve-implementation"),
+            Phase::Review => None,
+        }
+    }
 }
 
 /// Per-issue workflow state. Scoped to the issue (not a session), since the phase
@@ -70,7 +139,9 @@ impl Phase {
 #[derive(Default, Serialize, Deserialize)]
 pub struct IssueState {
     pub phase: Phase,
-    // Ids of comments whose `/proceed` directive has already been acted on.
+    // Ids of comments whose directive has already been acted on. Comment ids
+    // are globally unique across the issue and PR conversation threads, so one
+    // set dedupes both sources.
     pub consumed_directives: BTreeSet<u64>,
     // Populated once the prep-and-plan phase begins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,18 +166,6 @@ pub struct PrepState {
     // the review phase). Kept idempotent so we only mark it once.
     #[serde(default)]
     pub pr_ready: bool,
-}
-
-/// True if `body` contains a `/proceed` directive at the start of a line.
-///
-/// The directive must begin the line and be followed by a word boundary, so
-/// `/proceed` and `/proceed now` count, but `/proceeding` and conversational
-/// mid-sentence mentions do not.
-pub fn is_proceed_directive(body: &str) -> bool {
-    body.lines().any(|line| {
-        line.strip_prefix(PROCEED_DIRECTIVE)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-    })
 }
 
 /// Path to the per-issue state file under the ghwf data dir.
@@ -141,7 +200,66 @@ pub fn save(owner: &str, repo: &str, number: u64, state: &IssueState) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::branch_and_slug;
+    use super::{branch_and_slug, parse_directive, Directive, Phase};
+
+    #[test]
+    fn parse_each_command() {
+        assert_eq!(
+            parse_directive("/approve-pre-plan"),
+            Some(Directive::ApprovePrePlan)
+        );
+        assert_eq!(
+            parse_directive("/approve-preplan"),
+            Some(Directive::ApprovePrePlan)
+        );
+        assert_eq!(parse_directive("/approve-plan"), Some(Directive::ApprovePlan));
+        assert_eq!(
+            parse_directive("/approve-implementation"),
+            Some(Directive::ApproveImplementation)
+        );
+        assert_eq!(parse_directive("/proceed"), Some(Directive::Proceed));
+    }
+
+    #[test]
+    fn parse_allows_trailing_words() {
+        assert_eq!(
+            parse_directive("/approve-plan looks good!"),
+            Some(Directive::ApprovePlan)
+        );
+    }
+
+    #[test]
+    fn parse_requires_word_boundary() {
+        assert_eq!(parse_directive("/approve-plans"), None);
+        assert_eq!(parse_directive("/proceeding with caution"), None);
+    }
+
+    #[test]
+    fn parse_requires_line_start() {
+        assert_eq!(parse_directive("please /approve-plan"), None);
+        assert_eq!(
+            parse_directive("looks good\n/approve-plan"),
+            Some(Directive::ApprovePlan)
+        );
+    }
+
+    #[test]
+    fn parse_first_match_wins() {
+        assert_eq!(
+            parse_directive("/approve-plan\n/approve-implementation"),
+            Some(Directive::ApprovePlan)
+        );
+    }
+
+    #[test]
+    fn approval_command_round_trips_through_parse() {
+        for phase in [Phase::PrePlan, Phase::PrepAndPlan, Phase::Implement] {
+            let command = phase.approval_command().expect("non-terminal phase");
+            let directive = parse_directive(command).expect("command parses");
+            assert_eq!(directive.approves(), Some(phase));
+        }
+        assert_eq!(Phase::Review.approval_command(), None);
+    }
 
     #[test]
     fn naming_basic() {

@@ -81,7 +81,9 @@ fn branch_body(worktree: &str, plan_rel: &str, pr_url: Option<&str>, number: u64
          {pr_line}\n\
          Implement per the plan, committing and pushing to the branch as you go (the draft \
          PR updates automatically). Address any PR feedback shown below. When the work is \
-         complete and ready for human review, comment `/proceed` on issue #{number}."
+         complete and ready for human review, post a hand-off comment on issue #{number} \
+         and on the PR prompting the user to comment `/approve-implementation` on either \
+         thread."
     )
 }
 
@@ -89,7 +91,8 @@ fn no_branch_body(number: u64, plan_rel: &str) -> String {
     format!(
         "Implement (--no-branch) — code the change per `{plan_rel}`.\n\n\
          You are managing the branch and commits yourself; there is no ghwf worktree or PR. \
-         When the work is complete, comment `/proceed` on issue #{number}."
+         When the work is complete, post a comment on issue #{number} prompting the user to \
+         comment `/approve-implementation`."
     )
 }
 

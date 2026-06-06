@@ -145,8 +145,9 @@ fn complete_body(worktree: &Path, branch: &str, pr_url: &str, number: u64) -> St
          - Worktree: `{}`\n\
          - Branch: `{branch}`\n\
          - Draft PR: {pr_url}\n\n\
-         Review the plan in the PR. When you're ready to advance to the implement phase, \
-         comment `/proceed` on issue #{number}.",
+         If you haven't already, post a hand-off comment on issue #{number} and on the PR \
+         saying the plan is ready for review, and that commenting `/approve-plan` on either \
+         thread advances to the implement phase. Then wait for that approval.",
         worktree.display(),
     )
 }
