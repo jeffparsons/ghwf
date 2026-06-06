@@ -134,6 +134,32 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         }
     }
 
+    // Post a status update to the conversation threads when something
+    // user-visible happened: first engagement, a phase transition, or a
+    // misfired directive. Posted after the phase body ran, so the prose states
+    // facts (a review-phase PR has already been flipped to ready).
+    // Re-read the PR number: the prep-and-plan phase body may have just opened
+    // the PR.
+    let pr_number = issue_state.prep.as_ref().and_then(|p| p.pr_number);
+    let status = render::render_status_comment(
+        phase,
+        &outcome.transitions,
+        &outcome.notes,
+        !issue_state.intro_posted,
+        pr_number
+            .map(|pr| format!("https://github.com/{owner}/{repo}/pull/{pr}"))
+            .as_deref(),
+    );
+    let status_posted = status.is_some();
+    if let Some(text) = status {
+        let status_body = render::build_status_comment_body(&text);
+        post_status(&number.to_string(), &status_body, repo_ctx.as_ref(), "issue");
+        if let Some(pr) = pr_number {
+            post_status(&pr.to_string(), &status_body, repo_ctx.as_ref(), "PR");
+        }
+        issue_state.intro_posted = true;
+    }
+
     state::save(&owner, &repo, number, &issue_state)?;
 
     // Hard-error if this phase needs the issue's worktree but Claude isn't running
@@ -153,8 +179,6 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     // Choose which thread to digest: during implement/review, the PR conversation
     // thread (review feedback); otherwise the issue thread. Both share the issues
     // comments endpoint, so the machinery below is identical either way.
-    // Re-read the PR number: the prep-and-plan phase body may have just opened it.
-    let pr_number = issue_state.prep.as_ref().and_then(|p| p.pr_number);
     let digest_pr =
         matches!(phase, state::Phase::Implement | state::Phase::Review) && pr_number.is_some();
     // Inline review comments only exist for a PR digest; `None` for the
@@ -182,8 +206,8 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
 
     let mut new = Vec::new();
     for comment in &subject_comments {
-        // Don't feed this session's own comments back to it.
-        if render::extract_session_token(&comment.body).as_deref() == Some(my_token.as_str()) {
+        // Don't feed ghwf status updates or this session's own comments back.
+        if hidden_from_digest(&comment.body, &my_token) {
             continue;
         }
         let hash = store::content_hash(&comment.body);
@@ -199,9 +223,9 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
 
     let mut new_review = Vec::new();
     for comment in review_comments.iter().flatten() {
-        // Same own-comment filter as above, for symmetry — though ghwf never
-        // authors inline review comments today.
-        if render::extract_session_token(&comment.body).as_deref() == Some(my_token.as_str()) {
+        // Same filter as above, for symmetry — though ghwf never authors
+        // inline review comments today.
+        if hidden_from_digest(&comment.body, &my_token) {
             continue;
         }
         let hash = store::content_hash(&comment.body);
@@ -218,7 +242,13 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
 
     println!(
         "{}",
-        render::render_phase_banner(phase, &outcome.transitions, &outcome.notes, &body)
+        render::render_phase_banner(
+            phase,
+            &outcome.transitions,
+            &outcome.notes,
+            status_posted,
+            &body
+        )
     );
     println!();
     println!(
@@ -245,6 +275,25 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     seen::save(&session_id, &owner, &repo, number, &updated)?;
 
     Ok(())
+}
+
+/// Post a ghwf status update to a conversation thread, best-effort: a failure
+/// warns on stderr but never fails the run.
+fn post_status(subject: &str, body: &str, repo_ctx: Option<&github::RepoRef>, noun: &str) {
+    if let Err(err) = github::post_issue_comment(subject, body, repo_ctx) {
+        eprintln!("warning: failed to post the status update to the {noun}: {err:#}");
+    }
+}
+
+/// Whether a comment must be hidden from the digest shown to Claude: ghwf
+/// status updates always (they are machinery, whichever session posted them),
+/// and Claude-authored comments only when this session wrote them.
+fn hidden_from_digest(body: &str, my_token: &str) -> bool {
+    match render::extract_marker(body) {
+        Some(render::Marker::Status) => true,
+        Some(render::Marker::Session(token)) => token == my_token,
+        None => false,
+    }
 }
 
 /// Whether this phase requires Claude to be inside the issue's worktree.
@@ -292,8 +341,9 @@ fn advance_phase(
 
     let mut outcome = AdvanceOutcome::default();
     for (comment, source) in tagged {
-        // Only the user's comments are directives; skip Claude/ghwf-authored ones.
-        if render::extract_session_token(&comment.body).is_some() {
+        // Only the user's comments are directives; skip Claude/ghwf-authored
+        // ones (status updates mention approval commands in their prose).
+        if render::extract_marker(&comment.body).is_some() {
             continue;
         }
         if issue_state.consumed_directives.contains(&comment.id) {
@@ -441,6 +491,31 @@ mod tests {
         assert!(outcome.transitions.is_empty());
         assert!(matches!(outcome.notes[0].kind, NoteKind::Retired));
         assert!(state.consumed_directives.contains(&1));
+    }
+
+    #[test]
+    fn status_comments_are_not_directives() {
+        let mut state = state_in(Phase::PrePlan);
+        // A status comment may mention an approval command at line start.
+        let body = crate::render::build_status_comment_body("/approve-pre-plan");
+        let comments = [comment(1, &body, "2026-01-01T00:00:00Z")];
+        let outcome = advance_phase(&mut state, &comments, None);
+        assert_eq!(state.phase, Phase::PrePlan);
+        assert!(outcome.transitions.is_empty());
+        assert!(outcome.notes.is_empty());
+        assert!(!state.consumed_directives.contains(&1));
+    }
+
+    #[test]
+    fn digest_hides_status_always_and_own_session_comments_only() {
+        use super::hidden_from_digest;
+        let status = crate::render::build_status_comment_body("update");
+        assert!(hidden_from_digest(&status, "mine"));
+        let mine = crate::render::build_comment_body("hi", Some("mine"));
+        let theirs = crate::render::build_comment_body("hi", Some("theirs"));
+        assert!(hidden_from_digest(&mine, "mine"));
+        assert!(!hidden_from_digest(&theirs, "mine"));
+        assert!(!hidden_from_digest("plain user comment", "mine"));
     }
 
     #[test]
