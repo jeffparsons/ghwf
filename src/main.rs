@@ -16,7 +16,7 @@ use std::io::Read;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 
-use render::CommentView;
+use render::{CommentView, ReviewCommentView};
 
 #[derive(Parser)]
 #[command(name = "ghwf", about = "GitHub WorkFlow")]
@@ -148,13 +148,17 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     let pr_number = issue_state.prep.as_ref().and_then(|p| p.pr_number);
     let digest_pr =
         matches!(phase, state::Phase::Implement | state::Phase::Review) && pr_number.is_some();
-    let (subject, subject_comments, subject_noun) = if digest_pr {
-        let pr_arg = pr_number.expect("pr number checked above").to_string();
+    // Inline review comments only exist for a PR digest; `None` for the
+    // issue-thread phases, which must leave the cached map untouched.
+    let (subject, subject_comments, review_comments, subject_noun) = if digest_pr {
+        let pr = pr_number.expect("pr number checked above");
+        let pr_arg = pr.to_string();
         let pr_data = github::fetch_issue(&pr_arg, repo_ctx.as_ref())?;
         let pr_comments = github::fetch_comments(&pr_arg, repo_ctx.as_ref())?;
-        (pr_data, pr_comments, "PR")
+        let pr_review_comments = github::fetch_review_comments(&owner, &repo, pr)?;
+        (pr_data, pr_comments, Some(pr_review_comments), "PR")
     } else {
-        (issue_data, issue_comments, "issue")
+        (issue_data, issue_comments, None, "issue")
     };
 
     let record = seen::load(&session_id, &owner, &repo, number)?;
@@ -179,11 +183,30 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         }
     }
 
+    let mut new_review = Vec::new();
+    for comment in review_comments.iter().flatten() {
+        // Same own-comment filter as above, for symmetry — though ghwf never
+        // authors inline review comments today.
+        if render::extract_session_token(&comment.body).as_deref() == Some(my_token.as_str()) {
+            continue;
+        }
+        let hash = store::content_hash(&comment.body);
+        let previous = record.review_comments.get(&comment.id);
+        if previous != Some(&hash) {
+            new_review.push(ReviewCommentView {
+                comment,
+                body: render::strip_ghwf_marker(&comment.body),
+                location: comment.location(),
+                updated: previous.is_some(),
+            });
+        }
+    }
+
     println!("{}", render::render_phase_banner(phase, transition, &body));
     println!();
     println!(
         "{}",
-        render::render_work_on(&subject, subject_noun, body_changed, &new)
+        render::render_work_on(&subject, subject_noun, body_changed, &new, &new_review)
     );
 
     // Record the current state so the next run only surfaces later changes.
@@ -193,6 +216,14 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
             .iter()
             .map(|c| (c.id, store::content_hash(&c.body)))
             .collect(),
+        review_comments: match review_comments.as_ref() {
+            Some(comments) => comments
+                .iter()
+                .map(|c| (c.id, store::content_hash(&c.body)))
+                .collect(),
+            // Not fetched this run; carry the cached map over unchanged.
+            None => record.review_comments,
+        },
     };
     seen::save(&session_id, &owner, &repo, number, &updated)?;
 

@@ -16,6 +16,11 @@ pub struct SeenRecord {
     pub issue_body_hash: Option<String>,
     // Comment id -> content hash of its body.
     pub comments: BTreeMap<u64, String>,
+    // Inline review comment id -> content hash of its body. These ids come
+    // from a different namespace than conversation comment ids, hence the
+    // separate map; `default` keeps pre-existing records parsing.
+    #[serde(default)]
+    pub review_comments: BTreeMap<u64, String>,
 }
 
 /// Path to the seen-record for a session + issue, under the ghwf data dir.
@@ -55,4 +60,18 @@ pub fn save(
     let json = serde_json::to_string_pretty(record).context("failed to serialize seen-record")?;
     fs::write(&path, json)
         .with_context(|| format!("failed to write seen-record {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SeenRecord;
+
+    #[test]
+    fn record_without_review_comments_parses() {
+        // Records written before inline review comments existed lack the field.
+        let json = r#"{"issue_body_hash": "abc", "comments": {"1": "h1"}}"#;
+        let record: SeenRecord = serde_json::from_str(json).unwrap();
+        assert!(record.review_comments.is_empty());
+        assert_eq!(record.comments.get(&1).map(String::as_str), Some("h1"));
+    }
 }
