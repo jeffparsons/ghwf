@@ -32,3 +32,73 @@ pub struct Comment {
     pub html_url: String,
     pub author_association: String,
 }
+
+/// An inline review comment on a PR, anchored to a file (and usually a line)
+/// of its diff.
+#[derive(Deserialize, Serialize)]
+pub struct ReviewComment {
+    pub id: u64,
+    pub user: User,
+    pub body: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub html_url: String,
+    pub author_association: String,
+    pub path: String,
+    // `null` when the comment is outdated against the latest diff, or file-level.
+    pub line: Option<u64>,
+    // The anchor in the diff the comment was left on; the fallback when `line`
+    // is `null`.
+    pub original_line: Option<u64>,
+}
+
+impl ReviewComment {
+    /// Human-readable anchor for the comment: `path:line`, falling back to the
+    /// original line for outdated comments, or the bare path for file-level ones.
+    pub fn location(&self) -> String {
+        match self.line.or(self.original_line) {
+            Some(line) => format!("{}:{line}", self.path),
+            None => self.path.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReviewComment, User};
+
+    fn review_comment(line: Option<u64>, original_line: Option<u64>) -> ReviewComment {
+        ReviewComment {
+            id: 1,
+            user: User {
+                login: "reviewer".to_string(),
+            },
+            body: "body".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            html_url: "https://github.com/o/r/pull/1#discussion_r1".to_string(),
+            author_association: "OWNER".to_string(),
+            path: "src/main.rs".to_string(),
+            line,
+            original_line,
+        }
+    }
+
+    #[test]
+    fn location_prefers_current_line() {
+        assert_eq!(
+            review_comment(Some(42), Some(7)).location(),
+            "src/main.rs:42"
+        );
+    }
+
+    #[test]
+    fn location_falls_back_to_original_line() {
+        assert_eq!(review_comment(None, Some(7)).location(), "src/main.rs:7");
+    }
+
+    #[test]
+    fn location_falls_back_to_bare_path() {
+        assert_eq!(review_comment(None, None).location(), "src/main.rs");
+    }
+}

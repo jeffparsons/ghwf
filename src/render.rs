@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 
-use crate::models::{Comment, Issue};
+use crate::models::{Comment, Issue, ReviewComment};
 use crate::state::Phase;
 
 /// Opening of the hidden metadata marker embedded in Claude-authored comments.
@@ -13,6 +13,17 @@ pub struct CommentView<'a> {
     pub comment: &'a Comment,
     /// The comment body with the hidden ghwf marker stripped, ready to display.
     pub body: String,
+    /// True if this comment was seen before but its content has since changed.
+    pub updated: bool,
+}
+
+/// A new-or-changed inline review comment prepared for rendering.
+pub struct ReviewCommentView<'a> {
+    pub comment: &'a ReviewComment,
+    /// The comment body with the hidden ghwf marker stripped, ready to display.
+    pub body: String,
+    /// The code the comment is anchored to, e.g. `src/main.rs:42`.
+    pub location: String,
     /// True if this comment was seen before but its content has since changed.
     pub updated: bool,
 }
@@ -94,8 +105,9 @@ pub fn render_work_on(
     noun: &str,
     body_changed: bool,
     new: &[CommentView],
+    new_review: &[ReviewCommentView],
 ) -> String {
-    if !body_changed && new.is_empty() {
+    if !body_changed && new.is_empty() && new_review.is_empty() {
         return format!(
             "No new activity on {noun} #{} \"{}\" since you last ran `ghwf work-on`.",
             subject.number, subject.title
@@ -133,6 +145,25 @@ pub fn render_work_on(
         }
     }
 
+    if !new_review.is_empty() {
+        if body_changed || !new.is_empty() {
+            out.push_str("\n<hr>\n");
+        }
+        out.push_str("\nNew inline review comments since you last ran `ghwf work-on`:\n");
+        for (i, view) in new_review.iter().enumerate() {
+            if i > 0 {
+                out.push_str("\n<hr>\n");
+            }
+            let tag = if view.updated { " (updated)" } else { "" };
+            out.push_str(&format!(
+                "\n**{}** at {} said on `{}`{}:\n\n",
+                view.comment.user.login, view.comment.created_at, view.location, tag
+            ));
+            out.push_str(&blockquote(&view.body));
+            out.push('\n');
+        }
+    }
+
     out.trim_end().to_string()
 }
 
@@ -161,4 +192,116 @@ fn blockquote(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{render_work_on, CommentView, ReviewCommentView};
+    use crate::models::{Comment, Issue, ReviewComment, User};
+
+    fn issue() -> Issue {
+        Issue {
+            number: 9,
+            title: "A PR".to_string(),
+            state: "open".to_string(),
+            user: User {
+                login: "author".to_string(),
+            },
+            body: Some("body".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            html_url: "https://github.com/o/r/pull/9".to_string(),
+            author_association: "OWNER".to_string(),
+        }
+    }
+
+    fn comment() -> Comment {
+        Comment {
+            id: 1,
+            user: User {
+                login: "reviewer".to_string(),
+            },
+            body: "looks good".to_string(),
+            created_at: "2026-01-02T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            html_url: "https://github.com/o/r/pull/9#issuecomment-1".to_string(),
+            author_association: "OWNER".to_string(),
+        }
+    }
+
+    fn review_comment() -> ReviewComment {
+        ReviewComment {
+            id: 2,
+            user: User {
+                login: "reviewer".to_string(),
+            },
+            body: "rename this".to_string(),
+            created_at: "2026-01-02T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            html_url: "https://github.com/o/r/pull/9#discussion_r2".to_string(),
+            author_association: "OWNER".to_string(),
+            path: "src/main.rs".to_string(),
+            line: Some(42),
+            original_line: Some(42),
+        }
+    }
+
+    fn review_view(comment: &ReviewComment) -> ReviewCommentView<'_> {
+        ReviewCommentView {
+            comment,
+            body: comment.body.clone(),
+            location: comment.location(),
+            updated: false,
+        }
+    }
+
+    #[test]
+    fn no_activity_requires_all_inputs_empty() {
+        let out = render_work_on(&issue(), "PR", false, &[], &[]);
+        assert!(out.starts_with("No new activity on PR #9"));
+    }
+
+    #[test]
+    fn review_comments_alone_are_activity() {
+        let review = review_comment();
+        let out = render_work_on(&issue(), "PR", false, &[], &[review_view(&review)]);
+        assert!(out.contains("New inline review comments since you last ran `ghwf work-on`:"));
+        assert!(out.contains("**reviewer** at 2026-01-02T00:00:00Z said on `src/main.rs:42`:"));
+        assert!(out.contains("> rename this"));
+    }
+
+    #[test]
+    fn conversation_and_review_sections_compose() {
+        let conversation = comment();
+        let conversation_view = CommentView {
+            comment: &conversation,
+            body: conversation.body.clone(),
+            updated: false,
+        };
+        let review = review_comment();
+        let out = render_work_on(
+            &issue(),
+            "PR",
+            false,
+            &[conversation_view],
+            &[review_view(&review)],
+        );
+        let conversation_at = out
+            .find("New comments since")
+            .expect("conversation section present");
+        let review_at = out
+            .find("New inline review comments since")
+            .expect("review section present");
+        assert!(conversation_at < review_at);
+        assert!(out[conversation_at..review_at].contains("<hr>"));
+    }
+
+    #[test]
+    fn updated_review_comment_is_tagged() {
+        let review = review_comment();
+        let mut view = review_view(&review);
+        view.updated = true;
+        let out = render_work_on(&issue(), "PR", false, &[], &[view]);
+        assert!(out.contains("said on `src/main.rs:42` (updated):"));
+    }
 }

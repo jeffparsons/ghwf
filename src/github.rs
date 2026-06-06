@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, bail, Context, Result};
 use url::Url;
 
-use crate::models::{Comment, Issue};
+use crate::models::{Comment, Issue, ReviewComment};
 use crate::{config, git};
 
 /// The `(owner, repo)` a command should operate on, when known from `ghwf.toml`.
@@ -23,6 +23,16 @@ pub fn fetch_comments(issue: &str, config_repo: Option<&RepoRef>) -> Result<Vec<
     // `--paginate` follows `Link` headers and merges the paged JSON arrays into one.
     let json = gh_api(&["--paginate", &endpoint])?;
     serde_json::from_str(&json).context("failed to parse comments JSON from `gh api`")
+}
+
+/// Fetch the inline review comments on a PR, following pagination.
+///
+/// Takes a resolved `(owner, repo, pr)` directly: this is only called once a
+/// PR number is recorded in prep state, so no issue-arg resolution is needed.
+pub fn fetch_review_comments(owner: &str, repo: &str, pr: u64) -> Result<Vec<ReviewComment>> {
+    let endpoint = format!("repos/{owner}/{repo}/pulls/{pr}/comments");
+    let json = gh_api(&["--paginate", &endpoint])?;
+    serde_json::from_str(&json).context("failed to parse review comments JSON from `gh api`")
 }
 
 /// Post a comment to an issue's (or PR's) conversation thread.
