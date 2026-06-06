@@ -2,12 +2,14 @@ mod config;
 mod git;
 mod github;
 mod implement;
+mod install;
 mod launch;
 mod models;
 mod prep;
 mod render;
 mod seen;
 mod state;
+mod stop_hook;
 mod store;
 mod wait;
 mod worktree;
@@ -49,6 +51,18 @@ enum Commands {
         /// An issue number (resolved against the current repo) or a full GitHub issue URL.
         issue: String,
     },
+    /// Install (or update) ghwf's user-global Claude Code integration: the
+    /// `/work-on` skill and the Stop hook that keeps a session working an
+    /// issue until its workflow is done.
+    Install {
+        /// Overwrite an existing skill file even when ghwf didn't write it.
+        #[arg(long)]
+        force: bool,
+    },
+    /// The Stop-hook entry point Claude Code invokes (configured by
+    /// `ghwf install`); not for humans.
+    #[command(hide = true)]
+    ClaudeStopHook,
     /// Block until new activity appears on an issue (or its PR), or the timeout
     /// elapses.
     ///
@@ -69,6 +83,8 @@ fn main() -> Result<()> {
         Commands::WorkOn { issue, no_branch } => work_on(&issue, no_branch),
         Commands::CreateIssueComment { issue } => create_issue_comment(&issue),
         Commands::WorktreePath { issue } => worktree_path(&issue),
+        Commands::Install { force } => install::run(force),
+        Commands::ClaudeStopHook => stop_hook::run(),
         Commands::Wait { issue, timeout } => wait::run(&issue, timeout),
     }
 }
@@ -109,6 +125,11 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
 
     // Load the issue's workflow state once; mutate and save it at the end.
     let mut issue_state = state::load(&owner, &repo, number)?;
+
+    // Record whether the workflow is finished, for the Stop hook: a closed
+    // issue means a bound session may end instead of being nudged to keep
+    // waiting.
+    issue_state.issue_closed = issue_data.state != "open";
 
     // Approval directives are honoured from the issue thread and, once a PR
     // exists, its conversation thread too — fetched now, before directive
@@ -296,6 +317,20 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
                 updated: previous.is_some(),
             });
         }
+    }
+
+    // Anything new arriving — a directive (fired or noted), the issue body
+    // changing, or fresh digest content — resets the Stop hook's
+    // consecutive-nudge counter, so its cap only counts stops where nothing
+    // had changed (see stop_hook.rs).
+    if !outcome.transitions.is_empty()
+        || !outcome.notes.is_empty()
+        || body_changed
+        || !new_issue.is_empty()
+        || !new_pr.is_empty()
+        || !new_review.is_empty()
+    {
+        issue_state.stop_nudges = 0;
     }
 
     println!(

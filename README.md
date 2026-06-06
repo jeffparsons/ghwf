@@ -62,22 +62,42 @@ main_repo = "repo.git"
 worktrees_dir = "worktrees"
 ```
 
-## The `/work-on` slash command
+## Installing the Claude Code integration
 
-Wrap ghwf in a custom Claude Code slash command so a single `/work-on <issue>`
-drives the workflow. Put this in `.claude/commands/work-on.md`:
+`ghwf install` writes ghwf's user-global Claude Code pieces, so a single
+`/work-on <issue>` in any session drives the workflow:
 
-```markdown
----
-description: Drive ghwf on a GitHub issue.
----
-Run `ghwf work-on $ARGUMENTS` and follow the phase banner exactly:
-- Never enter Claude Code plan mode; write any plan as a file where ghwf tells you.
-- In pre-plan, post questions and your final summary with
-  `ghwf create-issue-comment $ARGUMENTS`.
-- If ghwf hard-errors that the work belongs in a different worktree, relay its
-  relaunch command to the user and stop — do not try to work around it.
-```
+- **The `/work-on` skill**, at `<claude_dir>/skills/work-on/SKILL.md` (where
+  `<claude_dir>` is `$CLAUDE_CONFIG_DIR` or `~/.claude`). It tells Claude to
+  run `ghwf work-on`, follow the phase banner, and keep the `wait`/`work-on`
+  loop going until the workflow completes or you tell it to stop.
+- **A Stop hook** in `<claude_dir>/settings.json`, pointing at
+  `ghwf claude-stop-hook`.
+
+Re-run `ghwf install` after upgrading ghwf to refresh both. The skill file
+carries a marker identifying it as ghwf-written; if a file without the marker
+is in the way, `install` refuses to touch it unless you pass `--force`. The
+settings merge is surgical (only our `hooks.Stop` entry is ever added) and
+idempotent, and anything unexpected about the file is an error, never an
+overwrite.
+
+### How the Stop hook keeps a session working
+
+Claude Code runs the hook whenever Claude tries to finish responding. The hook
+consults only ghwf's local state: if the session is bound to an issue (it ran
+`work-on` in that issue's worktree) whose workflow is still active, the hook
+blocks the stop and tells Claude to resume the `wait`/`work-on` loop. It lets
+go when:
+
+- the issue is closed (recorded by the last `work-on` run);
+- it has nudged 3 times in a row with nothing new arriving — Claude is stuck
+  or you've asked it to stop, so the hook stops fighting (any new activity
+  observed by `work-on` resets the count); or
+- the session isn't bound to any issue (including all `--no-branch` work) —
+  the hook stays out of the way of every other Claude session.
+
+The hook never touches the network and fails open: any error means the stop
+is allowed.
 
 ## Running `work-on` outside Claude
 

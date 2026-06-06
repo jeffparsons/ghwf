@@ -2,7 +2,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::state::{self, IssueState};
 use crate::{github, prep, store};
@@ -89,7 +89,7 @@ pub fn run(issue_arg: &str, no_branch: bool) -> Result<()> {
     };
 
     // Resume the worktree's recorded session if its transcript is still around.
-    let resume = resumable_session(&claude_dir()?, &issue_state, &worktree);
+    let resume = resumable_session(&store::claude_dir()?, &issue_state, &worktree);
     match &resume {
         Some(id) => println!(
             "Resuming this worktree's previous Claude session: launching \
@@ -136,19 +136,6 @@ fn resumable_session(
         );
         None
     }
-}
-
-/// Claude Code's per-user directory: `$CLAUDE_CONFIG_DIR` when set, else
-/// `~/.claude`.
-fn claude_dir() -> Result<PathBuf> {
-    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-        if !dir.is_empty() {
-            return Ok(PathBuf::from(dir));
-        }
-    }
-    let base = directories::BaseDirs::new()
-        .ok_or_else(|| anyhow!("could not determine a home directory"))?;
-    Ok(base.home_dir().join(".claude"))
 }
 
 /// Path to the transcript Claude Code keeps for `session_id` launched in `dir`:
