@@ -9,15 +9,21 @@ use anyhow::{bail, Context, Result};
 /// `claude` launches), so rather than limp along via absolute paths we refuse and
 /// tell the user how to relaunch in the worktree.
 ///
-/// `config_dir` (the `ghwf.toml` directory, when known) anchors the relaunch
-/// command at the project root so the printed `cd` target stays short and
-/// relative.
-pub fn ensure_inside(worktree: &Path, config_dir: Option<&Path>) -> Result<()> {
+/// `config_dir` (the `ghwf.toml` directory, when known) tells the user where the
+/// relaunch command will find its config; `number` is the issue to relaunch for.
+pub fn ensure_inside(worktree: &Path, config_dir: Option<&Path>, number: u64) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to determine the current directory")?;
     if is_inside(&cwd, worktree) {
         return Ok(());
     }
-    bail!("{}", relaunch_message(worktree, config_dir, &cwd));
+    bail!("{}", relaunch_message(worktree, config_dir, &cwd, number));
+}
+
+/// True if the current working directory is `worktree` or a descendant of it.
+pub fn cwd_is_inside(worktree: &Path) -> bool {
+    std::env::current_dir()
+        .map(|cwd| is_inside(&cwd, worktree))
+        .unwrap_or(false)
 }
 
 /// True if `cwd` is `worktree` or a descendant of it.
@@ -34,30 +40,28 @@ fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// The hard-error message telling the user to relaunch Claude in `worktree`.
-///
-/// The raw `cd … && claude` is a placeholder for an eventual `ghwf resume
-/// <issue>` (tracked in ghwf issue #2); the message is shaped so swapping it in
-/// later is trivial.
-fn relaunch_message(worktree: &Path, config_dir: Option<&Path>, cwd: &Path) -> String {
-    // Prefer a short relative `cd` target anchored at the project root; fall back
-    // to the absolute worktree path when the worktree isn't under the config dir.
-    let rel = config_dir.and_then(|dir| worktree.strip_prefix(dir).ok());
-    let (where_from, target) = match (config_dir, rel) {
-        (Some(dir), Some(rel)) => (
-            format!(" from the project root (where `ghwf.toml` lives), `{}`", dir.display()),
-            rel.display().to_string(),
-        ),
-        _ => (String::new(), worktree.display().to_string()),
-    };
+/// The hard-error message pointing the user at the outside-Claude launcher,
+/// which switches to the worktree and resumes the issue's session.
+fn relaunch_message(worktree: &Path, config_dir: Option<&Path>, cwd: &Path, number: u64) -> String {
+    // Name the project root so the user knows where the launcher will find its
+    // `ghwf.toml` (it works from anywhere under it).
+    let where_from = config_dir
+        .map(|dir| {
+            format!(
+                " from `{}` (the project root, where `ghwf.toml` lives) or anywhere under it",
+                dir.display()
+            )
+        })
+        .unwrap_or_default();
 
     let wt = worktree.display();
     let here = cwd.display();
     format!(
         "This issue's work happens in the worktree `{wt}`.\n\
          This Claude session is running in `{here}`, and ghwf can't move it.\n\
-         Exit Claude and relaunch in the worktree{where_from}:\n\n    cd {target} && claude\n\n\
-         then re-run your `ghwf` command. A future `ghwf resume <issue>` will replace this manual step."
+         Exit Claude, then run{where_from}:\n\n    ghwf work-on {number}\n\n\
+         ghwf will switch to the worktree and resume this issue's Claude session \
+         (or start one there)."
     )
 }
 
