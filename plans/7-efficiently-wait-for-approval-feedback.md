@@ -36,6 +36,16 @@ Design decisions locked on the issue thread:
 6. **Backoff:** polling starts at 5 s, doubles while idle, caps at 60 s, and
    resets to the floor whenever a poll sees change. Worst case at the cap is
    ~240 req/hr, comfortably inside the 5000/hr limit.
+7. **Hybrid idle mode via the events feed** (locked on the PR thread after a
+   live latency investigation). Measured feed insertion lag on this repo was
+   ~1–4 s across three probes — effectively real-time when GitHub is healthy —
+   and feed 304s don't count against the rate limit. So: direct conditional
+   polling while *hot* (the feed's `X-Poll-Interval: 60` can't beat the 5 s
+   direct floor anyway), switching to feed-first once the backoff reaches its
+   cap — one rate-limit-free request per cycle instead of four. The feed is
+   trusted only after self-calibration against ghwf's own most recent post,
+   and a periodic direct sweep bounds the damage of a lagging feed either
+   way.
 
 ## 1. Conditional request helper (`github.rs`)
 
@@ -81,7 +91,8 @@ pub struct WaitState {
     // globally unique) and inline review comments separately.
     pub comments: BTreeMap<u64, String>,
     pub review_comments: BTreeMap<u64, String>,
-    // Endpoint key → last ETag, updated by `wait` as it polls.
+    // Endpoint key → last ETag, updated by `wait` as it polls. The events
+    // feed's ETag lives here too, under the key `events`.
     #[serde(default)]
     pub etags: BTreeMap<String, String>,
 }
@@ -91,6 +102,13 @@ pub struct WaitState {
   pub wait: Option<WaitState>`. Pre-existing state files deserialize to
   `None`; `wait` without a baseline exits 1 telling the user to run
   `work-on` first.
+- `IssueState` also gains `last_posted: Option<PostedRef>` (comment id and
+  `created_at`), updated by every successful ghwf post — Claude comments via
+  `create-issue-comment` (which starts loading/saving issue state for this)
+  and status updates from `work-on`. It lives on `IssueState`, not
+  `WaitState`, because `work-on` rebuilds the latter wholesale when recording
+  a baseline, and a status update posted mid-run must survive that. Feed-mode
+  self-calibration (section 4b) reads it.
 - Issue-scoped (not session-scoped, unlike the seen cache) deliberately:
   directives are issue-scoped, the ETags describe the issue's endpoints, and
   any session's `wait` should wake on the same things.
@@ -160,6 +178,51 @@ Each poll cycle hits up to four endpoints, each with its stored ETag:
   is reserved for exit 1).
 - Failures: 403/429 sleep at the cap (rate-limited — don't hammer, don't
   die); other errors warn and back off; three *consecutive* failures exit 1.
+- Once the backoff reaches its cap with nothing seen, the loop tries to hand
+  over to feed-first idle mode (section 4b); any wake or trust failure there
+  drops it back here with the backoff reset to the cap.
+
+## 4b. Idle mode — events-feed first (`wait.rs`)
+
+Decision 7's cheap steady-state, entered only when direct polling has gone
+quiet long enough to reach the backoff cap.
+
+**Trust gate (self-calibration).** Before relying on the feed, check
+`last_posted` against one feed fetch (`repos/{o}/{r}/events?per_page=100`):
+
+- Visible in the page, or older than the oldest event in the page (it has
+  scrolled out of the 300-event/30-day window): the feed is current enough —
+  enter feed mode.
+- Newer than the oldest event yet absent: the feed is lagging *right now* —
+  stay in direct mode for this `wait` invocation (the gate re-runs if the
+  cap is reached again after a reset).
+- No `last_posted` recorded (fresh state): enter feed mode anyway; the
+  direct sweep below bounds the risk.
+
+**Feed cycle.** One conditional GET of the events feed per cycle (ETag under
+the `events` key; 304s are documented as rate-limit-free for this endpoint).
+Cadence: `max(X-Poll-Interval header, 60 s)` — the header is the contract
+here, and it grows under server load.
+
+**Wake rule.** On a 200, consider only events with `created_at` after the
+baseline `since`, and only those touching our subjects:
+
+- `IssueCommentEvent` where `payload.issue.number` is our issue or PR — the
+  payload embeds the full comment, so the same hidden filter applies
+  directly (status comments and this session's own posts never wake, even
+  via the feed).
+- `PullRequestReviewCommentEvent` where `payload.pull_request.number` is our
+  PR.
+- `IssuesEvent` for our issue number (closed/reopened/etc.).
+
+A match prints the reason and exits 0. Anything else (other issues' events,
+pushes, our own filtered comments) just refreshes the ETag.
+
+**Lag backstop.** Every ~5 min in feed mode, run one full direct cycle
+(section 4's four conditional GETs). A lagging feed can therefore delay a
+wake by at most that interval; a direct-cycle hit wakes exactly as in hot
+mode. Any feed *fetch error* abandons feed mode for this invocation and
+falls back to direct polling at the cap.
 
 ## 5. Banner instructions (`render.rs`, `prep.rs`, `implement.rs`)
 
@@ -192,10 +255,15 @@ A short subsection documenting the wait loop and the exit-code contract.
   mode hides only status comments.
 - Backoff: 5, 10, 20, 40, 60, 60…; reset on change; deadline clamps the last
   sleep.
-- `WaitState` serde: old `IssueState` files load with `wait: None`;
-  round-trip with ETags.
+- `WaitState` serde: old `IssueState` files load with `wait: None` and
+  `last_posted: None`; round-trip with ETags.
 - Baseline assembly: `since` is the max `updated_at` across sources; hashes
   recorded unfiltered; empty `review_comments` when not fetched.
+- Feed mode (pure functions over parsed feed pages): trust gate — visible
+  post trusts, scrolled-out post trusts, missing-but-recent post distrusts,
+  no `last_posted` trusts; wake rule — matching `IssueCommentEvent` wakes,
+  our own/status comment payloads don't, other issues' events don't,
+  pre-`since` events don't; `X-Poll-Interval` parsing with the 60 s floor.
 - Banners: the wait instruction appears in pre-plan, prep-complete,
   implement, and review bodies.
 
@@ -206,10 +274,11 @@ A short subsection documenting the wait loop and the exit-code contract.
 ## Out of scope / punted
 
 - PR review *summaries* (a submitted review with no inline comments) — not
-  surfaced by `work-on` today either; a future PR-object poll could cover
-  them.
+  surfaced by `work-on` today either, so `PullRequestReviewEvent` is also
+  ignored in feed mode for consistency; a future change can add both sides
+  together.
 - Watching pushes, CI, or anything beyond the conversation surfaces.
 - A `work-on --wait` convenience flag (trivial to add atop `wait` later).
-- The events feed, webhooks, long-polling, and `X-Poll-Interval` (only the
-  events feed sends it).
-- A cross-issue shared poller; each `wait` watches one issue.
+- Webhooks and long-polling.
+- A cross-issue shared poller; each `wait` watches one issue (though feed
+  mode would make one cheap).
