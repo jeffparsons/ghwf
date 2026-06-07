@@ -197,15 +197,44 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     let status_posted = status.is_some();
     if let Some(text) = status {
         let status_body = render::build_status_comment_body(&text);
-        let mut posted = post_status(
-            &number.to_string(),
-            &status_body,
-            repo_ctx.as_ref(),
-            "issue",
-        );
-        if let Some(pr) = pr_number {
-            posted = post_status(&pr.to_string(), &status_body, repo_ctx.as_ref(), "PR").or(posted);
-        }
+        let posted = match pr_number {
+            // No PR yet: the issue is the only thread.
+            None => post_status(
+                &number.to_string(),
+                &status_body,
+                repo_ctx.as_ref(),
+                "issue",
+            ),
+            // Full update on the phase's primary thread; the other thread
+            // gets a one-line stub linking to it — or the full body when the
+            // primary post failed, so nothing is lost.
+            Some(pr) => {
+                let (primary, primary_noun, secondary, secondary_noun) =
+                    if render::status_primary_is_pr(phase) {
+                        (pr.to_string(), "PR", number.to_string(), "issue")
+                    } else {
+                        (number.to_string(), "issue", pr.to_string(), "PR")
+                    };
+                let full = post_status(&primary, &status_body, repo_ctx.as_ref(), primary_noun);
+                let secondary_body = match &full {
+                    Some(comment) => {
+                        render::build_status_comment_body(&render::render_status_stub(
+                            &outcome.transitions,
+                            primary_noun,
+                            &comment.html_url,
+                        ))
+                    }
+                    None => status_body,
+                };
+                post_status(
+                    &secondary,
+                    &secondary_body,
+                    repo_ctx.as_ref(),
+                    secondary_noun,
+                )
+                .or(full)
+            }
+        };
         // Remember the newest own post for feed-lag self-calibration in `wait`.
         if let Some(comment) = posted {
             issue_state.last_posted = Some(state::PostedRef {

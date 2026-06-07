@@ -316,6 +316,32 @@ fn phase_status_prose(phase: Phase, pr_url: Option<&str>) -> String {
     }
 }
 
+/// Which conversation thread gets the full status update in this phase: the
+/// issue while planning, the PR once code is in motion. The other thread gets
+/// a one-line stub linking to it.
+pub fn status_primary_is_pr(phase: Phase) -> bool {
+    matches!(phase, Phase::Implement | Phase::Review)
+}
+
+/// Render the one-line stub posted to the secondary conversation thread,
+/// pointing at the full status update on the primary one. `primary_noun` is
+/// "issue" or "PR"; `full_url` is the posted full comment's html_url.
+pub fn render_status_stub(
+    transitions: &[Transition],
+    primary_noun: &str,
+    full_url: &str,
+) -> String {
+    // A multi-transition run collapses to its endpoints.
+    match (transitions.first(), transitions.last()) {
+        (Some(first), Some(last)) => format!(
+            "Phase advanced: {} → {} — full update: {full_url}",
+            first.from.label(),
+            last.to.label()
+        ),
+        _ => format!("Status update posted on the {primary_noun}: {full_url}"),
+    }
+}
+
 /// Render the markdown digest of what's new or changed across the threads —
 /// the issue and, once a PR exists, its conversation thread and inline review
 /// comments too. The issue is always the primary subject (header + body); the
@@ -435,9 +461,10 @@ fn blockquote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_comment_body, build_status_comment_body, extract_marker, render_phase_banner,
-        render_status_comment, render_work_on, strip_ghwf_marker, CommentView, DirectiveNote,
-        Marker, NoteKind, ReviewCommentView, Transition,
+        build_comment_body, build_status_comment_body, extract_marker, hidden_from_digest,
+        render_phase_banner, render_status_comment, render_status_stub, render_work_on,
+        status_primary_is_pr, strip_ghwf_marker, CommentView, DirectiveNote, Marker, NoteKind,
+        ReviewCommentView, Transition,
     };
     use crate::models::{Comment, Issue, ReviewComment, User};
     use crate::state::Phase;
@@ -601,6 +628,41 @@ mod tests {
         // Without a PR the prose still closes the workflow out.
         let out = render_status_comment(Phase::Review, &[], &[], true, None).unwrap();
         assert!(out.contains("no further approval command"));
+    }
+
+    #[test]
+    fn status_primary_thread_follows_phase() {
+        assert!(!status_primary_is_pr(Phase::PrePlan));
+        assert!(!status_primary_is_pr(Phase::PrepAndPlan));
+        assert!(status_primary_is_pr(Phase::Implement));
+        assert!(status_primary_is_pr(Phase::Review));
+    }
+
+    #[test]
+    fn stub_with_transitions_names_endpoints_and_url() {
+        let url = "https://github.com/o/r/pull/9#issuecomment-1";
+        let transitions = [
+            transition(Phase::PrePlan, Phase::PrepAndPlan, "/approve-pre-plan"),
+            transition(Phase::PrepAndPlan, Phase::Implement, "/approve-plan"),
+        ];
+        let out = render_status_stub(&transitions, "PR", url);
+        assert_eq!(
+            out,
+            format!("Phase advanced: pre-plan → implement — full update: {url}")
+        );
+    }
+
+    #[test]
+    fn stub_without_transitions_names_primary_and_url() {
+        let url = "https://github.com/o/r/issues/9#issuecomment-1";
+        let out = render_status_stub(&[], "issue", url);
+        assert_eq!(out, format!("Status update posted on the issue: {url}"));
+    }
+
+    #[test]
+    fn stub_comment_body_stays_hidden_from_digest() {
+        let body = build_status_comment_body(&render_status_stub(&[], "issue", "url"));
+        assert!(hidden_from_digest(&body, None));
     }
 
     fn issue() -> Issue {
