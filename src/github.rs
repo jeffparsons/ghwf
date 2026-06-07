@@ -4,7 +4,9 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, bail, Context, Result};
 use url::Url;
 
-use crate::models::{Comment, Issue, IssueListing, PullRequest, Reaction, ReviewComment, User};
+use crate::models::{
+    BranchPr, Comment, Issue, IssueListing, PullRequest, Reaction, ReviewComment, User,
+};
 use crate::{config, git};
 
 /// The `(owner, repo)` a command should operate on, when known from `ghwf.toml`.
@@ -172,6 +174,23 @@ pub fn default_branch(owner: &str, repo: &str) -> Result<String> {
         ".defaultBranchRef.name",
     ])?;
     Ok(out.trim().to_string())
+}
+
+/// All PRs (any state) whose head is `branch`, trimmed to merge-relevant fields.
+pub fn branch_prs(owner: &str, repo: &str, branch: &str) -> Result<Vec<BranchPr>> {
+    let json = gh(&[
+        "pr",
+        "list",
+        "-R",
+        &format!("{owner}/{repo}"),
+        "--head",
+        branch,
+        "--state",
+        "all",
+        "--json",
+        "number,state,headRefOid,mergeCommit",
+    ])?;
+    serde_json::from_str(&json).context("failed to parse PR list JSON from `gh`")
 }
 
 /// Find an existing PR (any state) whose head is `branch`, returning its number.

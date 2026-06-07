@@ -60,6 +60,28 @@ session has already started are skipped too (ghwf can't tell whether another
 session is still working them); `next` lists the ones it passed over — resume
 those explicitly with `ghwf work-on <n>`.
 
+## Collecting garbage
+
+`ghwf collect-garbage` (alias `gc`) cleans up after merged PRs. After a
+`git fetch --prune`, it examines every local and `origin/` branch other than
+the default branch, and for each one whose PR has been merged:
+
+- **deletes the branch** — local and remote sides judged independently — but
+  only when that side's tip is exactly the head commit GitHub merged, so
+  nothing added or rewritten since the merge is ever lost. The check works
+  for merge commits and squash/rebase merges alike, and also verifies the
+  merge actually landed on the default branch;
+- **removes the branch's worktree** first, but only when its working tree is
+  fully clean (no changes to tracked files *and* no untracked files), and
+  never the main worktree or the one the command is running inside;
+- **removes the issue's ghwf state file** once nothing of the branch remains.
+
+Anything suspicious — a merged branch carrying different/extra content than
+what was merged, a worktree with working-tree changes — is warned about and
+left alone. Nothing is ever force-deleted. Branches with an open PR, or with
+no merged PR at all, are skipped silently. Pass `--dry-run` to see what would
+be collected without touching anything.
+
 ## Waiting for approval and feedback
 
 `ghwf wait <issue>` blocks until something new happens on the issue or its PR,
