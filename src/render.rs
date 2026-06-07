@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 
 use crate::models::{Comment, Issue, ReviewComment};
-use crate::state::Phase;
+use crate::state::{Phase, PrOutcome};
 
 /// Opening shared by every hidden ghwf metadata marker, for detection/stripping.
 const MARKER_SCAN_PREFIX: &str = "<!-- ghwf:v1 ";
@@ -111,6 +111,29 @@ pub fn wait_instruction(number: u64) -> String {
          `ghwf work-on {number}` to process it. Exit 2 means nothing yet: run \
          `ghwf wait {number}` again. Do not poll with your own sleep loops."
     )
+}
+
+/// The banner body shown in place of the phase body once the PR has left the
+/// open state: the workflow is over, so the wait/work-on loop must stop.
+pub fn concluded_body(outcome: PrOutcome, pr_url: Option<&str>, number: u64) -> String {
+    let pr = match pr_url {
+        Some(url) => format!("The PR ({url})"),
+        None => "The PR".to_string(),
+    };
+    match outcome {
+        PrOutcome::Merged => format!(
+            "{pr} has been merged — the workflow for issue #{number} is complete.\n\n\
+             Stop the wait/work-on loop: do not run `ghwf wait {number}` or \
+             `ghwf work-on {number}` again unless the user asks."
+        ),
+        PrOutcome::Closed => format!(
+            "{pr} was closed without being merged — the workflow for issue #{number} \
+             has halted.\n\n\
+             Surface this to the user and stop the wait/work-on loop: do not run \
+             `ghwf wait {number}` or `ghwf work-on {number}` again unless the user asks. \
+             (Reopening the PR resumes the workflow on the next `ghwf work-on {number}`.)"
+        ),
+    }
 }
 
 /// Guidance shown to Claude during the pre-plan phase.
@@ -259,6 +282,9 @@ fn render_note(note: &DirectiveNote) -> String {
 /// what the next approval command triggers. `None` when there is nothing worth
 /// posting.
 ///
+/// A newly observed PR `conclusion` is always worth posting; its prose
+/// replaces the phase description, never prompting a further approval.
+///
 /// A stale note whose command also fired a transition this run is the
 /// duplicate-across-threads echo — skipped; the transition line already tells
 /// the story.
@@ -268,6 +294,7 @@ pub fn render_status_comment(
     notes: &[DirectiveNote],
     intro: bool,
     pr_url: Option<&str>,
+    conclusion: Option<PrOutcome>,
 ) -> Option<String> {
     let notes: Vec<&DirectiveNote> = notes
         .iter()
@@ -276,7 +303,7 @@ pub fn render_status_comment(
                 && transitions.iter().any(|t| t.command == note.command))
         })
         .collect();
-    if !intro && transitions.is_empty() && notes.is_empty() {
+    if !intro && transitions.is_empty() && notes.is_empty() && conclusion.is_none() {
         return None;
     }
 
@@ -294,8 +321,24 @@ pub fn render_status_comment(
     for note in notes {
         paragraphs.push(render_note(note));
     }
-    paragraphs.push(phase_status_prose(phase, pr_url));
+    paragraphs.push(match conclusion {
+        Some(outcome) => conclusion_status_prose(outcome),
+        None => phase_status_prose(phase, pr_url),
+    });
     Some(paragraphs.join("\n\n"))
+}
+
+/// The user-facing description of a concluded workflow. Must mention no
+/// approval command: a concluded status is not a 👍 target.
+fn conclusion_status_prose(outcome: PrOutcome) -> String {
+    match outcome {
+        PrOutcome::Merged => {
+            "The PR was merged; the workflow for this issue is **complete**.".to_string()
+        }
+        PrOutcome::Closed => "The PR was closed without being merged; the workflow has \
+             **halted**. Reopening the PR resumes it."
+            .to_string(),
+    }
 }
 
 /// The user-facing description of where the workflow stands and what the next
@@ -485,7 +528,7 @@ mod tests {
         ReviewCommentView, Transition,
     };
     use crate::models::{Comment, Issue, ReviewComment, User};
-    use crate::state::Phase;
+    use crate::state::{Phase, PrOutcome};
 
     fn note(kind: NoteKind, command: &'static str, phase_at: Phase) -> DirectiveNote {
         DirectiveNote {
@@ -609,7 +652,7 @@ mod tests {
     #[test]
     fn status_prose_offers_reaction_in_every_approvable_phase() {
         for phase in [Phase::PrePlan, Phase::PrepAndPlan, Phase::Implement] {
-            let out = render_status_comment(phase, &[], &[], true, None).unwrap();
+            let out = render_status_comment(phase, &[], &[], true, None, None).unwrap();
             assert!(out.contains("react 👍"), "{} prose lacks 👍", phase.label());
             // The prompted command must be the body's last command mention, so
             // a 👍 on the status comment maps to it.
@@ -617,13 +660,13 @@ mod tests {
             assert_eq!(directive.approves(), Some(phase));
         }
         // The terminal phase prompts no approval at all.
-        let out = render_status_comment(Phase::Review, &[], &[], true, None).unwrap();
+        let out = render_status_comment(Phase::Review, &[], &[], true, None, None).unwrap();
         assert!(crate::state::parse_prompted_directive(&out).is_none());
     }
 
     #[test]
     fn status_nothing_to_report_is_none() {
-        assert!(render_status_comment(Phase::PrePlan, &[], &[], false, None).is_none());
+        assert!(render_status_comment(Phase::PrePlan, &[], &[], false, None, None).is_none());
     }
 
     #[test]
@@ -633,7 +676,8 @@ mod tests {
             Phase::Implement,
             "/approve-plan",
         )];
-        let out = render_status_comment(Phase::Implement, &transitions, &[], false, None).unwrap();
+        let out =
+            render_status_comment(Phase::Implement, &transitions, &[], false, None, None).unwrap();
         assert!(out.contains(
             "Phase advanced: prep-and-plan → implement (triggered by `/approve-plan` from user)."
         ));
@@ -650,7 +694,7 @@ mod tests {
             Phase::Implement,
             Phase::Review,
         ] {
-            let out = render_status_comment(phase, &[], &[], true, None).unwrap();
+            let out = render_status_comment(phase, &[], &[], true, None, None).unwrap();
             assert!(out.contains("ghwf is tracking this issue"));
             assert!(out.contains(&format!("**{}** phase", phase.label())));
         }
@@ -663,7 +707,7 @@ mod tests {
             "/approve-implementation",
             Phase::PrePlan,
         )];
-        let out = render_status_comment(Phase::PrePlan, &[], &notes, false, None).unwrap();
+        let out = render_status_comment(Phase::PrePlan, &[], &notes, false, None, None).unwrap();
         assert!(out.contains("was ignored"));
         assert!(out.contains("the command that advances it is `/approve-pre-plan`"));
     }
@@ -676,23 +720,71 @@ mod tests {
             "/approve-plan",
         )];
         let stale = [note(NoteKind::Stale, "/approve-plan", Phase::Implement)];
-        let out =
-            render_status_comment(Phase::Implement, &transitions, &stale, false, None).unwrap();
+        let out = render_status_comment(Phase::Implement, &transitions, &stale, false, None, None)
+            .unwrap();
         assert!(!out.contains("was ignored"));
         // Alone — a genuinely late approval, not a same-run echo — it is reported.
-        let out = render_status_comment(Phase::Implement, &[], &stale, false, None).unwrap();
+        let out = render_status_comment(Phase::Implement, &[], &stale, false, None, None).unwrap();
         assert!(out.contains("was ignored"));
     }
 
     #[test]
     fn status_review_names_pr_and_terminality() {
         let url = "https://github.com/o/r/pull/9";
-        let out = render_status_comment(Phase::Review, &[], &[], true, Some(url)).unwrap();
+        let out = render_status_comment(Phase::Review, &[], &[], true, Some(url), None).unwrap();
         assert!(out.contains(url));
         assert!(out.contains("no further approval command"));
         // Without a PR the prose still closes the workflow out.
-        let out = render_status_comment(Phase::Review, &[], &[], true, None).unwrap();
+        let out = render_status_comment(Phase::Review, &[], &[], true, None, None).unwrap();
         assert!(out.contains("no further approval command"));
+    }
+
+    #[test]
+    fn concluded_bodies_name_outcome_and_stop_the_loop() {
+        let url = "https://github.com/o/r/pull/9";
+        let merged = super::concluded_body(PrOutcome::Merged, Some(url), 7);
+        assert!(merged.contains(url));
+        assert!(merged.contains("has been merged"));
+        assert!(merged.contains("complete"));
+        let closed = super::concluded_body(PrOutcome::Closed, Some(url), 7);
+        assert!(closed.contains("closed without being merged"));
+        assert!(closed.contains("halted"));
+        // Neither body tells Claude to keep waiting.
+        for body in [&merged, &closed] {
+            assert!(body.contains("Stop the wait/work-on loop") || body.contains("stop the wait"));
+            assert!(!body.contains("Once you have posted"));
+        }
+        // Without a recorded PR URL the prose still reads naturally.
+        let bare = super::concluded_body(PrOutcome::Merged, None, 7);
+        assert!(bare.starts_with("The PR has been merged"));
+    }
+
+    #[test]
+    fn status_conclusion_posts_alone_and_prompts_nothing() {
+        // A conclusion is worth posting even with no transitions or notes.
+        let out = render_status_comment(
+            Phase::Review,
+            &[],
+            &[],
+            false,
+            None,
+            Some(PrOutcome::Merged),
+        )
+        .unwrap();
+        assert!(out.contains("**complete**"));
+        assert!(crate::state::parse_prompted_directive(&out).is_none());
+        let out = render_status_comment(
+            Phase::Review,
+            &[],
+            &[],
+            false,
+            None,
+            Some(PrOutcome::Closed),
+        )
+        .unwrap();
+        assert!(out.contains("**halted**"));
+        assert!(out.contains("Reopening the PR resumes it."));
+        assert!(crate::state::parse_prompted_directive(&out).is_none());
     }
 
     #[test]

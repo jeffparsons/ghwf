@@ -72,6 +72,11 @@ fn should_block(state: &IssueState) -> bool {
     if state.issue_closed {
         return false;
     }
+    // The PR was merged (workflow complete) or closed without merging
+    // (workflow halted): either way the loop is over.
+    if state.pr_outcome.is_some() {
+        return false;
+    }
     // Nudged repeatedly with nothing new arriving: stop fighting.
     state.stop_nudges < NUDGE_CAP
 }
@@ -182,7 +187,7 @@ fn bound_from_path(
 #[cfg(test)]
 mod tests {
     use super::{block_reason, should_block, NUDGE_CAP};
-    use crate::state::{IssueState, Phase};
+    use crate::state::{IssueState, Phase, PrOutcome};
 
     fn active_state() -> IssueState {
         IssueState {
@@ -203,6 +208,17 @@ mod tests {
             ..active_state()
         };
         assert!(!should_block(&state));
+    }
+
+    #[test]
+    fn concluded_pr_allows() {
+        for outcome in [PrOutcome::Merged, PrOutcome::Closed] {
+            let state = IssueState {
+                pr_outcome: Some(outcome),
+                ..active_state()
+            };
+            assert!(!should_block(&state));
+        }
     }
 
     #[test]

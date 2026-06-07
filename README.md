@@ -24,6 +24,12 @@ prompts for an approval is equivalent to posting that command.
 4. **review** — on `/approve-implementation`, ghwf flips the draft PR to
    ready-for-review and the work awaits a human.
 
+Merging the PR completes the workflow automatically: `wait` wakes on the
+merge, `work-on` posts a final status update and tells Claude to stop the
+loop, and the session ends on its own. Closing the PR without merging halts
+the workflow the same way (with distinct wording, so Claude surfaces it);
+reopening the PR resumes it on the next `work-on`.
+
 A command that doesn't match the current phase (or the retired generic
 `/proceed`) is consumed without advancing anything, and `work-on` reports what
 went wrong and which command applies.
@@ -53,9 +59,10 @@ those explicitly with `ghwf work-on <n>`.
 so an agent can hand off and sleep instead of being re-prompted by hand. The
 contract:
 
-- **exit 0** — new activity arrived (a comment, an edit, a state change); run
-  `ghwf work-on <issue>` to process it. ghwf's own status updates and the
-  current session's comments never count as activity.
+- **exit 0** — new activity arrived (a comment, an edit, a state change, the
+  PR getting merged or closed); run `ghwf work-on <issue>` to process it.
+  ghwf's own status updates and the current session's comments never count as
+  activity.
 - **exit 2** — the timeout elapsed with nothing new (`--timeout <secs>`,
   default 540 — just under a 10-minute shell command timeout); run
   `ghwf wait <issue>` again.
@@ -109,7 +116,8 @@ consults only ghwf's local state: if the session is bound to an issue (it ran
 blocks the stop and tells Claude to resume the `wait`/`work-on` loop. It lets
 go when:
 
-- the issue is closed (recorded by the last `work-on` run);
+- the issue is closed, or the PR was merged or closed without merging
+  (recorded by the last `work-on` run);
 - it has nudged 3 times in a row with nothing new arriving — Claude is stuck
   or you've asked it to stop, so the hook stops fighting (any new activity
   observed by `work-on` resets the count); or
