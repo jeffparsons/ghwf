@@ -112,6 +112,13 @@ rather than printing the phase banner. It narrates each step as it:
    recorded session (`claude --resume <id>`) when its transcript still exists,
    else starting fresh.
 
+Every launch also fetches origin (worktree creation always did; an existing
+worktree now triggers its own fetch) and then opportunistically fast-forwards
+the worktree that has the repo's default branch checked out, so the local
+`main` checkout implicitly stays fresh. The update only happens when that
+worktree has no changes to tracked files, and any failure is just a warning —
+it never blocks the launch.
+
 For a fresh session there's nothing to resume and nothing queued: ghwf reminds
 you to run `/work-on <issue>` once Claude is up. It deliberately passes no
 prompt — programmatic use (`-p`/`--print`) is billed as API traffic rather than
