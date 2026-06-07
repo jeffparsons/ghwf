@@ -31,6 +31,37 @@ pub struct Comment {
     pub updated_at: String,
     pub html_url: String,
     pub author_association: String,
+    // The reaction summary GitHub embeds in every comment object. It gates
+    // the per-comment reactions detail fetch: no 👍s, no extra API call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reactions: Option<ReactionRollup>,
+}
+
+/// The reaction-count summary embedded in a comment object, trimmed to the
+/// counts we care about.
+#[derive(Deserialize, Serialize)]
+pub struct ReactionRollup {
+    pub total_count: u64,
+    #[serde(rename = "+1")]
+    pub plus_one: u64,
+}
+
+/// One reaction on a comment, from the comment-reactions detail endpoint.
+#[derive(Deserialize, Serialize)]
+pub struct Reaction {
+    pub id: u64,
+    pub user: User,
+    // The reaction kind: `+1`, `-1`, `laugh`, `confused`, `heart`, `hooray`,
+    // `rocket`, or `eyes`. Only `+1` carries workflow meaning.
+    pub content: String,
+    pub created_at: String,
+}
+
+impl Reaction {
+    /// Whether this reaction is a thumbs-up.
+    pub fn is_thumbs_up(&self) -> bool {
+        self.content == "+1"
+    }
 }
 
 /// An inline review comment on a PR, anchored to a file (and usually a line)

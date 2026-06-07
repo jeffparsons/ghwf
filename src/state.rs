@@ -88,6 +88,44 @@ pub fn parse_directive(body: &str) -> Option<Directive> {
     })
 }
 
+/// The approval a ghwf-authored comment prompts for: the *last* word-bounded
+/// mention of an approval command anywhere in `body`, or `None` when no
+/// command is mentioned.
+///
+/// Unlike `parse_directive`, mentions count mid-line (status prose backticks
+/// them). Last-mention-wins makes ghwf comments self-describing 👍 targets:
+/// status updates end with the "Next: comment `/approve-X`" prompt, and
+/// misfire notes end with "the command that advances it is `/approve-X`".
+/// The retired `/proceed` never maps — a 👍 can only mean a live approval.
+pub fn parse_prompted_directive(body: &str) -> Option<Directive> {
+    let mut last: Option<(usize, Directive)> = None;
+    for &(command, directive) in DIRECTIVE_COMMANDS {
+        if directive == Directive::Proceed {
+            continue;
+        }
+        for (idx, _) in body.match_indices(command) {
+            // Word boundaries: the preceding character must not be
+            // alphanumeric, and the following one must not extend the command
+            // word (so `/approve-plans` is not a `/approve-plan` mention).
+            let before_ok = body[..idx]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric());
+            let after_ok = body[idx + command.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '-');
+            if !before_ok || !after_ok {
+                continue;
+            }
+            if last.is_none_or(|(seen, _)| idx > seen) {
+                last = Some((idx, directive));
+            }
+        }
+    }
+    last.map(|(_, directive)| directive)
+}
+
 /// A phase of work on an issue. Named in the imperative mood. Variant order is
 /// workflow order, so the derived `Ord` lets directives be classified as stale
 /// (approving an earlier phase) or premature (a later one).
@@ -143,6 +181,11 @@ pub struct IssueState {
     // are globally unique across the issue and PR conversation threads, so one
     // set dedupes both sources.
     pub consumed_directives: BTreeSet<u64>,
+    // Ids of 👍 reactions already acted on. Reaction ids live in their own id
+    // namespace, so they get their own set rather than sharing
+    // `consumed_directives`. Removing a consumed reaction undoes nothing.
+    #[serde(default)]
+    pub consumed_reactions: BTreeSet<u64>,
     // Whether the one-time intro status update has been posted to the issue.
     // Defaults to false for pre-existing state files, so issues already
     // mid-flight get one phase-aware intro on their next `work-on`.
@@ -200,6 +243,19 @@ pub struct WaitState {
     // feed's ETag lives here too, under the key `events`.
     #[serde(default)]
     pub etags: BTreeMap<String, String>,
+    // Thread key (`issue` / `pr`) -> the approval-prompting comment whose 👍
+    // reactions `wait` watches. Only the latest prompt per thread is watched;
+    // a 👍 on an older prompt is still honoured on the next `work-on`.
+    #[serde(default)]
+    pub reaction_watches: BTreeMap<String, ReactionWatch>,
+}
+
+/// A comment whose 👍 reactions `wait` polls, with the reaction ids already
+/// seen (so only a fresh 👍 wakes).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ReactionWatch {
+    pub comment_id: u64,
+    pub plus_one_ids: BTreeSet<u64>,
 }
 
 /// The fingerprint recorded in `WaitState::issue_fingerprint`.
@@ -310,8 +366,8 @@ pub fn save(owner: &str, repo: &str, number: u64, state: &IssueState) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        branch_and_slug, issue_fingerprint, parse_directive, Directive, IssueState, Phase,
-        PostedRef, WaitState,
+        branch_and_slug, issue_fingerprint, parse_directive, parse_prompted_directive, Directive,
+        IssueState, Phase, PostedRef, ReactionWatch, WaitState,
     };
 
     #[test]
@@ -322,6 +378,16 @@ mod tests {
         assert!(state.last_posted.is_none());
         assert!(!state.issue_closed);
         assert_eq!(state.stop_nudges, 0);
+        assert!(state.consumed_reactions.is_empty());
+    }
+
+    #[test]
+    fn old_wait_state_loads_without_reaction_watches() {
+        let wait: WaitState = serde_json::from_str(
+            r#"{"since":"2026-06-06T10:00:00Z","issue_fingerprint":"abc","comments":{},"review_comments":{}}"#,
+        )
+        .unwrap();
+        assert!(wait.reaction_watches.is_empty());
     }
 
     #[test]
@@ -333,6 +399,14 @@ mod tests {
                 comments: [(1, "h1".to_string())].into(),
                 review_comments: [(2, "h2".to_string())].into(),
                 etags: [("issue".to_string(), "W/\"x\"".to_string())].into(),
+                reaction_watches: [(
+                    "issue".to_string(),
+                    ReactionWatch {
+                        comment_id: 9,
+                        plus_one_ids: [100].into(),
+                    },
+                )]
+                .into(),
             }),
             last_posted: Some(PostedRef {
                 id: 7,
@@ -346,6 +420,9 @@ mod tests {
         assert_eq!(wait.since, "2026-06-06T10:00:00Z");
         assert_eq!(wait.comments.get(&1).map(String::as_str), Some("h1"));
         assert_eq!(wait.etags.get("issue").map(String::as_str), Some("W/\"x\""));
+        let watch = wait.reaction_watches.get("issue").unwrap();
+        assert_eq!(watch.comment_id, 9);
+        assert!(watch.plus_one_ids.contains(&100));
         assert_eq!(back.last_posted.unwrap().id, 7);
     }
 
@@ -422,6 +499,45 @@ mod tests {
             assert_eq!(directive.approves(), Some(phase));
         }
         assert_eq!(Phase::Review.approval_command(), None);
+    }
+
+    #[test]
+    fn prompted_directive_matches_backticked_mid_line_mention() {
+        assert_eq!(
+            parse_prompted_directive("Next: comment `/approve-plan` to advance."),
+            Some(Directive::ApprovePlan)
+        );
+    }
+
+    #[test]
+    fn prompted_directive_last_mention_wins() {
+        // A transition status update mentions the fired command first and the
+        // next prompt last; the prompt is what a 👍 means.
+        let body = "Phase advanced (triggered by `/approve-pre-plan`).\n\n\
+                    Next: comment `/approve-plan` to advance.";
+        assert_eq!(parse_prompted_directive(body), Some(Directive::ApprovePlan));
+        // The alias mentions in pre-plan prose both map to the same directive.
+        let body = "comment `/approve-pre-plan` (alias `/approve-preplan`) to advance";
+        assert_eq!(
+            parse_prompted_directive(body),
+            Some(Directive::ApprovePrePlan)
+        );
+    }
+
+    #[test]
+    fn prompted_directive_requires_word_boundary() {
+        assert_eq!(parse_prompted_directive("see /approve-plans"), None);
+        assert_eq!(parse_prompted_directive("x/approve-plan"), None);
+        assert_eq!(
+            parse_prompted_directive("(/approve-plan)"),
+            Some(Directive::ApprovePlan)
+        );
+    }
+
+    #[test]
+    fn prompted_directive_ignores_proceed_and_plain_prose() {
+        assert_eq!(parse_prompted_directive("`/proceed` is retired"), None);
+        assert_eq!(parse_prompted_directive("no commands here"), None);
     }
 
     #[test]

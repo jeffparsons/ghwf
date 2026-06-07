@@ -7,7 +7,8 @@ and tells Claude what to do next; run outside one, it launches (or resumes) the
 issue's Claude session instead. You advance between phases by commenting a
 phase-specific approval command — `/approve-pre-plan` (alias `/approve-preplan`),
 `/approve-plan`, or `/approve-implementation` — on the issue or, once the draft
-PR exists, on its conversation thread.
+PR exists, on its conversation thread. Reacting 👍 to a ghwf-posted comment that
+prompts for an approval is equivalent to posting that command.
 
 ## Phases
 

@@ -139,10 +139,17 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         Some(pr) => Some(github::fetch_comments(&pr.to_string(), repo_ctx.as_ref())?),
         None => None,
     };
+    // 👍 reactions on ghwf prompt comments are approvals too; fetch the
+    // reaction details for prompts whose rollup shows any.
+    let mut prompt_thumbs = collect_prompt_thumbs(&owner, &repo, &issue_comments, "issue")?;
+    if let Some(comments) = early_pr_comments.as_deref() {
+        prompt_thumbs.extend(collect_prompt_thumbs(&owner, &repo, comments, "PR")?);
+    }
     let outcome = advance_phase(
         &mut issue_state,
         &issue_comments,
         early_pr_comments.as_deref(),
+        &prompt_thumbs,
     );
 
     // The phase-specific banner body. Prep-and-plan does real work here (and
@@ -195,22 +202,27 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
             .as_deref(),
     );
     let status_posted = status.is_some();
+    // The status comments posted to each thread this run, kept so the
+    // reaction watches below can target them — a just-posted prompt is the
+    // likeliest 👍 target.
+    let mut posted_issue: Option<models::Comment> = None;
+    let mut posted_pr: Option<models::Comment> = None;
     if let Some(text) = status {
         let status_body = render::build_status_comment_body(&text);
-        let mut posted = post_status(
+        posted_issue = post_status(
             &number.to_string(),
             &status_body,
             repo_ctx.as_ref(),
             "issue",
         );
         if let Some(pr) = pr_number {
-            posted = post_status(&pr.to_string(), &status_body, repo_ctx.as_ref(), "PR").or(posted);
+            posted_pr = post_status(&pr.to_string(), &status_body, repo_ctx.as_ref(), "PR");
         }
         // Remember the newest own post for feed-lag self-calibration in `wait`.
-        if let Some(comment) = posted {
+        if let Some(comment) = posted_pr.as_ref().or(posted_issue.as_ref()) {
             issue_state.last_posted = Some(state::PostedRef {
                 id: comment.id,
-                created_at: comment.created_at,
+                created_at: comment.created_at.clone(),
             });
         }
         issue_state.intro_posted = true;
@@ -287,6 +299,24 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
             .review_comments
             .insert(comment.id, store::content_hash(&comment.body));
         state::fold_since(&mut wait_state.since, &comment.updated_at);
+    }
+
+    // Watch the latest approval prompt per thread for 👍 reactions — `wait`
+    // is otherwise blind to them (a reaction bumps neither the comment's
+    // `updated_at` nor the events feed). A status comment posted this run is
+    // the newest prompt on its thread.
+    if let Some(watch) = latest_prompt_watch(&issue_comments, posted_issue.as_ref(), &prompt_thumbs)
+    {
+        wait_state
+            .reaction_watches
+            .insert("issue".to_string(), watch);
+    }
+    if let Some(watch) = latest_prompt_watch(
+        pr_comments.as_deref().unwrap_or(&[]),
+        posted_pr.as_ref(),
+        &prompt_thumbs,
+    ) {
+        wait_state.reaction_watches.insert("pr".to_string(), watch);
     }
 
     let record = seen::load(&session_id, &owner, &repo, number)?;
@@ -429,6 +459,37 @@ fn collect_new_comments<'a>(
     new
 }
 
+/// The reaction watch for one thread: its latest ghwf-authored approval
+/// prompt, baselined with the 👍 reaction ids already fetched this run (a
+/// just-posted prompt has none).
+fn latest_prompt_watch(
+    comments: &[models::Comment],
+    posted: Option<&models::Comment>,
+    prompt_thumbs: &[PromptThumbs],
+) -> Option<state::ReactionWatch> {
+    let prompt = comments
+        .iter()
+        .chain(posted)
+        .filter(|comment| render::extract_marker(&comment.body).is_some())
+        .filter(|comment| state::parse_prompted_directive(&comment.body).is_some())
+        .max_by(|a, b| a.created_at.cmp(&b.created_at))?;
+    let plus_one_ids = prompt_thumbs
+        .iter()
+        .find(|p| p.comment_id == prompt.id)
+        .map(|p| {
+            p.reactions
+                .iter()
+                .filter(|r| r.is_thumbs_up())
+                .map(|r| r.id)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(state::ReactionWatch {
+        comment_id: prompt.id,
+        plus_one_ids,
+    })
+}
+
 /// Whether this phase requires Claude to be inside the issue's worktree.
 ///
 /// Only branch-mode phases that operate on a created worktree qualify:
@@ -452,46 +513,148 @@ struct AdvanceOutcome {
     notes: Vec<render::DirectiveNote>,
 }
 
-/// Process any new approval directives on the issue and PR conversation
-/// threads, advancing the issue's phase in `issue_state`.
+/// A ghwf-authored approval prompt comment with the reactions currently on it,
+/// prefetched so `advance_phase` stays network-free.
+struct PromptThumbs {
+    comment_id: u64,
+    /// The approval the prompt's body asks for.
+    directive: state::Directive,
+    /// Which conversation thread the prompt is on ("issue" / "PR").
+    source: &'static str,
+    reactions: Vec<models::Reaction>,
+}
+
+/// Collect one thread's approval prompts that carry 👍 reactions: ghwf-marked
+/// comments whose body prompts for an approval and whose reaction rollup shows
+/// at least one 👍 — only those warrant the per-comment detail fetch.
+fn collect_prompt_thumbs(
+    owner: &str,
+    repo: &str,
+    comments: &[models::Comment],
+    source: &'static str,
+) -> Result<Vec<PromptThumbs>> {
+    let mut prompts = Vec::new();
+    for comment in comments {
+        if render::extract_marker(&comment.body).is_none() {
+            continue;
+        }
+        let Some(directive) = state::parse_prompted_directive(&comment.body) else {
+            continue;
+        };
+        if comment.reactions.as_ref().is_none_or(|r| r.plus_one == 0) {
+            continue;
+        }
+        prompts.push(PromptThumbs {
+            comment_id: comment.id,
+            directive,
+            source,
+            reactions: github::fetch_comment_reactions(owner, repo, comment.id)?,
+        });
+    }
+    Ok(prompts)
+}
+
+/// One approval event awaiting classification: a typed directive comment, or
+/// a 👍 reaction on a ghwf prompt comment.
+enum ApprovalEvent<'a> {
+    Directive {
+        comment: &'a models::Comment,
+        source: &'static str,
+    },
+    Thumb {
+        reaction: &'a models::Reaction,
+        directive: state::Directive,
+        source: &'static str,
+    },
+}
+
+impl ApprovalEvent<'_> {
+    /// When the event happened, for the chronological merge.
+    fn created_at(&self) -> &str {
+        match self {
+            ApprovalEvent::Directive { comment, .. } => &comment.created_at,
+            ApprovalEvent::Thumb { reaction, .. } => &reaction.created_at,
+        }
+    }
+}
+
+/// Process any new approval events — typed directives on the issue and PR
+/// conversation threads, and 👍 reactions on ghwf prompt comments — advancing
+/// the issue's phase in `issue_state`.
 ///
-/// Every directive in an unconsumed user comment is consumed exactly once; one
-/// that doesn't approve the current phase is recorded as a note (stale,
-/// premature, or retired `/proceed`) instead of firing.
+/// Every event is consumed exactly once (comment id or reaction id); one that
+/// doesn't approve the current phase is recorded as a note (stale, premature,
+/// or retired `/proceed`) instead of firing.
 fn advance_phase(
     issue_state: &mut state::IssueState,
     issue_comments: &[models::Comment],
     pr_comments: Option<&[models::Comment]>,
+    prompt_thumbs: &[PromptThumbs],
 ) -> AdvanceOutcome {
-    // Merge both threads chronologically, so successive approvals posted
-    // together fire in the order they were written.
-    let mut tagged: Vec<(&models::Comment, &'static str)> = issue_comments
+    // Merge both threads and both event kinds chronologically, so successive
+    // approvals fire in the order they were given.
+    let mut events: Vec<ApprovalEvent> = issue_comments
         .iter()
-        .map(|comment| (comment, "issue"))
+        .map(|comment| ApprovalEvent::Directive {
+            comment,
+            source: "issue",
+        })
         .chain(
             pr_comments
                 .into_iter()
                 .flatten()
-                .map(|comment| (comment, "PR")),
+                .map(|comment| ApprovalEvent::Directive {
+                    comment,
+                    source: "PR",
+                }),
         )
+        .chain(prompt_thumbs.iter().flat_map(|prompt| {
+            prompt
+                .reactions
+                .iter()
+                .filter(|reaction| reaction.is_thumbs_up())
+                .map(|reaction| ApprovalEvent::Thumb {
+                    reaction,
+                    directive: prompt.directive,
+                    source: prompt.source,
+                })
+        }))
         .collect();
-    tagged.sort_by(|a, b| a.0.created_at.cmp(&b.0.created_at));
+    events.sort_by(|a, b| a.created_at().cmp(b.created_at()));
 
     let mut outcome = AdvanceOutcome::default();
-    for (comment, source) in tagged {
-        // Only the user's comments are directives; skip Claude/ghwf-authored
-        // ones (status updates mention approval commands in their prose).
-        if render::extract_marker(&comment.body).is_some() {
-            continue;
-        }
-        if issue_state.consumed_directives.contains(&comment.id) {
-            continue;
-        }
-        let Some(directive) = state::parse_directive(&comment.body) else {
-            continue;
+    for event in events {
+        let (directive, by, source, via_reaction) = match event {
+            ApprovalEvent::Directive { comment, source } => {
+                // Only the user's comments are directives; skip Claude/ghwf-
+                // authored ones (status updates mention approval commands in
+                // their prose).
+                if render::extract_marker(&comment.body).is_some() {
+                    continue;
+                }
+                if issue_state.consumed_directives.contains(&comment.id) {
+                    continue;
+                }
+                let Some(directive) = state::parse_directive(&comment.body) else {
+                    continue;
+                };
+                // Consume the directive whatever happens next, so it never
+                // re-fires.
+                issue_state.consumed_directives.insert(comment.id);
+                (directive, &comment.user.login, source, false)
+            }
+            ApprovalEvent::Thumb {
+                reaction,
+                directive,
+                source,
+            } => {
+                if issue_state.consumed_reactions.contains(&reaction.id) {
+                    continue;
+                }
+                issue_state.consumed_reactions.insert(reaction.id);
+                (directive, &reaction.user.login, source, true)
+            }
         };
-        // Consume the directive whatever happens next, so it never re-fires.
-        issue_state.consumed_directives.insert(comment.id);
 
         let phase = issue_state.phase;
         let kind = match directive.approves() {
@@ -503,7 +666,8 @@ fn advance_phase(
                     from: phase,
                     to,
                     command: directive.command(),
-                    by: comment.user.login.clone(),
+                    by: by.clone(),
+                    via_reaction,
                 });
                 continue;
             }
@@ -514,9 +678,10 @@ fn advance_phase(
         outcome.notes.push(render::DirectiveNote {
             kind,
             command: directive.command(),
-            by: comment.user.login.clone(),
+            by: by.clone(),
             source,
             phase_at: phase,
+            via_reaction,
         });
     }
     outcome
@@ -558,8 +723,9 @@ fn record_last_posted(
     comment: &models::Comment,
     repo_ctx: Option<&github::RepoRef>,
 ) -> Result<()> {
-    let (owner, repo, number) = github::resolve_issue_ref(issue, repo_ctx)?;
-    let Some((number, mut state)) = state::find_workflow_issue(&owner, &repo, number)? else {
+    let (owner, repo, thread_number) = github::resolve_issue_ref(issue, repo_ctx)?;
+    let Some((number, mut state)) = state::find_workflow_issue(&owner, &repo, thread_number)?
+    else {
         // No workflow has engaged this thread yet; nothing to calibrate.
         return Ok(());
     };
@@ -567,15 +733,35 @@ fn record_last_posted(
         id: comment.id,
         created_at: comment.created_at.clone(),
     });
+    // When the post prompts for an approval it becomes its thread's reaction
+    // watch: it is now the newest prompt there, and the likeliest 👍 target.
+    if state::parse_prompted_directive(&comment.body).is_some() {
+        if let Some(wait) = state.wait.as_mut() {
+            let thread = if thread_number == number {
+                "issue"
+            } else {
+                "pr"
+            };
+            wait.reaction_watches.insert(
+                thread.to_string(),
+                state::ReactionWatch {
+                    comment_id: comment.id,
+                    plus_one_ids: Default::default(),
+                },
+            );
+            // The watch endpoint's URL changed with it; drop the stale ETag.
+            wait.etags.remove(&format!("reactions_{thread}"));
+        }
+    }
     state::save(&owner, &repo, number, &state)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::advance_phase;
-    use crate::models::{Comment, User};
+    use super::{advance_phase, latest_prompt_watch, PromptThumbs};
+    use crate::models::{Comment, Reaction, User};
     use crate::render::NoteKind;
-    use crate::state::{IssueState, Phase};
+    use crate::state::{Directive, IssueState, Phase};
 
     fn comment(id: u64, body: &str, created_at: &str) -> Comment {
         Comment {
@@ -588,6 +774,27 @@ mod tests {
             updated_at: created_at.to_string(),
             html_url: format!("https://github.com/o/r/issues/1#issuecomment-{id}"),
             author_association: "OWNER".to_string(),
+            reactions: None,
+        }
+    }
+
+    fn reaction(id: u64, content: &str, created_at: &str) -> Reaction {
+        Reaction {
+            id,
+            user: User {
+                login: "reactor".to_string(),
+            },
+            content: content.to_string(),
+            created_at: created_at.to_string(),
+        }
+    }
+
+    fn thumbs(comment_id: u64, directive: Directive, reactions: Vec<Reaction>) -> PromptThumbs {
+        PromptThumbs {
+            comment_id,
+            directive,
+            source: "issue",
+            reactions,
         }
     }
 
@@ -602,7 +809,7 @@ mod tests {
     fn matching_directive_advances_and_consumes() {
         let mut state = state_in(Phase::PrePlan);
         let comments = [comment(1, "/approve-pre-plan", "2026-01-01T00:00:00Z")];
-        let outcome = advance_phase(&mut state, &comments, None);
+        let outcome = advance_phase(&mut state, &comments, None, &[]);
         assert_eq!(state.phase, Phase::PrepAndPlan);
         assert_eq!(outcome.transitions.len(), 1);
         assert_eq!(outcome.transitions[0].command, "/approve-pre-plan");
@@ -614,7 +821,7 @@ mod tests {
     fn pr_thread_directive_advances() {
         let mut state = state_in(Phase::PrepAndPlan);
         let pr = [comment(2, "/approve-plan", "2026-01-01T00:00:00Z")];
-        let outcome = advance_phase(&mut state, &[], Some(&pr));
+        let outcome = advance_phase(&mut state, &[], Some(&pr), &[]);
         assert_eq!(state.phase, Phase::Implement);
         assert_eq!(outcome.transitions.len(), 1);
         assert_eq!(outcome.transitions[0].by, "user");
@@ -625,7 +832,7 @@ mod tests {
         let mut state = state_in(Phase::PrepAndPlan);
         let issue = [comment(1, "/approve-plan", "2026-01-01T00:00:00Z")];
         let pr = [comment(2, "/approve-plan", "2026-01-01T00:01:00Z")];
-        let outcome = advance_phase(&mut state, &issue, Some(&pr));
+        let outcome = advance_phase(&mut state, &issue, Some(&pr), &[]);
         assert_eq!(state.phase, Phase::Implement);
         assert_eq!(outcome.transitions.len(), 1);
         assert_eq!(outcome.notes.len(), 1);
@@ -642,7 +849,7 @@ mod tests {
             "/approve-implementation",
             "2026-01-01T00:00:00Z",
         )];
-        let outcome = advance_phase(&mut state, &comments, None);
+        let outcome = advance_phase(&mut state, &comments, None, &[]);
         assert_eq!(state.phase, Phase::PrePlan);
         assert!(outcome.transitions.is_empty());
         assert!(matches!(outcome.notes[0].kind, NoteKind::Premature));
@@ -654,7 +861,7 @@ mod tests {
     fn retired_proceed_is_noted_not_fired() {
         let mut state = state_in(Phase::PrePlan);
         let comments = [comment(1, "/proceed", "2026-01-01T00:00:00Z")];
-        let outcome = advance_phase(&mut state, &comments, None);
+        let outcome = advance_phase(&mut state, &comments, None, &[]);
         assert_eq!(state.phase, Phase::PrePlan);
         assert!(outcome.transitions.is_empty());
         assert!(matches!(outcome.notes[0].kind, NoteKind::Retired));
@@ -667,7 +874,7 @@ mod tests {
         // A status comment may mention an approval command at line start.
         let body = crate::render::build_status_comment_body("/approve-pre-plan");
         let comments = [comment(1, &body, "2026-01-01T00:00:00Z")];
-        let outcome = advance_phase(&mut state, &comments, None);
+        let outcome = advance_phase(&mut state, &comments, None, &[]);
         assert_eq!(state.phase, Phase::PrePlan);
         assert!(outcome.transitions.is_empty());
         assert!(outcome.notes.is_empty());
@@ -733,7 +940,7 @@ mod tests {
             comment(1, "/approve-pre-plan", "2026-01-01T00:00:00Z"),
             comment(2, &claude_body, "2026-01-01T00:01:00Z"),
         ];
-        let outcome = advance_phase(&mut state, &comments, None);
+        let outcome = advance_phase(&mut state, &comments, None, &[]);
         assert_eq!(state.phase, Phase::PrePlan);
         assert!(outcome.transitions.is_empty());
         assert!(outcome.notes.is_empty());
@@ -747,11 +954,143 @@ mod tests {
         // issue slice: the chronological merge must fire pre-plan's first.
         let issue = [comment(2, "/approve-plan", "2026-01-01T00:01:00Z")];
         let pr = [comment(1, "/approve-pre-plan", "2026-01-01T00:00:00Z")];
-        let outcome = advance_phase(&mut state, &issue, Some(&pr));
+        let outcome = advance_phase(&mut state, &issue, Some(&pr), &[]);
         assert_eq!(state.phase, Phase::Implement);
         assert_eq!(outcome.transitions.len(), 2);
         assert_eq!(outcome.transitions[0].command, "/approve-pre-plan");
         assert_eq!(outcome.transitions[1].command, "/approve-plan");
         assert!(outcome.notes.is_empty());
+    }
+
+    #[test]
+    fn thumbs_up_advances_and_consumes_by_reaction_id() {
+        let mut state = state_in(Phase::PrePlan);
+        let prompts = [thumbs(
+            10,
+            Directive::ApprovePrePlan,
+            vec![reaction(100, "+1", "2026-01-01T00:00:00Z")],
+        )];
+        let outcome = advance_phase(&mut state, &[], None, &prompts);
+        assert_eq!(state.phase, Phase::PrepAndPlan);
+        assert_eq!(outcome.transitions.len(), 1);
+        assert!(outcome.transitions[0].via_reaction);
+        assert_eq!(outcome.transitions[0].command, "/approve-pre-plan");
+        assert_eq!(outcome.transitions[0].by, "reactor");
+        assert!(state.consumed_reactions.contains(&100));
+        // Re-running with the same reaction is a no-op.
+        let outcome = advance_phase(&mut state, &[], None, &prompts);
+        assert_eq!(state.phase, Phase::PrepAndPlan);
+        assert!(outcome.transitions.is_empty());
+        assert!(outcome.notes.is_empty());
+    }
+
+    #[test]
+    fn thumbs_up_after_equivalent_directive_is_stale() {
+        let mut state = state_in(Phase::PrePlan);
+        let comments = [comment(1, "/approve-pre-plan", "2026-01-01T00:00:00Z")];
+        let prompts = [thumbs(
+            10,
+            Directive::ApprovePrePlan,
+            vec![reaction(100, "+1", "2026-01-01T00:01:00Z")],
+        )];
+        let outcome = advance_phase(&mut state, &comments, None, &prompts);
+        assert_eq!(state.phase, Phase::PrepAndPlan);
+        assert_eq!(outcome.transitions.len(), 1);
+        assert!(!outcome.transitions[0].via_reaction);
+        assert_eq!(outcome.notes.len(), 1);
+        assert!(matches!(outcome.notes[0].kind, NoteKind::Stale));
+        assert!(outcome.notes[0].via_reaction);
+        assert!(state.consumed_reactions.contains(&100));
+    }
+
+    #[test]
+    fn premature_thumbs_up_is_noted_not_fired() {
+        let mut state = state_in(Phase::PrePlan);
+        let prompts = [thumbs(
+            10,
+            Directive::ApproveImplementation,
+            vec![reaction(100, "+1", "2026-01-01T00:00:00Z")],
+        )];
+        let outcome = advance_phase(&mut state, &[], None, &prompts);
+        assert_eq!(state.phase, Phase::PrePlan);
+        assert!(outcome.transitions.is_empty());
+        assert!(matches!(outcome.notes[0].kind, NoteKind::Premature));
+        assert!(state.consumed_reactions.contains(&100));
+    }
+
+    #[test]
+    fn non_thumbs_up_reactions_are_ignored() {
+        let mut state = state_in(Phase::PrePlan);
+        let prompts = [thumbs(
+            10,
+            Directive::ApprovePrePlan,
+            vec![
+                reaction(100, "heart", "2026-01-01T00:00:00Z"),
+                reaction(101, "-1", "2026-01-01T00:01:00Z"),
+            ],
+        )];
+        let outcome = advance_phase(&mut state, &[], None, &prompts);
+        assert_eq!(state.phase, Phase::PrePlan);
+        assert!(outcome.transitions.is_empty());
+        assert!(outcome.notes.is_empty());
+        assert!(state.consumed_reactions.is_empty());
+    }
+
+    #[test]
+    fn thumbs_up_and_directive_interleave_chronologically() {
+        let mut state = state_in(Phase::PrePlan);
+        // A 👍 approves pre-plan first; a later typed command approves the
+        // plan. Both must fire, in written order.
+        let comments = [comment(1, "/approve-plan", "2026-01-01T00:01:00Z")];
+        let prompts = [thumbs(
+            10,
+            Directive::ApprovePrePlan,
+            vec![reaction(100, "+1", "2026-01-01T00:00:00Z")],
+        )];
+        let outcome = advance_phase(&mut state, &comments, None, &prompts);
+        assert_eq!(state.phase, Phase::Implement);
+        assert_eq!(outcome.transitions.len(), 2);
+        assert!(outcome.transitions[0].via_reaction);
+        assert_eq!(outcome.transitions[0].command, "/approve-pre-plan");
+        assert!(!outcome.transitions[1].via_reaction);
+        assert_eq!(outcome.transitions[1].command, "/approve-plan");
+    }
+
+    #[test]
+    fn latest_prompt_watch_picks_newest_prompt_with_baseline() {
+        let status_old = crate::render::build_status_comment_body(
+            "Next: comment `/approve-pre-plan` to advance.",
+        );
+        let status_new =
+            crate::render::build_status_comment_body("Next: comment `/approve-plan` to advance.");
+        // A non-prompt ghwf comment and a plain user comment never qualify.
+        let status_terminal =
+            crate::render::build_status_comment_body("There is no further approval command.");
+        let comments = [
+            comment(1, &status_old, "2026-01-01T00:00:00Z"),
+            comment(2, &status_new, "2026-01-01T00:01:00Z"),
+            comment(3, &status_terminal, "2026-01-01T00:02:00Z"),
+            comment(4, "/approve-plan", "2026-01-01T00:03:00Z"),
+        ];
+        let prompts = [thumbs(
+            2,
+            Directive::ApprovePlan,
+            vec![
+                reaction(100, "+1", "2026-01-01T00:02:00Z"),
+                reaction(101, "heart", "2026-01-01T00:02:30Z"),
+            ],
+        )];
+        let watch = latest_prompt_watch(&comments, None, &prompts).unwrap();
+        assert_eq!(watch.comment_id, 2);
+        // Baseline holds only the 👍 ids.
+        assert!(watch.plus_one_ids.contains(&100));
+        assert!(!watch.plus_one_ids.contains(&101));
+        // A just-posted status comment outranks everything on the thread.
+        let posted = comment(5, &status_new, "2026-01-01T00:04:00Z");
+        let watch = latest_prompt_watch(&comments, Some(&posted), &prompts).unwrap();
+        assert_eq!(watch.comment_id, 5);
+        assert!(watch.plus_one_ids.is_empty());
+        // No prompts at all: nothing to watch.
+        assert!(latest_prompt_watch(&comments[3..], None, &[]).is_none());
     }
 }
