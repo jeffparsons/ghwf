@@ -19,6 +19,19 @@ pub(crate) fn data_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Claude Code's per-user directory: `$CLAUDE_CONFIG_DIR` when set, else
+/// `~/.claude`.
+pub(crate) fn claude_dir() -> Result<PathBuf> {
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
+    }
+    let base = directories::BaseDirs::new()
+        .ok_or_else(|| anyhow!("could not determine a home directory"))?;
+    Ok(base.home_dir().join(".claude"))
+}
+
 /// Load the persistent salt, generating and storing it on first use.
 ///
 /// The salt makes the session token unguessable from the session id alone.

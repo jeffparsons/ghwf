@@ -155,6 +155,16 @@ pub struct IssueState {
     // Absent until a `work-on` run records one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<WaitState>,
+    // Whether the issue was closed the last time `work-on` fetched it. The
+    // Stop hook reads this to let a session end once the workflow is done.
+    #[serde(default)]
+    pub issue_closed: bool,
+    // Consecutive Stop-hook nudges issued without anything new arriving.
+    // Incremented by `ghwf claude-stop-hook` each time it blocks a stop; reset
+    // by `work-on` whenever it observes new activity. The hook stops nudging
+    // at a cap, so a stuck session isn't fought forever.
+    #[serde(default)]
+    pub stop_nudges: u32,
     // The most recent comment ghwf itself posted to either thread. Lives here
     // rather than on `WaitState` because `work-on` rebuilds that wholesale
     // when recording a baseline, and a status update posted mid-run must
@@ -310,6 +320,8 @@ mod tests {
             serde_json::from_str(r#"{"phase":"implement","consumed_directives":[1]}"#).unwrap();
         assert!(state.wait.is_none());
         assert!(state.last_posted.is_none());
+        assert!(!state.issue_closed);
+        assert_eq!(state.stop_nudges, 0);
     }
 
     #[test]
