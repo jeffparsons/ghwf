@@ -19,10 +19,14 @@ const SKILL_MARKER: &str = "<!-- ghwf:skill";
 const SKILL_CONTENT: &str = r#"---
 description: Drive ghwf on a GitHub issue.
 disable-model-invocation: true
-argument-hint: <issue number or URL>
+argument-hint: "[issue number or URL]"
 allowed-tools: "Bash(ghwf:*)"
 ---
 <!-- ghwf:skill — installed by `ghwf install`; edits are overwritten on update -->
+
+The issue argument may be omitted: ghwf then infers the issue from the
+session environment ($GHWF_ISSUE, set by the ghwf launcher) or the current
+worktree.
 
 Run `ghwf work-on $ARGUMENTS` and follow the phase banner exactly:
 

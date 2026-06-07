@@ -30,7 +30,7 @@ pub fn cwd_is_inside(worktree: &Path) -> bool {
 ///
 /// Both paths are canonicalized first so symlinks (e.g. macOS `/var` →
 /// `/private/var`) don't produce false negatives.
-fn is_inside(cwd: &Path, worktree: &Path) -> bool {
+pub fn is_inside(cwd: &Path, worktree: &Path) -> bool {
     canonical(cwd).starts_with(canonical(worktree))
 }
 

@@ -18,7 +18,7 @@ mod worktree;
 
 use std::io::Read;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
 use clap::{Parser, Subcommand};
 
 use render::{CommentView, ReviewCommentView};
@@ -34,8 +34,11 @@ struct Cli {
 enum Commands {
     /// Advance the workflow on an issue and report what's new and what to do next.
     WorkOn {
-        /// An issue number (resolved against the current repo) or a full GitHub issue URL.
-        issue: String,
+        /// An issue number (resolved against the current repo) or a full GitHub
+        /// issue URL. When omitted, inferred from $GHWF_ISSUE (set by the
+        /// outside-Claude launcher) or the worktree containing the current
+        /// directory.
+        issue: Option<String>,
         /// Work without a dedicated branch/worktree/PR (just write the plan file).
         #[arg(long)]
         no_branch: bool,
@@ -68,13 +71,15 @@ enum Commands {
     /// The comment is prefixed with a "Claude says" header and tagged with hidden
     /// metadata identifying the authoring Claude session.
     CreateIssueComment {
-        /// An issue number (resolved against the current repo) or a full GitHub issue URL.
-        issue: String,
+        /// An issue number (resolved against the current repo) or a full GitHub
+        /// issue URL. When omitted, inferred as `work-on` does.
+        issue: Option<String>,
     },
     /// Print the absolute path of the worktree recorded for an issue.
     WorktreePath {
-        /// An issue number (resolved against the current repo) or a full GitHub issue URL.
-        issue: String,
+        /// An issue number (resolved against the current repo) or a full GitHub
+        /// issue URL. When omitted, inferred as `work-on` does.
+        issue: Option<String>,
     },
     /// Install (or update) ghwf's user-global Claude Code integration: the
     /// `/work-on` skill and the Stop hook that keeps a session working an
@@ -94,8 +99,9 @@ enum Commands {
     /// Exits 0 when activity is detected (run `ghwf work-on` to process it),
     /// 2 on timeout (nothing new — run `wait` again), and 1 on error.
     Wait {
-        /// An issue number (resolved against the current repo) or a full GitHub issue URL.
-        issue: String,
+        /// An issue number (resolved against the current repo) or a full GitHub
+        /// issue URL. When omitted, inferred as `work-on` does.
+        issue: Option<String>,
         /// Give up after this many seconds, with exit code 2.
         #[arg(long, default_value_t = 540)]
         timeout: u64,
@@ -105,15 +111,41 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::WorkOn { issue, no_branch } => work_on(&issue, no_branch),
+        Commands::WorkOn { issue, no_branch } => work_on(&resolve_issue_arg(issue)?, no_branch),
         Commands::Next { no_branch } => work_on(&next::pick()?.to_string(), no_branch),
         Commands::CollectGarbage { dry_run } => collect_garbage::run(dry_run),
-        Commands::CreateIssueComment { issue } => create_issue_comment(&issue),
-        Commands::WorktreePath { issue } => worktree_path(&issue),
+        Commands::CreateIssueComment { issue } => create_issue_comment(&resolve_issue_arg(issue)?),
+        Commands::WorktreePath { issue } => worktree_path(&resolve_issue_arg(issue)?),
         Commands::Install { force } => install::run(force),
         Commands::ClaudeStopHook => stop_hook::run(),
-        Commands::Wait { issue, timeout } => wait::run(&issue, timeout),
+        Commands::Wait { issue, timeout } => wait::run(&resolve_issue_arg(issue)?, timeout),
     }
+}
+
+/// Resolve the issue a command operates on: the explicit argument when given,
+/// else $GHWF_ISSUE (set on the session by the outside-Claude launcher), else
+/// the issue whose recorded worktree contains the current directory. An
+/// explicit argument always wins — the fallbacks are defaults, not locks.
+fn resolve_issue_arg(arg: Option<String>) -> Result<String> {
+    if let Some(arg) = arg {
+        return Ok(arg);
+    }
+    if let Ok(value) = std::env::var(store::ISSUE_ENV) {
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
+    let issues_root = store::data_dir()?.join("issues");
+    let cwd = std::env::current_dir().context("failed to determine the current directory")?;
+    if let Some((owner, repo, number)) = state::find_issue_for_dir(&issues_root, &cwd)? {
+        return Ok(format!("https://github.com/{owner}/{repo}/issues/{number}"));
+    }
+    bail!(
+        "no issue given and none could be inferred (${} is unset and the current \
+         directory is not inside a recorded worktree); pass an issue number or URL, \
+         e.g. `ghwf work-on 13`.",
+        store::ISSUE_ENV
+    );
 }
 
 /// Print the absolute worktree path recorded for an issue (for scripts and the
