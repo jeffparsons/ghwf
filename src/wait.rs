@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::github::{self, Conditional};
-use crate::models::{Comment, Issue, Reaction, ReviewComment, User};
+use crate::models::{Comment, Issue, PullRequest, Reaction, ReviewComment, User};
 use crate::state::{self, PostedRef, ReactionWatch, WaitState};
 use crate::{render, store};
 
@@ -245,6 +245,8 @@ struct Endpoint {
 enum EndpointKind {
     /// The issue object; wakes on a fingerprint change.
     IssueObject,
+    /// The PR object; wakes when the PR has left the open state.
+    PrObject,
     /// A conversation comment list; the noun names the thread in reasons.
     Conversation(&'static str),
     /// The PR's inline review comment list.
@@ -281,6 +283,11 @@ fn poll_endpoints(
         },
     ];
     if let Some(pr) = pr {
+        endpoints.push(Endpoint {
+            key: "pr",
+            url: format!("repos/{owner}/{repo}/pulls/{pr}"),
+            kind: EndpointKind::PrObject,
+        });
         endpoints.push(Endpoint {
             key: "pr_comments",
             url: format!("repos/{owner}/{repo}/issues/{pr}/comments?per_page=100&since={since}"),
@@ -367,6 +374,23 @@ fn evaluate_fresh(
                 state::issue_fingerprint(&issue.title, issue.body.as_deref(), &issue.state);
             if fingerprint != wait.issue_fingerprint {
                 reasons.push("The issue was edited (title, body, or state changed).".to_string());
+            }
+        }
+        EndpointKind::PrObject => {
+            let pr: PullRequest = serde_json::from_str(body)
+                .with_context(|| format!("failed to parse PR JSON from {}", endpoint.url))?;
+            // No baseline: a wait only runs while the PR is open (work-on
+            // stops the loop once it isn't), so any left-the-open-state
+            // response is a wake. The PR's ETag also bumps on pushes and
+            // comment activity; a fresh-but-open response is not a reason.
+            match state::pr_outcome(&pr) {
+                Some(state::PrOutcome::Merged) => {
+                    reasons.push("The PR was merged.".to_string());
+                }
+                Some(state::PrOutcome::Closed) => {
+                    reasons.push("The PR was closed without merging.".to_string());
+                }
+                None => {}
             }
         }
         EndpointKind::Conversation(noun) => {
@@ -481,6 +505,10 @@ struct FeedPayload {
 #[derive(Deserialize)]
 struct FeedSubject {
     number: u64,
+    // The `PullRequestEvent` payload embeds the full PR object, including its
+    // merged state; absent on issue subjects.
+    #[serde(default)]
+    merged: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -619,6 +647,23 @@ fn feed_wake_reasons(
             "IssuesEvent" if ours(&event.payload.issue) => {
                 let action = event.payload.action.as_deref().unwrap_or("changed");
                 reasons.push(format!("The issue was {action} (via the events feed)."));
+            }
+            // Only the closed action matters: it concludes (or halts) the
+            // workflow. Pushes (`synchronize`) and reopens must not wake.
+            "PullRequestEvent" if ours(&event.payload.pull_request) => {
+                if event.payload.action.as_deref() != Some("closed") {
+                    continue;
+                }
+                let merged = event
+                    .payload
+                    .pull_request
+                    .as_ref()
+                    .is_some_and(|pr| pr.merged == Some(true));
+                reasons.push(if merged {
+                    "The PR was merged (via the events feed).".to_string()
+                } else {
+                    "The PR was closed without merging (via the events feed).".to_string()
+                });
             }
             _ => {}
         }
@@ -822,13 +867,102 @@ mod tests {
         assert!(reaction_reasons(body, &[]).is_empty());
     }
 
+    /// Run `evaluate_fresh` for the PR-object endpoint against a PR body in
+    /// the given state, returning the wake reasons.
+    fn pr_object_reasons(state: &str, merged: bool) -> Vec<String> {
+        let endpoint = Endpoint {
+            key: "pr",
+            url: "repos/o/r/pulls/18".to_string(),
+            kind: EndpointKind::PrObject,
+        };
+        let body = serde_json::json!({
+            "number": 18,
+            "state": state,
+            "merged": merged,
+            "html_url": "https://github.com/o/r/pull/18",
+        });
+        let mut reasons = Vec::new();
+        evaluate_fresh(
+            &endpoint,
+            &body.to_string(),
+            &WaitState::default(),
+            Some("tok"),
+            &mut reasons,
+        )
+        .unwrap();
+        reasons
+    }
+
+    #[test]
+    fn merged_pr_wakes() {
+        let reasons = pr_object_reasons("closed", true);
+        assert_eq!(reasons, ["The PR was merged."]);
+    }
+
+    #[test]
+    fn closed_unmerged_pr_wakes() {
+        let reasons = pr_object_reasons("closed", false);
+        assert_eq!(reasons, ["The PR was closed without merging."]);
+    }
+
+    #[test]
+    fn open_pr_does_not_wake() {
+        assert!(pr_object_reasons("open", false).is_empty());
+    }
+
+    fn feed_pr_event(pr: u64, action: &str, merged: bool, at: &str) -> FeedEvent {
+        FeedEvent {
+            kind: "PullRequestEvent".to_string(),
+            created_at: at.to_string(),
+            payload: FeedPayload {
+                action: Some(action.to_string()),
+                issue: None,
+                pull_request: Some(FeedSubject {
+                    number: pr,
+                    merged: Some(merged),
+                }),
+                comment: None,
+            },
+        }
+    }
+
+    #[test]
+    fn feed_wakes_on_pr_closed_event() {
+        let events = [feed_pr_event(18, "closed", true, "2026-06-06T13:00:00Z")];
+        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, None);
+        assert_eq!(reasons, ["The PR was merged (via the events feed)."]);
+        let events = [feed_pr_event(18, "closed", false, "2026-06-06T13:00:00Z")];
+        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, None);
+        assert_eq!(
+            reasons,
+            ["The PR was closed without merging (via the events feed)."]
+        );
+    }
+
+    #[test]
+    fn feed_ignores_other_prs_and_other_pr_actions() {
+        let events = [
+            // A different PR.
+            feed_pr_event(99, "closed", true, "2026-06-06T13:00:00Z"),
+            // Ours, but not the closed action.
+            feed_pr_event(18, "synchronize", false, "2026-06-06T13:00:00Z"),
+            feed_pr_event(18, "reopened", false, "2026-06-06T13:00:00Z"),
+            // Ours and closed, but before the watermark.
+            feed_pr_event(18, "closed", true, "2026-06-06T11:00:00Z"),
+        ];
+        assert!(feed_wake_reasons(&events, 7, Some(18), SINCE, None).is_empty());
+    }
+
     fn feed_comment_event(issue: u64, comment_id: u64, body: &str, at: &str) -> FeedEvent {
         FeedEvent {
             kind: "IssueCommentEvent".to_string(),
             created_at: at.to_string(),
             payload: FeedPayload {
                 action: Some("created".to_string()),
-                issue: Some(FeedSubject { number: issue }),
+                issue: Some(FeedSubject {
+                    number: issue,
+                    merged: None,
+                }),
                 pull_request: None,
                 comment: Some(FeedComment {
                     id: comment_id,
@@ -876,7 +1010,10 @@ mod tests {
             created_at: "2026-06-06T13:00:00Z".to_string(),
             payload: FeedPayload {
                 action: Some("closed".to_string()),
-                issue: Some(FeedSubject { number: 7 }),
+                issue: Some(FeedSubject {
+                    number: 7,
+                    merged: None,
+                }),
                 pull_request: None,
                 comment: None,
             },

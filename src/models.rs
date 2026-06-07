@@ -21,6 +21,16 @@ pub struct Issue {
     pub author_association: String,
 }
 
+/// A pull request, trimmed to the fields conclusion detection needs. Only the
+/// single-PR fetch carries `merged`.
+#[derive(Deserialize, Serialize)]
+pub struct PullRequest {
+    pub number: u64,
+    pub state: String,
+    pub merged: bool,
+    pub html_url: String,
+}
+
 /// A label on an issue, trimmed to the fields we care about.
 #[derive(Deserialize, Serialize)]
 pub struct Label {
