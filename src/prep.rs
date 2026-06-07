@@ -103,7 +103,8 @@ pub fn run(
     state: &mut IssueState,
 ) -> Result<String> {
     // Record the mode on first entry; later runs reuse it. (The outside-Claude
-    // launcher may already have created branch-mode prep state during pre-plan.)
+    // launcher may already have created prep state — in either mode — during
+    // pre-plan.)
     if state.prep.is_none() {
         state.prep = Some(PrepState {
             no_branch: no_branch_flag,

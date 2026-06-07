@@ -38,6 +38,10 @@ pub fn run(issue_arg: &str, no_branch: bool) -> Result<()> {
         None => no_branch,
     };
 
+    // The canonical issue URL, set as $GHWF_ISSUE on the launched Claude so
+    // ghwf commands inside the session don't need an issue argument.
+    let issue_url = format!("https://github.com/{owner}/{repo}/issues/{number}");
+
     // --no-branch work has no worktree to anchor a session to: launch a fresh
     // Claude where we are.
     if use_no_branch {
@@ -45,8 +49,17 @@ pub fn run(issue_arg: &str, no_branch: bool) -> Result<()> {
             "Issue #{number} is being worked with --no-branch (no dedicated worktree), \
              so Claude will start in the current directory."
         );
-        print_fresh_reminder(number);
-        return exec_claude(None, None);
+        // Record the mode now so the in-session run honours it even though the
+        // user won't repeat the flag (recorded mode wins over the flag there).
+        if issue_state.prep.is_none() {
+            issue_state.prep = Some(state::PrepState {
+                no_branch: true,
+                ..Default::default()
+            });
+            state::save(&owner, &repo, number, &issue_state)?;
+        }
+        print_fresh_reminder();
+        return exec_claude(None, None, &issue_url);
     }
 
     // Find or create the worktree. The launcher creates it immediately — even
@@ -105,10 +118,10 @@ pub fn run(issue_arg: &str, no_branch: bool) -> Result<()> {
                 "Starting a fresh Claude session in `{}`.",
                 worktree.display()
             );
-            print_fresh_reminder(number);
+            print_fresh_reminder();
         }
     }
-    exec_claude(Some(&worktree), resume.as_deref())
+    exec_claude(Some(&worktree), resume.as_deref(), &issue_url)
 }
 
 /// Best-effort fetch plus default-branch worktree update, so every launch is a
@@ -149,8 +162,11 @@ fn refresh_main_repo(owner: &str, repo: &str) {
 /// Remind the user how to kick off the workflow in a fresh session. The launcher
 /// can't do it for them: passing Claude a prompt would be programmatic use,
 /// billed as API traffic.
-fn print_fresh_reminder(number: u64) {
-    println!("Once Claude is up, run `/work-on {number}` to pick up the workflow.");
+fn print_fresh_reminder() {
+    println!(
+        "Once Claude is up, run `/work-on` to pick up the workflow \
+         (the issue is inferred from the session environment)."
+    );
 }
 
 /// The session recorded for this worktree, if its transcript still exists under
@@ -199,13 +215,15 @@ fn munge(path: &Path) -> String {
 }
 
 /// Replace this process with an interactive `claude`, launched in `dir` when
-/// given, resuming `resume` when given.
+/// given, resuming `resume` when given. `issue_url` is exported as $GHWF_ISSUE
+/// so ghwf commands inside the session can default to it.
 ///
 /// Never pass `-p`/`--print` (or any prompt): that is programmatic use, billed
 /// as API traffic rather than the user's subscription. Because we exec rather
 /// than spawn, quitting Claude returns the user to the shell that ran ghwf.
-fn exec_claude(dir: Option<&Path>, resume: Option<&str>) -> Result<()> {
+fn exec_claude(dir: Option<&Path>, resume: Option<&str>, issue_url: &str) -> Result<()> {
     let mut cmd = Command::new("claude");
+    cmd.env(store::ISSUE_ENV, issue_url);
     if let Some(id) = resume {
         cmd.args(["--resume", id]);
     }

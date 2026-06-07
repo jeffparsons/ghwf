@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::store;
+use crate::{store, worktree};
 
 /// Branch/worktree name and plan-file slug derived from an issue.
 ///
@@ -351,6 +351,72 @@ pub fn find_workflow_issue(
     Ok(None)
 }
 
+/// Find the issue whose recorded worktree contains `dir`, walking every
+/// `<owner>/<repo>/<number>.json` under `issues_root` (the data dir's `issues`
+/// directory; parameterized for tests). Returns `(owner, repo, number)`, or
+/// `None` when no recorded worktree contains `dir`. Worktrees are per-issue,
+/// so multiple matches shouldn't happen; if they do, the first wins with a
+/// warning.
+pub fn find_issue_for_dir(issues_root: &Path, dir: &Path) -> Result<Option<(String, String, u64)>> {
+    let mut found: Option<(String, String, u64)> = None;
+    for (owner, repo, number, path) in state_files(issues_root) {
+        let json = match fs::read_to_string(&path) {
+            Ok(json) => json,
+            Err(_) => continue,
+        };
+        let state: IssueState = serde_json::from_str(&json)
+            .with_context(|| format!("failed to parse issue state {}", path.display()))?;
+        let Some(worktree_path) = state.prep.as_ref().and_then(|p| p.worktree_path.as_ref()) else {
+            continue;
+        };
+        if !worktree::is_inside(dir, worktree_path) {
+            continue;
+        }
+        match &found {
+            None => found = Some((owner, repo, number)),
+            Some((o, r, n)) => eprintln!(
+                "warning: `{}` is inside the worktrees of both {o}/{r}#{n} and \
+                 {owner}/{repo}#{number}; using the former.",
+                dir.display()
+            ),
+        }
+    }
+    Ok(found)
+}
+
+/// Every `(owner, repo, number, path)` state file under `issues_root`, in
+/// directory-walk order. Unreadable directories and non-numeric filenames are
+/// skipped.
+fn state_files(issues_root: &Path) -> Vec<(String, String, u64, PathBuf)> {
+    let mut files = Vec::new();
+    for owner_entry in fs::read_dir(issues_root).into_iter().flatten().flatten() {
+        let owner_path = owner_entry.path();
+        let Some(owner) = owner_path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let owner = owner.to_string();
+        for repo_entry in fs::read_dir(&owner_path).into_iter().flatten().flatten() {
+            let repo_path = repo_entry.path();
+            let Some(repo) = repo_path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let repo = repo.to_string();
+            for file_entry in fs::read_dir(&repo_path).into_iter().flatten().flatten() {
+                let path = file_entry.path();
+                let Some(number) = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                else {
+                    continue;
+                };
+                files.push((owner.clone(), repo.clone(), number, path));
+            }
+        }
+    }
+    files
+}
+
 /// Persist the state for an issue.
 pub fn save(owner: &str, repo: &str, number: u64, state: &IssueState) -> Result<()> {
     let path = state_path(owner, repo, number)?;
@@ -366,9 +432,85 @@ pub fn save(owner: &str, repo: &str, number: u64, state: &IssueState) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        branch_and_slug, issue_fingerprint, parse_directive, parse_prompted_directive, Directive,
-        IssueState, Phase, PostedRef, ReactionWatch, WaitState,
+        branch_and_slug, find_issue_for_dir, issue_fingerprint, parse_directive,
+        parse_prompted_directive, Directive, IssueState, Phase, PostedRef, PrepState,
+        ReactionWatch, WaitState,
     };
+    use std::path::{Path, PathBuf};
+
+    /// A unique scratch directory for building fake issues roots and worktrees.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ghwf-state-test-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write a state file for `owner/repo#number` under `issues_root`, recording
+    /// `worktree` when given.
+    fn write_state(
+        issues_root: &Path,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        worktree: Option<&Path>,
+    ) {
+        let state = IssueState {
+            prep: worktree.map(|path| PrepState {
+                worktree_path: Some(path.to_path_buf()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dir = issues_root.join(owner).join(repo);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{number}.json")),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn find_issue_for_dir_matches_worktree_and_descendants() {
+        let root = scratch("find-match");
+        let issues_root = root.join("issues");
+        let worktree = root.join("wt_7");
+        std::fs::create_dir_all(worktree.join("sub")).unwrap();
+        write_state(&issues_root, "o", "r", 7, Some(&worktree));
+        // Another issue without a worktree must not interfere.
+        write_state(&issues_root, "o", "r", 8, None);
+
+        let expected = Some(("o".to_string(), "r".to_string(), 7));
+        assert_eq!(
+            find_issue_for_dir(&issues_root, &worktree).unwrap(),
+            expected
+        );
+        assert_eq!(
+            find_issue_for_dir(&issues_root, &worktree.join("sub")).unwrap(),
+            expected
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn find_issue_for_dir_outside_any_worktree() {
+        let root = scratch("find-miss");
+        let issues_root = root.join("issues");
+        let worktree = root.join("wt_7");
+        std::fs::create_dir_all(&worktree).unwrap();
+        write_state(&issues_root, "o", "r", 7, Some(&worktree));
+
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        assert_eq!(find_issue_for_dir(&issues_root, &elsewhere).unwrap(), None);
+        // A missing issues root is a miss, not an error.
+        assert_eq!(
+            find_issue_for_dir(&root.join("no-issues"), &worktree).unwrap(),
+            None
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn old_state_files_load_without_wait_fields() {

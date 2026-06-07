@@ -29,7 +29,14 @@ A command that doesn't match the current phase (or the retired generic
 went wrong and which command applies.
 
 Pass `--no-branch` to skip the branch/worktree/PR entirely and just write the plan
-file — handy for trivial tasks or when you're already on a feature branch.
+file — handy for trivial tasks or when you're already on a feature branch. The
+mode is recorded in the issue's state on first use (including by the
+outside-Claude launcher), so later `work-on` runs don't need the flag repeated.
+
+The issue argument is optional everywhere it appears: when omitted, ghwf falls
+back to `$GHWF_ISSUE` (set on sessions started by the launcher below), then to
+the issue whose recorded worktree contains the current directory. An explicit
+argument always wins.
 
 ## Picking an issue automatically
 
@@ -132,6 +139,10 @@ rather than printing the phase banner. It narrates each step as it:
    recorded session (`claude --resume <id>`) when its transcript still exists,
    else starting fresh.
 
+The launcher exports `GHWF_ISSUE` (the issue's URL) to the `claude` it starts,
+and records `--no-branch` in the issue's state, so ghwf commands inside the
+session need neither the issue argument nor the flag repeated.
+
 Every launch also fetches origin (worktree creation always did; an existing
 worktree now triggers its own fetch) and then opportunistically fast-forwards
 the worktree that has the repo's default branch checked out, so the local
@@ -140,9 +151,9 @@ worktree has no changes to tracked files, and any failure is just a warning —
 it never blocks the launch.
 
 For a fresh session there's nothing to resume and nothing queued: ghwf reminds
-you to run `/work-on <issue>` once Claude is up. It deliberately passes no
-prompt — programmatic use (`-p`/`--print`) is billed as API traffic rather than
-your subscription.
+you to run `/work-on` (no argument needed) once Claude is up. It deliberately
+passes no prompt — programmatic use (`-p`/`--print`) is billed as API traffic
+rather than your subscription.
 
 ## The relaunch constraint
 

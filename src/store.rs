@@ -8,6 +8,11 @@ use sha2::{Digest, Sha256};
 /// current session UUID.
 pub const SESSION_ID_ENV: &str = "CLAUDE_CODE_SESSION_ID";
 
+/// Environment variable the outside-Claude launcher sets on the `claude` it
+/// execs, holding the canonical URL of the issue being worked. Commands run
+/// inside that session fall back to it when no issue argument is given.
+pub const ISSUE_ENV: &str = "GHWF_ISSUE";
+
 /// Per-user data directory for ghwf, e.g. `~/Library/Application Support/ghwf`
 /// on macOS, `~/.local/share/ghwf` on Linux. Created if absent.
 pub(crate) fn data_dir() -> Result<PathBuf> {
