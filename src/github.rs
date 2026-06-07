@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, bail, Context, Result};
 use url::Url;
 
-use crate::models::{Comment, Issue, IssueListing, ReviewComment, User};
+use crate::models::{Comment, Issue, IssueListing, Reaction, ReviewComment, User};
 use crate::{config, git};
 
 /// The `(owner, repo)` a command should operate on, when known from `ghwf.toml`.
@@ -33,6 +33,16 @@ pub fn fetch_review_comments(owner: &str, repo: &str, pr: u64) -> Result<Vec<Rev
     let endpoint = format!("repos/{owner}/{repo}/pulls/{pr}/comments");
     let json = gh_api(&["--paginate", &endpoint])?;
     serde_json::from_str(&json).context("failed to parse review comments JSON from `gh api`")
+}
+
+/// Fetch the reactions on a conversation comment, following pagination.
+///
+/// Issue and PR conversation comments share the issue-comments id namespace,
+/// so one endpoint form serves both threads.
+pub fn fetch_comment_reactions(owner: &str, repo: &str, comment_id: u64) -> Result<Vec<Reaction>> {
+    let endpoint = format!("repos/{owner}/{repo}/issues/comments/{comment_id}/reactions");
+    let json = gh_api(&["--paginate", &endpoint])?;
+    serde_json::from_str(&json).context("failed to parse reactions JSON from `gh api`")
 }
 
 /// Post a comment to an issue's (or PR's) conversation thread.

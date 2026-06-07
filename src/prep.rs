@@ -196,7 +196,7 @@ fn complete_body(worktree: &Path, branch: &str, pr_url: &str, number: u64) -> St
          - Draft PR: {pr_url}\n\n\
          If you haven't already, post a hand-off comment on issue #{number} and on the PR \
          saying the plan is ready for review, and that commenting `/approve-plan` on either \
-         thread advances to the implement phase.\n\n{}",
+         thread (or reacting 👍 to that comment) advances to the implement phase.\n\n{}",
         worktree.display(),
         crate::render::wait_instruction(number),
     )

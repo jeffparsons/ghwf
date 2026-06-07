@@ -5,8 +5,8 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::github::{self, Conditional};
-use crate::models::{Comment, Issue, ReviewComment, User};
-use crate::state::{self, PostedRef, WaitState};
+use crate::models::{Comment, Issue, Reaction, ReviewComment, User};
+use crate::state::{self, PostedRef, ReactionWatch, WaitState};
 use crate::{render, store};
 
 /// Exit code when the timeout elapses with nothing new (exit 0 = activity
@@ -44,7 +44,12 @@ pub fn run(issue: &str, timeout_secs: u64) -> Result<()> {
         _ => None,
     };
 
-    let endpoints = poll_endpoints(&owner, &repo, number, pr_number, &wait_state.since);
+    let endpoints = poll_endpoints(&owner, &repo, number, pr_number, &wait_state);
+    // The reaction watches again, on their own: the events feed is
+    // structurally blind to reactions, so feed mode polls these directly
+    // every cycle rather than leaving them to the backstop sweep. They share
+    // ETag keys with their twins in `endpoints`.
+    let watch_endpoints = reaction_endpoints(&owner, &repo, &wait_state.reaction_watches);
     let feed_endpoint = format!("repos/{owner}/{repo}/events?per_page=100");
 
     match pr_number {
@@ -85,6 +90,14 @@ pub fn run(issue: &str, timeout_secs: u64) -> Result<()> {
                         my_token.as_deref(),
                         interval,
                     )
+                    .and_then(|mut outcome| {
+                        // The feed can't show reactions; poll the watches too.
+                        let reactions =
+                            direct_cycle(&watch_endpoints, &mut wait_state, my_token.as_deref())?;
+                        outcome.reasons.extend(reactions.reasons);
+                        outcome.fresh |= reactions.fresh;
+                        Ok(outcome)
+                    })
                 }
             }
         };
@@ -236,18 +249,23 @@ enum EndpointKind {
     Conversation(&'static str),
     /// The PR's inline review comment list.
     ReviewComments,
+    /// The reactions on one thread's watched approval prompt; the key
+    /// (`issue` / `pr`) selects the baseline in `WaitState::reaction_watches`.
+    Reactions(&'static str),
 }
 
 /// The fixed set of endpoints one `wait` invocation polls. The PR endpoints
 /// exist only when prep state records a PR (only `work-on` opens PRs, so the
-/// set can't change mid-wait).
+/// set can't change mid-wait); the reaction watches are likewise fixed at
+/// entry.
 fn poll_endpoints(
     owner: &str,
     repo: &str,
     number: u64,
     pr: Option<u64>,
-    since: &str,
+    wait: &WaitState,
 ) -> Vec<Endpoint> {
+    let since = &wait.since;
     let mut endpoints = vec![
         Endpoint {
             key: "issue",
@@ -274,7 +292,35 @@ fn poll_endpoints(
             kind: EndpointKind::ReviewComments,
         });
     }
+    endpoints.extend(reaction_endpoints(owner, repo, &wait.reaction_watches));
     endpoints
+}
+
+/// One endpoint per recorded reaction watch: the watched prompt comment's
+/// reactions list. A reaction bumps neither the comment's `updated_at` nor
+/// the events feed, so this is the only way a 👍 can wake a wait.
+fn reaction_endpoints(
+    owner: &str,
+    repo: &str,
+    watches: &BTreeMap<String, ReactionWatch>,
+) -> Vec<Endpoint> {
+    ["issue", "pr"]
+        .into_iter()
+        .filter_map(|thread| {
+            let watch = watches.get(thread)?;
+            Some(Endpoint {
+                key: match thread {
+                    "issue" => "reactions_issue",
+                    _ => "reactions_pr",
+                },
+                url: format!(
+                    "repos/{owner}/{repo}/issues/comments/{}/reactions?per_page=100",
+                    watch.comment_id
+                ),
+                kind: EndpointKind::Reactions(thread),
+            })
+        })
+        .collect()
 }
 
 /// One direct cycle: a conditional GET per endpoint, evaluating fresh bodies
@@ -327,6 +373,29 @@ fn evaluate_fresh(
             let comments: Vec<Comment> = serde_json::from_str(body)
                 .with_context(|| format!("failed to parse comments JSON from {}", endpoint.url))?;
             comment_reasons(&comments, noun, &wait.comments, my_token, reasons);
+        }
+        EndpointKind::Reactions(thread) => {
+            let reactions: Vec<Reaction> = serde_json::from_str(body)
+                .with_context(|| format!("failed to parse reactions JSON from {}", endpoint.url))?;
+            let noun = match *thread {
+                "pr" => "PR thread",
+                _ => "issue thread",
+            };
+            // Only a 👍 the baseline hasn't seen is activity; other reaction
+            // kinds carry no workflow meaning.
+            let baseline = wait.reaction_watches.get(*thread).map(|w| &w.plus_one_ids);
+            for reaction in &reactions {
+                if !reaction.is_thumbs_up() {
+                    continue;
+                }
+                if baseline.is_some_and(|ids| ids.contains(&reaction.id)) {
+                    continue;
+                }
+                reasons.push(format!(
+                    "New 👍 reaction from {} on the approval prompt ({noun}).",
+                    reaction.user.login
+                ));
+            }
         }
         EndpointKind::ReviewComments => {
             let comments: Vec<ReviewComment> = serde_json::from_str(body).with_context(|| {
@@ -599,11 +668,11 @@ fn persist(
 #[cfg(test)]
 mod tests {
     use super::{
-        comment_reasons, feed_interval, feed_trusted, feed_wake_reasons, FeedComment, FeedEvent,
-        FeedPayload, FeedSubject,
+        comment_reasons, evaluate_fresh, feed_interval, feed_trusted, feed_wake_reasons, Endpoint,
+        EndpointKind, FeedComment, FeedEvent, FeedPayload, FeedSubject,
     };
     use crate::models::{Comment, User};
-    use crate::state::PostedRef;
+    use crate::state::{PostedRef, ReactionWatch, WaitState};
     use std::collections::BTreeMap;
     use std::time::Duration;
 
@@ -618,6 +687,7 @@ mod tests {
             updated_at: "2026-06-06T12:00:00Z".to_string(),
             html_url: format!("https://github.com/o/r/issues/1#issuecomment-{id}"),
             author_association: "OWNER".to_string(),
+            reactions: None,
         }
     }
 
@@ -690,6 +760,66 @@ mod tests {
         // Only the other session's comment is activity.
         assert_eq!(reasons.len(), 1);
         assert!(reasons[0].contains("New comment"));
+    }
+
+    fn reaction_json(id: u64, content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "user": { "login": "reactor" },
+            "content": content,
+            "created_at": "2026-06-06T13:00:00Z",
+        })
+    }
+
+    /// Run `evaluate_fresh` for an issue-thread reactions endpoint against a
+    /// baseline of already-seen 👍 ids, returning the wake reasons.
+    fn reaction_reasons(body: serde_json::Value, baseline: &[u64]) -> Vec<String> {
+        let endpoint = Endpoint {
+            key: "reactions_issue",
+            url: "repos/o/r/issues/comments/9/reactions?per_page=100".to_string(),
+            kind: EndpointKind::Reactions("issue"),
+        };
+        let wait = WaitState {
+            reaction_watches: [(
+                "issue".to_string(),
+                ReactionWatch {
+                    comment_id: 9,
+                    plus_one_ids: baseline.iter().copied().collect(),
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let mut reasons = Vec::new();
+        evaluate_fresh(
+            &endpoint,
+            &body.to_string(),
+            &wait,
+            Some("tok"),
+            &mut reasons,
+        )
+        .unwrap();
+        reasons
+    }
+
+    #[test]
+    fn unknown_thumbs_up_wakes() {
+        let reasons = reaction_reasons(serde_json::json!([reaction_json(100, "+1")]), &[]);
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("New 👍 reaction from reactor"));
+        assert!(reasons[0].contains("issue thread"));
+    }
+
+    #[test]
+    fn baselined_thumbs_up_does_not_wake() {
+        let reasons = reaction_reasons(serde_json::json!([reaction_json(100, "+1")]), &[100]);
+        assert!(reasons.is_empty());
+    }
+
+    #[test]
+    fn non_thumbs_up_reactions_do_not_wake() {
+        let body = serde_json::json!([reaction_json(100, "heart"), reaction_json(101, "rocket")]);
+        assert!(reaction_reasons(body, &[]).is_empty());
     }
 
     fn feed_comment_event(issue: u64, comment_id: u64, body: &str, at: &str) -> FeedEvent {
