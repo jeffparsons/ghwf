@@ -116,6 +116,13 @@ worktrees_dir = "worktrees"
 # Labels marking an issue as urgent, most urgent first (optional; used by
 # `ghwf next`).
 priority_labels = ["urgent", "soon"]
+# Markdown file of instructions for writing PR titles and bodies (optional;
+# defaults to `pull-request.md` next to this config). When the file exists,
+# the implement- and review-phase instructions point Claude at it and tell it
+# to finish each round of work by checking whether the PR title/body need
+# updating; when it doesn't, a brief generic instruction applies instead. The
+# file is free-form prose and may itself refer to repo-versioned templates.
+pr_instructions = "pull-request.md"
 ```
 
 ## Installing the Claude Code integration
