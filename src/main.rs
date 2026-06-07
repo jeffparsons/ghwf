@@ -209,17 +209,60 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     let mut posted_pr: Option<models::Comment> = None;
     if let Some(text) = status {
         let status_body = render::build_status_comment_body(&text);
-        posted_issue = post_status(
-            &number.to_string(),
-            &status_body,
-            repo_ctx.as_ref(),
-            "issue",
-        );
-        if let Some(pr) = pr_number {
-            posted_pr = post_status(&pr.to_string(), &status_body, repo_ctx.as_ref(), "PR");
+        match pr_number {
+            // No PR yet: the issue is the only thread.
+            None => {
+                posted_issue = post_status(
+                    &number.to_string(),
+                    &status_body,
+                    repo_ctx.as_ref(),
+                    "issue",
+                );
+            }
+            // Full update on the phase's primary thread; the other thread
+            // gets a one-line stub linking to it — or the full body when the
+            // primary post failed, so nothing is lost.
+            Some(pr) => {
+                let primary_is_pr = render::status_primary_is_pr(phase);
+                let (primary, primary_noun, secondary, secondary_noun) = if primary_is_pr {
+                    (pr.to_string(), "PR", number.to_string(), "issue")
+                } else {
+                    (number.to_string(), "issue", pr.to_string(), "PR")
+                };
+                let full = post_status(&primary, &status_body, repo_ctx.as_ref(), primary_noun);
+                let secondary_body = match &full {
+                    Some(comment) => {
+                        render::build_status_comment_body(&render::render_status_stub(
+                            &outcome.transitions,
+                            primary_noun,
+                            &comment.html_url,
+                        ))
+                    }
+                    None => status_body,
+                };
+                let stub = post_status(
+                    &secondary,
+                    &secondary_body,
+                    repo_ctx.as_ref(),
+                    secondary_noun,
+                );
+                // Stubs never mention an approval command, so only the full
+                // update can become a thread's reaction watch below.
+                (posted_issue, posted_pr) = if primary_is_pr {
+                    (stub, full)
+                } else {
+                    (full, stub)
+                };
+            }
         }
-        // Remember the newest own post for feed-lag self-calibration in `wait`.
-        if let Some(comment) = posted_pr.as_ref().or(posted_issue.as_ref()) {
+        // Remember the newest own post for feed-lag self-calibration in
+        // `wait`. The secondary-thread post lands last, so compare timestamps
+        // rather than assuming a thread.
+        let newest = match (posted_issue.as_ref(), posted_pr.as_ref()) {
+            (Some(a), Some(b)) => Some(if a.created_at >= b.created_at { a } else { b }),
+            (a, b) => a.or(b),
+        };
+        if let Some(comment) = newest {
             issue_state.last_posted = Some(state::PostedRef {
                 id: comment.id,
                 created_at: comment.created_at.clone(),
