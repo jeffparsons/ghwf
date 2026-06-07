@@ -21,6 +21,28 @@ pub struct Issue {
     pub author_association: String,
 }
 
+/// A label on an issue, trimmed to the fields we care about.
+#[derive(Deserialize, Serialize)]
+pub struct Label {
+    pub name: String,
+}
+
+/// An entry from the REST issues *listing*, which carries fields the
+/// single-issue [`Issue`] fetch doesn't need (assignees, labels) and may
+/// describe a PR rather than an issue.
+#[derive(Deserialize, Serialize)]
+pub struct IssueListing {
+    pub number: u64,
+    pub title: String,
+    #[serde(default)]
+    pub assignees: Vec<User>,
+    #[serde(default)]
+    pub labels: Vec<Label>,
+    // Present (with any value) exactly when the entry is a PR.
+    #[serde(default)]
+    pub pull_request: Option<serde_json::Value>,
+}
+
 /// A comment on an issue's (or PR's) conversation thread.
 #[derive(Deserialize, Serialize)]
 pub struct Comment {

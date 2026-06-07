@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, bail, Context, Result};
 use url::Url;
 
-use crate::models::{Comment, Issue, Reaction, ReviewComment};
+use crate::models::{Comment, Issue, IssueListing, Reaction, ReviewComment, User};
 use crate::{config, git};
 
 /// The `(owner, repo)` a command should operate on, when known from `ghwf.toml`.
@@ -57,6 +57,37 @@ pub fn post_issue_comment(
     let payload = serde_json::json!({ "body": body }).to_string();
     let json = gh_api_stdin(&["--method", "POST", &endpoint, "--input", "-"], &payload)?;
     serde_json::from_str(&json).context("failed to parse created-comment JSON from `gh api`")
+}
+
+/// All open issues of a repo, following pagination. The REST listing includes
+/// PRs and carries assignees/labels; see [`IssueListing`].
+pub fn list_open_issues(owner: &str, repo: &str) -> Result<Vec<IssueListing>> {
+    let endpoint = format!("repos/{owner}/{repo}/issues?state=open&per_page=100");
+    // `--paginate` follows `Link` headers; `--slurp` wraps the paged arrays
+    // into a single array-of-pages so the output stays one JSON document.
+    let json = gh_api(&["--paginate", "--slurp", &endpoint])?;
+    let pages: Vec<Vec<IssueListing>> =
+        serde_json::from_str(&json).context("failed to parse issues listing JSON from `gh api`")?;
+    Ok(pages.into_iter().flatten().collect())
+}
+
+/// The login of the authenticated `gh` user.
+pub fn authenticated_user() -> Result<String> {
+    let json = gh_api(&["user"])?;
+    let user: User =
+        serde_json::from_str(&json).context("failed to parse user JSON from `gh api`")?;
+    Ok(user.login)
+}
+
+/// The `(owner, repo)` a repo-wide command should operate on: the configured
+/// repo when a `ghwf.toml` is in effect, otherwise the current directory's
+/// `origin` remote.
+pub fn repo_or_cwd() -> Result<RepoRef> {
+    if let Some(repo) = config_repo()? {
+        return Ok(repo);
+    }
+    let url = git::remote_url(std::path::Path::new("."))?;
+    parse_remote_url(&url)
 }
 
 /// The `(owner, repo)` declared by a discovered `ghwf.toml`, derived from the

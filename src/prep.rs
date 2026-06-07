@@ -33,6 +33,7 @@ pub fn ensure_worktree(
         let worktree_path = located.worktrees_dir_path().join(&branch);
         git::fetch(&main_repo)?;
         let default = github::default_branch(owner, repo)?;
+        update_default_worktree(&main_repo, &default);
         git::add_worktree(
             &main_repo,
             &worktree_path,
@@ -46,6 +47,47 @@ pub fn ensure_worktree(
     let worktree = prep.worktree_path.clone().expect("worktree path set above");
     let branch = prep.branch.clone().expect("branch set above");
     Ok((worktree, branch))
+}
+
+/// Best-effort: fast-forward the worktree that has `default` checked out to
+/// `origin/<default>`, so the local default-branch checkout implicitly tracks
+/// what was just fetched. Never fails — every skip or failure is at most a
+/// stderr warning, so callers can't be broken by it.
+pub fn update_default_worktree(main_repo: &Path, default: &str) {
+    if let Err(err) = try_update_default_worktree(main_repo, default) {
+        eprintln!("warning: failed to update the `{default}` worktree: {err:#}");
+    }
+}
+
+/// The fallible mechanics of [`update_default_worktree`].
+fn try_update_default_worktree(main_repo: &Path, default: &str) -> Result<()> {
+    let Some(worktree) = git::branch_worktree(main_repo, default)? else {
+        // No checkout of the default branch anywhere; nothing to update.
+        return Ok(());
+    };
+    if git::remote_branch_matches(&worktree, default)? {
+        // Already at the fetched tip.
+        return Ok(());
+    }
+    if !git::is_tree_clean(&worktree)? {
+        eprintln!(
+            "note: not updating `{}` — it has uncommitted changes.",
+            worktree.display()
+        );
+        return Ok(());
+    }
+    match git::merge_ff_only(&worktree, &format!("origin/{default}")) {
+        Ok(()) => println!(
+            "Fast-forwarded `{}` to origin/{default}.",
+            worktree.display()
+        ),
+        // A checkout with local commits can't fast-forward; leave it alone.
+        Err(err) => eprintln!(
+            "note: not updating `{}` — fast-forward failed: {err:#}",
+            worktree.display()
+        ),
+    }
+    Ok(())
 }
 
 /// Drive the prep-and-plan phase for an issue, idempotently doing whatever step
@@ -162,12 +204,41 @@ fn complete_body(worktree: &Path, branch: &str, pr_url: &str, number: u64) -> St
 
 #[cfg(test)]
 mod tests {
-    use super::complete_body;
+    use super::{complete_body, update_default_worktree};
+    use crate::git::tests::{init_repo, rev_parse, run_git, scratch};
     use std::path::Path;
 
     #[test]
     fn complete_body_includes_wait_instruction() {
         let body = complete_body(Path::new("/wt"), "b", "https://github.com/o/r/pull/18", 7);
         assert!(body.contains("`ghwf wait 7`"));
+    }
+
+    #[test]
+    fn update_default_worktree_fast_forwards_clean_checkout_only() {
+        let root = scratch("update-default");
+        let origin = root.join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        init_repo(&origin);
+        run_git(&root, &["clone", "origin", "work"]);
+        let work = root.join("work");
+
+        // Origin advances; after a fetch, the clean checkout fast-forwards.
+        std::fs::write(origin.join("file.txt"), "two\n").unwrap();
+        run_git(&origin, &["commit", "-am", "two"]);
+        run_git(&work, &["fetch", "origin"]);
+        update_default_worktree(&work, "main");
+        assert_eq!(rev_parse(&work, "main"), rev_parse(&origin, "main"));
+
+        // Origin advances again, but a dirty checkout is left untouched.
+        std::fs::write(origin.join("file.txt"), "three\n").unwrap();
+        run_git(&origin, &["commit", "-am", "three"]);
+        run_git(&work, &["fetch", "origin"]);
+        std::fs::write(work.join("file.txt"), "dirty\n").unwrap();
+        let before = rev_parse(&work, "main");
+        update_default_worktree(&work, "main");
+        assert_eq!(rev_parse(&work, "main"), before);
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

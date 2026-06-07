@@ -5,7 +5,7 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 
 use crate::state::{self, IssueState};
-use crate::{github, prep, store};
+use crate::{config, git, github, prep, store};
 
 /// Run `work-on` as a launcher: no Claude session is present, so prepare the
 /// issue's worktree and replace this process with an interactive Claude session
@@ -69,6 +69,10 @@ pub fn run(issue_arg: &str, no_branch: bool) -> Result<()> {
                 "Issue #{number} already has its worktree at `{}`.",
                 path.display()
             );
+            // The worktree-creation path fetches as a side effect; this path
+            // wouldn't otherwise touch the network, so take the opportunity
+            // to keep the local default-branch checkout fresh.
+            refresh_main_repo(&owner, &repo);
             path
         }
         None => {
@@ -105,6 +109,41 @@ pub fn run(issue_arg: &str, no_branch: bool) -> Result<()> {
         }
     }
     exec_claude(Some(&worktree), resume.as_deref())
+}
+
+/// Best-effort fetch plus default-branch worktree update, so every launch is a
+/// chance to keep the local default-branch checkout fresh. The launcher works
+/// without a config (and offline) in the existing-worktree path, so every
+/// failure here degrades to a warning rather than blocking the launch.
+fn refresh_main_repo(owner: &str, repo: &str) {
+    let located = match config::find() {
+        Ok(Some(located)) => located,
+        Ok(None) => {
+            // No config means no main repo to refresh; stay quiet.
+            return;
+        }
+        Err(err) => {
+            eprintln!("warning: skipping the fetch — failed to load the config: {err:#}");
+            return;
+        }
+    };
+    let main_repo = located.main_repo_path();
+    println!("Fetching origin in `{}`…", main_repo.display());
+    if let Err(err) = git::fetch(&main_repo) {
+        eprintln!("warning: fetch failed: {err:#}");
+        return;
+    }
+    let default = match github::default_branch(owner, repo) {
+        Ok(default) => default,
+        Err(err) => {
+            eprintln!(
+                "warning: skipping the default-branch update — \
+                 failed to resolve the default branch: {err:#}"
+            );
+            return;
+        }
+    };
+    prep::update_default_worktree(&main_repo, &default);
 }
 
 /// Remind the user how to kick off the workflow in a fresh session. The launcher

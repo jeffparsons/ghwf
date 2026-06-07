@@ -31,6 +31,22 @@ went wrong and which command applies.
 Pass `--no-branch` to skip the branch/worktree/PR entirely and just write the plan
 file — handy for trivial tasks or when you're already on a feature branch.
 
+## Picking an issue automatically
+
+`ghwf next` chooses the next issue to work on and then proceeds exactly as
+`ghwf work-on <picked>` would (including `--no-branch` pass-through). It picks
+from the repo's open issues, preferring, in order:
+
+1. issues assigned to you (the authenticated `gh` user);
+2. issues carrying a priority label, ranked by the configured
+   `priority_labels` list — earlier in the list wins;
+3. the lowest issue number.
+
+PRs and issues assigned to someone else are never picked. Issues a ghwf
+session has already started are skipped too (ghwf can't tell whether another
+session is still working them); `next` lists the ones it passed over — resume
+those explicitly with `ghwf work-on <n>`.
+
 ## Waiting for approval and feedback
 
 `ghwf wait <issue>` blocks until something new happens on the issue or its PR,
@@ -61,6 +77,9 @@ ghwf needs a `ghwf.toml`, found by walking up from the current directory:
 main_repo = "repo.git"
 # Directory under which ghwf creates per-issue worktrees.
 worktrees_dir = "worktrees"
+# Labels marking an issue as urgent, most urgent first (optional; used by
+# `ghwf next`).
+priority_labels = ["urgent", "soon"]
 ```
 
 ## Installing the Claude Code integration
@@ -112,6 +131,13 @@ rather than printing the phase banner. It narrates each step as it:
 2. starts an interactive `claude` in the worktree, resuming the worktree's
    recorded session (`claude --resume <id>`) when its transcript still exists,
    else starting fresh.
+
+Every launch also fetches origin (worktree creation always did; an existing
+worktree now triggers its own fetch) and then opportunistically fast-forwards
+the worktree that has the repo's default branch checked out, so the local
+`main` checkout implicitly stays fresh. The update only happens when that
+worktree has no changes to tracked files, and any failure is just a warning —
+it never blocks the launch.
 
 For a fresh session there's nothing to resume and nothing queued: ghwf reminds
 you to run `/work-on <issue>` once Claude is up. It deliberately passes no
