@@ -5,6 +5,7 @@ mod implement;
 mod install;
 mod launch;
 mod models;
+mod next;
 mod prep;
 mod render;
 mod seen;
@@ -34,6 +35,17 @@ enum Commands {
     WorkOn {
         /// An issue number (resolved against the current repo) or a full GitHub issue URL.
         issue: String,
+        /// Work without a dedicated branch/worktree/PR (just write the plan file).
+        #[arg(long)]
+        no_branch: bool,
+    },
+    /// Pick the next issue to work on and start work on it, as `work-on` would.
+    ///
+    /// Picks from the repo's open issues: ones assigned to you first, then by
+    /// the configured `priority_labels` (earlier in the list wins), then the
+    /// lowest issue number. Issues assigned to someone else or already started
+    /// by a ghwf session are passed over.
+    Next {
         /// Work without a dedicated branch/worktree/PR (just write the plan file).
         #[arg(long)]
         no_branch: bool,
@@ -81,6 +93,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::WorkOn { issue, no_branch } => work_on(&issue, no_branch),
+        Commands::Next { no_branch } => work_on(&next::pick()?.to_string(), no_branch),
         Commands::CreateIssueComment { issue } => create_issue_comment(&issue),
         Commands::WorktreePath { issue } => worktree_path(&issue),
         Commands::Install { force } => install::run(force),

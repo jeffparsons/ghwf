@@ -13,6 +13,10 @@ pub struct Config {
     pub main_repo: Option<PathBuf>,
     /// Directory under which worktrees are created.
     pub worktrees_dir: PathBuf,
+    /// Labels that mark an issue as urgent, most urgent first. `ghwf next`
+    /// prefers issues carrying a label earlier in this list.
+    #[serde(default)]
+    pub priority_labels: Vec<String>,
 }
 
 /// A parsed config together with the directory it was found in.
@@ -82,5 +86,29 @@ pub fn require() -> Result<Located> {
             "this step requires a {CONFIG_FILE} (with `worktrees_dir`) in this or a parent \
              directory; none found. Use --no-branch to work without one."
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn priority_labels_parse() {
+        let config: Config = toml::from_str(
+            r#"
+            worktrees_dir = "worktrees"
+            priority_labels = ["urgent", "soon"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.priority_labels, ["urgent", "soon"]);
+    }
+
+    #[test]
+    fn priority_labels_default_to_empty() {
+        // Pre-existing configs without the key keep loading.
+        let config: Config = toml::from_str(r#"worktrees_dir = "worktrees""#).unwrap();
+        assert!(config.priority_labels.is_empty());
     }
 }
