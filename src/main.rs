@@ -152,6 +152,18 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         Some(pr) => Some(github::fetch_comments(&pr.to_string(), repo_ctx.as_ref())?),
         None => None,
     };
+    // Recompute how (or whether) the PR left the open state, remembering the
+    // previous value so a fresh conclusion can be announced exactly once.
+    // Recomputing rather than latching lets a closed-then-reopened PR resume
+    // the workflow.
+    let prior_pr_outcome = issue_state.pr_outcome;
+    issue_state.pr_outcome = match pr_number {
+        Some(pr) => state::pr_outcome(&github::fetch_pr(&owner, &repo, pr)?),
+        None => None,
+    };
+    let new_conclusion = (issue_state.pr_outcome != prior_pr_outcome)
+        .then_some(issue_state.pr_outcome)
+        .flatten();
     // 👍 reactions on ghwf prompt comments are approvals too; fetch the
     // reaction details for prompts whose rollup shows any.
     let mut prompt_thumbs = collect_prompt_thumbs(&owner, &repo, &issue_comments, "issue")?;
@@ -167,21 +179,33 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
 
     // The phase-specific banner body. Prep-and-plan does real work here (and
     // hard-errors if it needs a config that's missing); implement/review are light.
+    // A concluded PR replaces the phase body wholesale: the workflow is over,
+    // so no phase work runs (in particular review's draft→ready flip, which
+    // would fail against a merged or closed PR).
     let phase = issue_state.phase;
-    let body = match phase {
-        state::Phase::PrePlan => render::pre_plan_body(number),
-        state::Phase::PrepAndPlan => prep::run(
-            &issue_data,
-            &owner,
-            &repo,
+    let body = match issue_state.pr_outcome {
+        Some(pr_outcome) => render::concluded_body(
+            pr_outcome,
+            pr_number
+                .map(|pr| format!("https://github.com/{owner}/{repo}/pull/{pr}"))
+                .as_deref(),
             number,
-            no_branch,
-            &mut issue_state,
-        )?,
-        state::Phase::Implement => {
-            implement::run(&issue_data, &owner, &repo, number, &issue_state)?
-        }
-        state::Phase::Review => implement::review(&owner, &repo, number, &mut issue_state)?,
+        ),
+        None => match phase {
+            state::Phase::PrePlan => render::pre_plan_body(number),
+            state::Phase::PrepAndPlan => prep::run(
+                &issue_data,
+                &owner,
+                &repo,
+                number,
+                no_branch,
+                &mut issue_state,
+            )?,
+            state::Phase::Implement => {
+                implement::run(&issue_data, &owner, &repo, number, &issue_state)?
+            }
+            state::Phase::Review => implement::review(&owner, &repo, number, &mut issue_state)?,
+        },
     };
 
     // We didn't hard-need a config (or we'd have errored above); still nudge if
@@ -213,6 +237,7 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         pr_number
             .map(|pr| format!("https://github.com/{owner}/{repo}/pull/{pr}"))
             .as_deref(),
+        new_conclusion,
     );
     let status_posted = status.is_some();
     // The status comments posted to each thread this run, kept so the
@@ -550,8 +575,12 @@ fn latest_prompt_watch(
 ///
 /// Only branch-mode phases that operate on a created worktree qualify:
 /// prep-and-plan (Claude must write the plan there) and implement (Claude codes
-/// there). Pre-plan, review, and `--no-branch` work don't need it.
+/// there). Pre-plan, review, `--no-branch` work, and a concluded workflow
+/// (merged or closed PR) don't need it.
 fn needs_worktree_guard(phase: state::Phase, issue_state: &state::IssueState) -> bool {
+    if issue_state.pr_outcome.is_some() {
+        return false;
+    }
     let Some(prep) = issue_state.prep.as_ref() else {
         return false;
     };
@@ -814,10 +843,10 @@ fn record_last_posted(
 
 #[cfg(test)]
 mod tests {
-    use super::{advance_phase, latest_prompt_watch, PromptThumbs};
+    use super::{advance_phase, latest_prompt_watch, needs_worktree_guard, PromptThumbs};
     use crate::models::{Comment, Reaction, User};
     use crate::render::NoteKind;
-    use crate::state::{Directive, IssueState, Phase};
+    use crate::state::{Directive, IssueState, Phase, PrOutcome, PrepState};
 
     fn comment(id: u64, body: &str, created_at: &str) -> Comment {
         Comment {
@@ -859,6 +888,21 @@ mod tests {
             phase,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn worktree_guard_skipped_once_pr_concluded() {
+        let mut state = IssueState {
+            phase: Phase::Implement,
+            prep: Some(PrepState {
+                worktree_path: Some("/wt".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(needs_worktree_guard(Phase::Implement, &state));
+        state.pr_outcome = Some(PrOutcome::Merged);
+        assert!(!needs_worktree_guard(Phase::Implement, &state));
     }
 
     #[test]
