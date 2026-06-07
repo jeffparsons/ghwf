@@ -172,6 +172,26 @@ impl Phase {
     }
 }
 
+/// How an issue's PR left the open state, concluding (or halting) the workflow.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrOutcome {
+    Merged,
+    Closed,
+}
+
+/// The outcome a fetched PR implies: merged, closed without merging, or
+/// `None` while it is still open.
+pub fn pr_outcome(pr: &crate::models::PullRequest) -> Option<PrOutcome> {
+    if pr.merged {
+        Some(PrOutcome::Merged)
+    } else if pr.state != "open" {
+        Some(PrOutcome::Closed)
+    } else {
+        None
+    }
+}
+
 /// Per-issue workflow state. Scoped to the issue (not a session), since the phase
 /// reflects the progress of the work across sessions.
 #[derive(Default, Serialize, Deserialize)]
@@ -202,6 +222,12 @@ pub struct IssueState {
     // Stop hook reads this to let a session end once the workflow is done.
     #[serde(default)]
     pub issue_closed: bool,
+    // How the PR had left the open state the last time `work-on` fetched it,
+    // or `None` while it was still open (or no PR exists). Recomputed every
+    // run rather than latched, so a closed-then-reopened PR resumes the loop.
+    // The Stop hook reads this too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_outcome: Option<PrOutcome>,
     // Consecutive Stop-hook nudges issued without anything new arriving.
     // Incremented by `ghwf claude-stop-hook` each time it blocks a stop; reset
     // by `work-on` whenever it observes new activity. The hook stops nudging
@@ -433,9 +459,10 @@ pub fn save(owner: &str, repo: &str, number: u64, state: &IssueState) -> Result<
 mod tests {
     use super::{
         branch_and_slug, find_issue_for_dir, issue_fingerprint, parse_directive,
-        parse_prompted_directive, Directive, IssueState, Phase, PostedRef, PrepState,
-        ReactionWatch, WaitState,
+        parse_prompted_directive, pr_outcome, Directive, IssueState, Phase, PostedRef, PrOutcome,
+        PrepState, ReactionWatch, WaitState,
     };
+    use crate::models::PullRequest;
     use std::path::{Path, PathBuf};
 
     /// A unique scratch directory for building fake issues roots and worktrees.
@@ -521,6 +548,41 @@ mod tests {
         assert!(!state.issue_closed);
         assert_eq!(state.stop_nudges, 0);
         assert!(state.consumed_reactions.is_empty());
+        assert!(state.pr_outcome.is_none());
+    }
+
+    fn pull_request(state: &str, merged: bool) -> PullRequest {
+        PullRequest {
+            number: 33,
+            state: state.to_string(),
+            merged,
+            html_url: "https://github.com/o/r/pull/33".to_string(),
+        }
+    }
+
+    #[test]
+    fn pr_outcome_maps_merged_closed_and_open() {
+        assert_eq!(
+            pr_outcome(&pull_request("closed", true)),
+            Some(PrOutcome::Merged)
+        );
+        assert_eq!(
+            pr_outcome(&pull_request("closed", false)),
+            Some(PrOutcome::Closed)
+        );
+        assert_eq!(pr_outcome(&pull_request("open", false)), None);
+    }
+
+    #[test]
+    fn pr_outcome_round_trips() {
+        let state = IssueState {
+            pr_outcome: Some(PrOutcome::Merged),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains(r#""pr_outcome":"merged""#));
+        let back: IssueState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pr_outcome, Some(PrOutcome::Merged));
     }
 
     #[test]
