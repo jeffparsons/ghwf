@@ -377,6 +377,43 @@ pub fn find_workflow_issue(
     Ok(None)
 }
 
+/// Find the issue whose recorded prep branch is `branch`, scanning the repo's
+/// state files. `None` when no state file records that branch.
+pub fn find_issue_for_branch(owner: &str, repo: &str, branch: &str) -> Result<Option<u64>> {
+    let dir = store::data_dir()?.join("issues").join(owner).join(repo);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Ok(None);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(number) = stem.parse::<u64>() else {
+            continue;
+        };
+        let Some(state) = load_if_exists(owner, repo, number)? else {
+            continue;
+        };
+        if state.prep.as_ref().and_then(|p| p.branch.as_deref()) == Some(branch) {
+            return Ok(Some(number));
+        }
+    }
+    Ok(None)
+}
+
+/// Remove an issue's state file. Absence is not an error.
+pub fn delete(owner: &str, repo: &str, number: u64) -> Result<()> {
+    let path = state_path(owner, repo, number)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to remove issue state {}", path.display()))
+        }
+    }
+}
+
 /// Persist the state for an issue.
 pub fn save(owner: &str, repo: &str, number: u64, state: &IssueState) -> Result<()> {
     let path = state_path(owner, repo, number)?;
