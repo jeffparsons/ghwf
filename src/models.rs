@@ -43,6 +43,29 @@ pub struct IssueListing {
     pub pull_request: Option<serde_json::Value>,
 }
 
+/// A PR associated with a branch, from `gh pr list --json`, trimmed to the
+/// fields garbage collection needs.
+#[derive(Deserialize)]
+pub struct BranchPr {
+    pub number: u64,
+    // "OPEN", "CLOSED", or "MERGED".
+    pub state: String,
+    // The PR's head commit. Frozen at merge time for merged PRs: pushes to the
+    // branch after the merge don't update it.
+    #[serde(rename = "headRefOid")]
+    pub head_ref_oid: String,
+    // The commit the merge created on the base branch (the merge commit, or
+    // the squash/rebase result); `null` until merged.
+    #[serde(rename = "mergeCommit")]
+    pub merge_commit: Option<Oid>,
+}
+
+/// A bare commit reference, as `gh` renders `mergeCommit`.
+#[derive(Deserialize)]
+pub struct Oid {
+    pub oid: String,
+}
+
 /// A comment on an issue's (or PR's) conversation thread.
 #[derive(Deserialize, Serialize)]
 pub struct Comment {

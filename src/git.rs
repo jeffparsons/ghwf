@@ -40,9 +40,10 @@ pub fn remote_url(repo: &Path) -> Result<String> {
         .to_string())
 }
 
-/// Fetch the latest refs from origin.
+/// Fetch the latest refs from origin, pruning remote-tracking refs whose
+/// remote branch is gone.
 pub fn fetch(repo: &Path) -> Result<()> {
-    git(repo, &["fetch", "origin"]).map(|_| ())
+    git(repo, &["fetch", "--prune", "origin"]).map(|_| ())
 }
 
 /// Create a new worktree at `path` on a new `branch` starting from `start`
@@ -127,9 +128,78 @@ pub fn push(dir: &Path, branch: &str) -> Result<()> {
     git(dir, &["push", "-u", "origin", branch]).map(|_| ())
 }
 
+/// All local branch names.
+pub fn list_local_branches(repo: &Path) -> Result<Vec<String>> {
+    Ok(
+        git(repo, &["for-each-ref", "refs/heads", "--format=%(refname)"])?
+            .lines()
+            .filter_map(|line| line.strip_prefix("refs/heads/"))
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// All branch names on origin, with the `origin/` prefix stripped and the
+/// symbolic `origin/HEAD` skipped.
+pub fn list_remote_branches(repo: &Path) -> Result<Vec<String>> {
+    Ok(git(
+        repo,
+        &["for-each-ref", "refs/remotes/origin", "--format=%(refname)"],
+    )?
+    .lines()
+    .filter_map(|line| line.strip_prefix("refs/remotes/origin/"))
+    .filter(|name| *name != "HEAD")
+    .map(str::to_string)
+    .collect())
+}
+
+/// The commit a rev points at, or `None` when it doesn't resolve.
+pub fn rev_parse_ok(repo: &Path, rev: &str) -> Option<String> {
+    git(repo, &["rev-parse", "--verify", "--quiet", rev])
+        .ok()
+        .map(|sha| sha.trim().to_string())
+}
+
+/// True if `ancestor` is an ancestor of (or equal to) `descendant`. Any
+/// failure to prove ancestry (e.g. an unknown commit) reads as "no".
+pub fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> bool {
+    git_ok(repo, &["merge-base", "--is-ancestor", ancestor, descendant])
+}
+
+/// True if `dir`'s working tree contains untracked (and unignored) files.
+pub fn has_untracked_files(dir: &Path) -> Result<bool> {
+    Ok(git(dir, &["status", "--porcelain"])?
+        .lines()
+        .any(|line| line.starts_with("??")))
+}
+
+/// Delete a local branch. The branch must not be checked out anywhere.
+///
+/// Uses `-D`: callers have already proven the content is merged, and `-d`'s
+/// own merged-into-HEAD check doesn't understand squash merges.
+pub fn delete_local_branch(repo: &Path, branch: &str) -> Result<()> {
+    git(repo, &["branch", "-D", branch]).map(|_| ())
+}
+
+/// Delete `branch` on origin.
+pub fn delete_remote_branch(repo: &Path, branch: &str) -> Result<()> {
+    git(repo, &["push", "origin", "--delete", branch]).map(|_| ())
+}
+
+/// Remove a worktree. Git refuses (errors) when the worktree has tracked
+/// changes or untracked files; this never forces.
+pub fn remove_worktree(repo: &Path, path: &Path) -> Result<()> {
+    let path = path.to_str().context("worktree path is not valid UTF-8")?;
+    git(repo, &["worktree", "remove", path]).map(|_| ())
+}
+
 #[cfg(test)]
 pub mod tests {
-    use super::{is_tree_clean, merge_ff_only, parse_worktree_list};
+    use super::{
+        delete_local_branch, delete_remote_branch, fetch, has_untracked_files, is_ancestor,
+        is_tree_clean, list_local_branches, list_remote_branches, merge_ff_only,
+        parse_worktree_list, remove_worktree, rev_parse_ok,
+    };
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -227,6 +297,116 @@ pub mod tests {
         // A modified tracked file does.
         std::fs::write(root.join("file.txt"), "two\n").unwrap();
         assert!(!is_tree_clean(&root).unwrap());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn local_branches_list_and_delete() {
+        let root = scratch("branches");
+        init_repo(&root);
+        run_git(&root, &["branch", "extra"]);
+        assert_eq!(list_local_branches(&root).unwrap(), ["extra", "main"]);
+
+        delete_local_branch(&root, "extra").unwrap();
+        assert_eq!(list_local_branches(&root).unwrap(), ["main"]);
+        // The checked-out branch refuses to die.
+        assert!(delete_local_branch(&root, "main").is_err());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn remote_branches_roundtrip_through_a_local_origin() {
+        let root = scratch("remote");
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        run_git(&origin, &["init", "--bare", "-b", "main"]);
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        run_git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        run_git(&repo, &["push", "origin", "main", "main:extra"]);
+        run_git(&repo, &["fetch", "origin"]);
+        // The symbolic origin/HEAD must be skipped, not listed.
+        run_git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        assert_eq!(list_remote_branches(&repo).unwrap(), ["extra", "main"]);
+
+        // Deleting on origin and pruning drops the remote-tracking ref.
+        delete_remote_branch(&repo, "extra").unwrap();
+        fetch(&repo).unwrap();
+        assert_eq!(list_remote_branches(&repo).unwrap(), ["main"]);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rev_parse_ok_and_is_ancestor() {
+        let root = scratch("ancestor");
+        init_repo(&root);
+        let first = rev_parse_ok(&root, "refs/heads/main").unwrap();
+        std::fs::write(root.join("file.txt"), "two\n").unwrap();
+        run_git(&root, &["commit", "-am", "two"]);
+        let second = rev_parse_ok(&root, "refs/heads/main").unwrap();
+
+        assert!(rev_parse_ok(&root, "refs/heads/nonexistent").is_none());
+        assert!(is_ancestor(&root, &first, &second));
+        // Equality counts as ancestry.
+        assert!(is_ancestor(&root, &second, &second));
+        assert!(!is_ancestor(&root, &second, &first));
+        // An unknown commit fails safe: not an ancestor.
+        assert!(!is_ancestor(
+            &root,
+            "0000000000000000000000000000000000000000",
+            &second
+        ));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn has_untracked_files_sees_only_untracked() {
+        let root = scratch("untracked");
+        init_repo(&root);
+        assert!(!has_untracked_files(&root).unwrap());
+
+        // A modified tracked file is not "untracked".
+        std::fs::write(root.join("file.txt"), "two\n").unwrap();
+        assert!(!has_untracked_files(&root).unwrap());
+
+        std::fs::write(root.join("new.txt"), "x\n").unwrap();
+        assert!(has_untracked_files(&root).unwrap());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn remove_worktree_requires_a_clean_tree() {
+        let root = scratch("rm-worktree");
+        init_repo(&root);
+        let wt = root.join("wt");
+        run_git(
+            &root,
+            &["worktree", "add", "-b", "feature", wt.to_str().unwrap()],
+        );
+
+        // A dirty worktree refuses removal (gc downgrades this to a warning).
+        std::fs::write(wt.join("file.txt"), "changed\n").unwrap();
+        assert!(remove_worktree(&root, &wt).is_err());
+
+        std::fs::write(wt.join("file.txt"), "one\n").unwrap();
+        remove_worktree(&root, &wt).unwrap();
+        assert!(!wt.exists());
 
         std::fs::remove_dir_all(&root).unwrap();
     }

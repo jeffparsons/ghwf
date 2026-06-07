@@ -1,3 +1,4 @@
+mod collect_garbage;
 mod config;
 mod git;
 mod github;
@@ -50,6 +51,18 @@ enum Commands {
         #[arg(long)]
         no_branch: bool,
     },
+    /// Delete branches and worktrees for PRs that have already been merged.
+    ///
+    /// A branch (local and remote) is collected only when its tip is exactly
+    /// what got merged into the default branch; its worktree only when the
+    /// working tree is clean. Anything suspicious is warned about and left
+    /// alone.
+    #[command(alias = "gc")]
+    CollectGarbage {
+        /// Report what would be deleted without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Post a comment to an issue (or PR), reading the body from stdin.
     ///
     /// The comment is prefixed with a "Claude says" header and tagged with hidden
@@ -94,6 +107,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::WorkOn { issue, no_branch } => work_on(&issue, no_branch),
         Commands::Next { no_branch } => work_on(&next::pick()?.to_string(), no_branch),
+        Commands::CollectGarbage { dry_run } => collect_garbage::run(dry_run),
         Commands::CreateIssueComment { issue } => create_issue_comment(&issue),
         Commands::WorktreePath { issue } => worktree_path(&issue),
         Commands::Install { force } => install::run(force),
