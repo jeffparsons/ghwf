@@ -141,27 +141,46 @@ pub fn pre_plan_body(number: u64) -> String {
     format!(
         "Pre-plan — gathering the information needed to write a plan.\n\n\
          Discuss on the issue itself. Post questions and clarifications as comments with \
-         `ghwf create-issue-comment <issue>`. When you have enough information, post a comment \
-         that summarises your understanding, clearly states you are ready to write a plan, and \
-         ends by prompting the user to comment `/approve-pre-plan` (alias `/approve-preplan`) \
-         on the issue — or react 👍 to that comment — when they're happy to advance.\n\n\
+         `ghwf create-issue-comment {number}`. When you have enough information, hand off \
+         with `ghwf hand-off {number}` (body from stdin): a comment that summarises your \
+         understanding and clearly states you are ready to write a plan. ghwf appends the \
+         approval prompt itself — do not write one.\n\n\
          Do not start planning or advance the workflow yourself. Wait for the user's \
          approval; ghwf will then advance to the prep-and-plan phase.\n\n{}",
         wait_instruction(number)
     )
 }
 
-/// A phase transition fired by an approval directive, for banner reporting.
+/// A phase transition that fired this run, for banner reporting.
 pub struct Transition {
     pub from: Phase,
     pub to: Phase,
-    /// The canonical spelling of the directive that fired.
-    pub command: &'static str,
-    /// Who posted it.
-    pub by: String,
-    /// True when the approval arrived as a 👍 reaction on a ghwf prompt
-    /// comment rather than as a typed command.
-    pub via_reaction: bool,
+    pub trigger: Trigger,
+}
+
+/// What fired a phase transition.
+pub enum Trigger {
+    /// An approval directive: a typed command, or a 👍 reaction on a ghwf
+    /// prompt comment (`via_reaction`).
+    Directive {
+        /// The canonical spelling of the directive.
+        command: &'static str,
+        /// Who posted it.
+        by: String,
+        via_reaction: bool,
+    },
+    /// The user marked the draft PR ready for review (advances implement).
+    PrReady,
+}
+
+impl Transition {
+    /// The directive command that fired this transition, if it was one.
+    fn command(&self) -> Option<&'static str> {
+        match self.trigger {
+            Trigger::Directive { command, .. } => Some(command),
+            Trigger::PrReady => None,
+        }
+    }
 }
 
 /// Why a consumed directive did not fire.
@@ -224,13 +243,18 @@ pub fn render_phase_banner(
 /// One line reporting a fired phase transition, shared by the banner and
 /// status comments.
 fn render_transition(transition: &Transition) -> String {
-    let trigger = if transition.via_reaction {
-        format!(
-            "a 👍 reaction from {}, equivalent to `{}`",
-            transition.by, transition.command
-        )
-    } else {
-        format!("`{}` from {}", transition.command, transition.by)
+    let trigger = match &transition.trigger {
+        Trigger::Directive {
+            command,
+            by,
+            via_reaction: true,
+        } => format!("a 👍 reaction from {by}, equivalent to `{command}`"),
+        Trigger::Directive {
+            command,
+            by,
+            via_reaction: false,
+        } => format!("`{command}` from {by}"),
+        Trigger::PrReady => "the PR being marked ready for review".to_string(),
     };
     format!(
         "Phase advanced: {} → {} (triggered by {trigger}).",
@@ -255,10 +279,7 @@ fn render_note(note: &DirectiveNote) -> String {
         format!("`{command}` from {by}")
     };
     // What would advance the workflow from where it stands.
-    let next_step = match phase_at.approval_command() {
-        Some(cmd) => format!("the command that advances it is `{cmd}`"),
-        None => "there is nothing further to approve".to_string(),
-    };
+    let next_step = advance_hint(*phase_at);
     match note.kind {
         NoteKind::Stale => format!(
             "Note: {what} (on the {source}) was ignored — the workflow is \
@@ -270,10 +291,19 @@ fn render_note(note: &DirectiveNote) -> String {
             phase_at.label()
         ),
         NoteKind::Retired => format!(
-            "Note: {what} (on the {source}) was ignored — `/proceed` is \
+            "Note: {what} (on the {source}) was ignored — `{command}` is \
              retired; the workflow is in the {} phase, and {next_step}.",
             phase_at.label()
         ),
+    }
+}
+
+/// What advances the workflow from `phase`, for misfire notes.
+fn advance_hint(phase: Phase) -> String {
+    match (phase.approval_command(), phase) {
+        (Some(cmd), _) => format!("the command that advances it is `{cmd}`"),
+        (None, Phase::Implement) => "marking the draft PR ready for review advances it".to_string(),
+        (None, _) => "there is nothing further to approve".to_string(),
     }
 }
 
@@ -300,7 +330,9 @@ pub fn render_status_comment(
         .iter()
         .filter(|note| {
             !(matches!(note.kind, NoteKind::Stale)
-                && transitions.iter().any(|t| t.command == note.command))
+                && transitions
+                    .iter()
+                    .any(|t| t.command() == Some(note.command)))
         })
         .collect();
     if !intro && transitions.is_empty() && notes.is_empty() && conclusion.is_none() {
@@ -341,39 +373,68 @@ fn conclusion_status_prose(outcome: PrOutcome) -> String {
     }
 }
 
-/// The user-facing description of where the workflow stands and what the next
-/// approval command triggers — the single source of that prose for status
-/// updates.
+/// The user-facing description of where the workflow stands and how the next
+/// advance will arrive — the single source of that prose for status updates.
+///
+/// Status updates never prompt for an approval (and so are never 👍 targets):
+/// the prompt belongs on the hand-off comment, once there is actually
+/// something to approve.
 fn phase_status_prose(phase: Phase, pr_url: Option<&str>) -> String {
     match phase {
         Phase::PrePlan => "The workflow is in the **pre-plan** phase: Claude gathers the \
-             information needed to write a plan and posts its understanding here.\n\n\
-             Next: comment `/approve-pre-plan` (alias `/approve-preplan`) — or react 👍 to \
-             this comment — to advance to prep-and-plan, where a branch and worktree are \
-             created and Claude writes an implementation plan, opened as a draft PR."
+             information needed to write a plan and posts its understanding here. When it \
+             has enough, it will hand off and prompt for your approval to advance to \
+             prep-and-plan."
             .to_string(),
         Phase::PrepAndPlan => "The workflow is in the **prep-and-plan** phase: Claude is \
-             writing the implementation plan; ghwf opens it as a draft PR.\n\n\
-             Next: comment `/approve-plan` (on this issue or the PR) — or react 👍 to this \
-             comment — to advance to implement, where Claude codes the change."
+             writing the implementation plan; ghwf opens it as a draft PR. Claude will \
+             hand off and prompt for your approval when the plan is ready."
             .to_string(),
         Phase::Implement => "The workflow is in the **implement** phase: Claude codes the \
-             change in the worktree, pushing to the draft PR as it goes.\n\n\
-             Next: comment `/approve-implementation` (on this issue or the PR) — or react \
-             👍 to this comment — to advance to review; the PR flips to ready-for-review."
+             change in the worktree, pushing to the draft PR as it goes. When it hands \
+             off, review the PR and mark it ready for review to advance to the review \
+             phase."
             .to_string(),
         Phase::Review => match pr_url {
             Some(url) => format!(
-                "The workflow is in the **review** phase: the PR has been marked ready \
-                 for human review: {url}\n\n\
-                 There is no further approval command — merging or closing the PR \
-                 concludes the workflow."
+                "The workflow is in the **review** phase: the PR is ready for human \
+                 review: {url}\n\n\
+                 Merging or closing the PR concludes the workflow."
             ),
             None => "The workflow is in the **review** phase: the work is complete and \
-                 awaiting human review.\n\n\
-                 There is no further approval command."
+                 awaiting human review."
                 .to_string(),
         },
+    }
+}
+
+/// The next-step paragraph ghwf appends to a hand-off comment — the single
+/// source of approval-prompt prose, making the hand-off the thread's 👍
+/// target where a command applies. `None` when the phase has nothing to hand
+/// off (review: the PR is already with the user).
+pub fn hand_off_prompt(phase: Phase, no_branch: bool) -> Option<&'static str> {
+    match (phase, no_branch) {
+        (Phase::PrePlan, _) => Some(
+            "Next: comment `/approve-pre-plan` (alias `/approve-preplan`) — or react 👍 \
+             to this comment — to advance to prep-and-plan, where a branch and worktree \
+             are created and Claude writes an implementation plan, opened as a draft PR.",
+        ),
+        (Phase::PrepAndPlan, _) => Some(
+            "Next: comment `/approve-plan` (on the issue or the PR) — or react 👍 to \
+             this comment — to advance to implement, where Claude codes the change.",
+        ),
+        (Phase::Implement, false) => Some(
+            "Next: when you're happy with the change, mark the draft PR ready for \
+             review (the \"Ready for review\" button) to advance to the review phase.",
+        ),
+        // No draft PR exists to mark ready, so nothing advances the phase
+        // mechanically; the issue is wrapped up by hand.
+        (Phase::Implement, true) => Some(
+            "The work is complete. With `--no-branch` there is no draft PR to mark \
+             ready; review the change and close the issue (or merge it yourself) to \
+             wrap up.",
+        ),
+        (Phase::Review, _) => None,
     }
 }
 
@@ -522,13 +583,13 @@ fn blockquote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_comment_body, build_status_comment_body, extract_marker, hidden_from_digest,
-        render_phase_banner, render_status_comment, render_status_stub, render_work_on,
-        status_primary_is_pr, strip_ghwf_marker, CommentView, DirectiveNote, Marker, NoteKind,
-        ReviewCommentView, Transition,
+        build_comment_body, build_status_comment_body, extract_marker, hand_off_prompt,
+        hidden_from_digest, render_phase_banner, render_status_comment, render_status_stub,
+        render_work_on, status_primary_is_pr, strip_ghwf_marker, CommentView, DirectiveNote,
+        Marker, NoteKind, ReviewCommentView, Transition, Trigger,
     };
     use crate::models::{Comment, Issue, ReviewComment, User};
-    use crate::state::{Phase, PrOutcome};
+    use crate::state::{Directive, Phase, PrOutcome};
 
     fn note(kind: NoteKind, command: &'static str, phase_at: Phase) -> DirectiveNote {
         DirectiveNote {
@@ -545,9 +606,11 @@ mod tests {
         Transition {
             from,
             to,
-            command,
-            by: "user".to_string(),
-            via_reaction: false,
+            trigger: Trigger::Directive {
+                command,
+                by: "user".to_string(),
+                via_reaction: false,
+            },
         }
     }
 
@@ -592,13 +655,9 @@ mod tests {
 
     #[test]
     fn banner_premature_note_suggests_current_command() {
-        let notes = [note(
-            NoteKind::Premature,
-            "/approve-implementation",
-            Phase::PrePlan,
-        )];
+        let notes = [note(NoteKind::Premature, "/approve-plan", Phase::PrePlan)];
         let out = render_phase_banner(Phase::PrePlan, &[], &notes, false, "body");
-        assert!(out.contains("`/approve-implementation` from user (on the PR) was ignored"));
+        assert!(out.contains("`/approve-plan` from user (on the PR) was ignored"));
         assert!(out.contains("only in the pre-plan phase"));
         assert!(out.contains("the command that advances it is `/approve-pre-plan`"));
     }
@@ -612,6 +671,32 @@ mod tests {
     }
 
     #[test]
+    fn banner_retired_approve_implementation_names_the_button() {
+        let notes = [note(
+            NoteKind::Retired,
+            "/approve-implementation",
+            Phase::Implement,
+        )];
+        let out = render_phase_banner(Phase::Implement, &[], &notes, false, "body");
+        assert!(out.contains("`/approve-implementation` is retired"));
+        assert!(out.contains("marking the draft PR ready for review advances it"));
+    }
+
+    #[test]
+    fn banner_pr_ready_transition_names_the_trigger() {
+        let transitions = [Transition {
+            from: Phase::Implement,
+            to: Phase::Review,
+            trigger: Trigger::PrReady,
+        }];
+        let out = render_phase_banner(Phase::Review, &transitions, &[], false, "body");
+        assert!(out.contains(
+            "Phase advanced: implement → review (triggered by the PR being marked ready \
+             for review)."
+        ));
+    }
+
+    #[test]
     fn banner_status_posted_line_only_when_posted() {
         let out = render_phase_banner(Phase::Implement, &[], &[], true, "body");
         assert!(out.contains("posted a status update"));
@@ -621,12 +706,15 @@ mod tests {
 
     #[test]
     fn banner_reaction_transition_names_reactor_and_command() {
-        let mut transitions = [transition(
-            Phase::PrePlan,
-            Phase::PrepAndPlan,
-            "/approve-pre-plan",
-        )];
-        transitions[0].via_reaction = true;
+        let transitions = [Transition {
+            from: Phase::PrePlan,
+            to: Phase::PrepAndPlan,
+            trigger: Trigger::Directive {
+                command: "/approve-pre-plan",
+                by: "user".to_string(),
+                via_reaction: true,
+            },
+        }];
         let out = render_phase_banner(Phase::PrepAndPlan, &transitions, &[], false, "body");
         assert!(out.contains(
             "Phase advanced: pre-plan → prep-and-plan (triggered by a 👍 reaction from user, \
@@ -650,18 +738,55 @@ mod tests {
     }
 
     #[test]
-    fn status_prose_offers_reaction_in_every_approvable_phase() {
-        for phase in [Phase::PrePlan, Phase::PrepAndPlan, Phase::Implement] {
+    fn status_prose_never_prompts_an_approval() {
+        // The prompt belongs on the hand-off comment; a status update must
+        // never be a 👍 target.
+        for phase in [
+            Phase::PrePlan,
+            Phase::PrepAndPlan,
+            Phase::Implement,
+            Phase::Review,
+        ] {
             let out = render_status_comment(phase, &[], &[], true, None, None).unwrap();
-            assert!(out.contains("react 👍"), "{} prose lacks 👍", phase.label());
-            // The prompted command must be the body's last command mention, so
-            // a 👍 on the status comment maps to it.
-            let directive = crate::state::parse_prompted_directive(&out).unwrap();
-            assert_eq!(directive.approves(), Some(phase));
+            assert!(
+                crate::state::parse_prompted_directive(&out).is_none(),
+                "{} prose mentions an approval command",
+                phase.label()
+            );
         }
-        // The terminal phase prompts no approval at all.
-        let out = render_status_comment(Phase::Review, &[], &[], true, None, None).unwrap();
-        assert!(crate::state::parse_prompted_directive(&out).is_none());
+    }
+
+    #[test]
+    fn hand_off_prompt_maps_thumbs_to_the_phase_approval() {
+        // Pre-plan and prep-and-plan prompts are 👍 targets for their phase's
+        // approval; the implement prompt names the button and maps nothing.
+        let out = hand_off_prompt(Phase::PrePlan, false).unwrap();
+        assert_eq!(
+            crate::state::parse_prompted_directive(out).unwrap(),
+            Directive::ApprovePrePlan
+        );
+        let out = hand_off_prompt(Phase::PrepAndPlan, false).unwrap();
+        assert_eq!(
+            crate::state::parse_prompted_directive(out).unwrap(),
+            Directive::ApprovePlan
+        );
+        let out = hand_off_prompt(Phase::Implement, false).unwrap();
+        assert!(out.contains("ready for review"));
+        assert!(crate::state::parse_prompted_directive(out).is_none());
+        assert!(hand_off_prompt(Phase::Review, false).is_none());
+    }
+
+    #[test]
+    fn no_branch_implement_hand_off_skips_the_pr_button() {
+        let out = hand_off_prompt(Phase::Implement, true).unwrap();
+        assert!(out.contains("--no-branch"));
+        assert!(!out.contains("button"));
+        assert!(crate::state::parse_prompted_directive(out).is_none());
+        // Earlier phases are unaffected by the mode.
+        assert_eq!(
+            hand_off_prompt(Phase::PrePlan, true),
+            hand_off_prompt(Phase::PrePlan, false)
+        );
     }
 
     #[test]
@@ -682,8 +807,7 @@ mod tests {
             "Phase advanced: prep-and-plan → implement (triggered by `/approve-plan` from user)."
         ));
         assert!(out.contains("**implement** phase"));
-        assert!(out.contains("`/approve-implementation`"));
-        assert!(out.contains("flips to ready-for-review"));
+        assert!(out.contains("mark it ready for review"));
     }
 
     #[test]
@@ -702,11 +826,7 @@ mod tests {
 
     #[test]
     fn status_premature_note_names_correct_command() {
-        let notes = [note(
-            NoteKind::Premature,
-            "/approve-implementation",
-            Phase::PrePlan,
-        )];
+        let notes = [note(NoteKind::Premature, "/approve-plan", Phase::PrePlan)];
         let out = render_status_comment(Phase::PrePlan, &[], &notes, false, None, None).unwrap();
         assert!(out.contains("was ignored"));
         assert!(out.contains("the command that advances it is `/approve-pre-plan`"));
@@ -733,10 +853,10 @@ mod tests {
         let url = "https://github.com/o/r/pull/9";
         let out = render_status_comment(Phase::Review, &[], &[], true, Some(url), None).unwrap();
         assert!(out.contains(url));
-        assert!(out.contains("no further approval command"));
+        assert!(out.contains("Merging or closing the PR concludes the workflow."));
         // Without a PR the prose still closes the workflow out.
         let out = render_status_comment(Phase::Review, &[], &[], true, None, None).unwrap();
-        assert!(out.contains("no further approval command"));
+        assert!(out.contains("awaiting human review"));
     }
 
     #[test]

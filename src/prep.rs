@@ -195,9 +195,9 @@ fn complete_body(worktree: &Path, branch: &str, pr_url: &str, number: u64) -> St
          - Worktree: `{}`\n\
          - Branch: `{branch}`\n\
          - Draft PR: {pr_url}\n\n\
-         If you haven't already, post a hand-off comment on issue #{number} and on the PR \
-         saying the plan is ready for review, and that commenting `/approve-plan` on either \
-         thread (or reacting 👍 to that comment) advances to the implement phase.\n\n{}",
+         If you haven't already, hand off with `ghwf hand-off {number}` (body from stdin): \
+         a comment saying the plan is ready for review. ghwf posts it to both threads and \
+         appends the `/approve-plan` prompt itself — do not write one.\n\n{}",
         worktree.display(),
         crate::render::wait_instruction(number),
     )
@@ -213,6 +213,8 @@ mod tests {
     fn complete_body_includes_wait_instruction() {
         let body = complete_body(Path::new("/wt"), "b", "https://github.com/o/r/pull/18", 7);
         assert!(body.contains("`ghwf wait 7`"));
+        // The hand-off goes through ghwf, which owns the approval prompt.
+        assert!(body.contains("`ghwf hand-off 7`"));
     }
 
     #[test]

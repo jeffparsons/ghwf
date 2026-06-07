@@ -33,9 +33,11 @@ fn slug_words(title: &str) -> Vec<String> {
 pub enum Directive {
     ApprovePrePlan,
     ApprovePlan,
+    // Retired: the implement phase now advances when the user marks the draft
+    // PR ready for review. Still recognised so its retirement can be explained
+    // rather than the comment being silently ignored.
     ApproveImplementation,
-    // The retired generic command; still recognised so its retirement can be
-    // explained rather than the comment being silently ignored.
+    // The retired generic command; recognised for the same reason.
     Proceed,
 }
 
@@ -52,12 +54,12 @@ const DIRECTIVE_COMMANDS: &[(&str, Directive)] = &[
 
 impl Directive {
     /// The phase this directive approves (i.e. advances out of), or `None` for
-    /// the retired generic `/proceed`.
+    /// a retired command.
     pub fn approves(self) -> Option<Phase> {
         match self {
             Directive::ApprovePrePlan => Some(Phase::PrePlan),
             Directive::ApprovePlan => Some(Phase::PrepAndPlan),
-            Directive::ApproveImplementation => Some(Phase::Implement),
+            Directive::ApproveImplementation => None,
             Directive::Proceed => None,
         }
     }
@@ -92,15 +94,15 @@ pub fn parse_directive(body: &str) -> Option<Directive> {
 /// mention of an approval command anywhere in `body`, or `None` when no
 /// command is mentioned.
 ///
-/// Unlike `parse_directive`, mentions count mid-line (status prose backticks
+/// Unlike `parse_directive`, mentions count mid-line (hand-off prose backticks
 /// them). Last-mention-wins makes ghwf comments self-describing 👍 targets:
-/// status updates end with the "Next: comment `/approve-X`" prompt, and
-/// misfire notes end with "the command that advances it is `/approve-X`".
-/// The retired `/proceed` never maps — a 👍 can only mean a live approval.
+/// hand-off comments end with the "comment `/approve-X`" prompt, and misfire
+/// notes end with "the command that advances it is `/approve-X`". Retired
+/// commands never map — a 👍 can only mean a live approval.
 pub fn parse_prompted_directive(body: &str) -> Option<Directive> {
     let mut last: Option<(usize, Directive)> = None;
     for &(command, directive) in DIRECTIVE_COMMANDS {
-        if directive == Directive::Proceed {
+        if directive.approves().is_none() {
             continue;
         }
         for (idx, _) in body.match_indices(command) {
@@ -161,15 +163,36 @@ impl Phase {
     }
 
     /// The canonical command that approves this phase (advancing to the next),
-    /// or `None` for the terminal phase.
+    /// or `None` when no command advances it — implement advances when the
+    /// user marks the draft PR ready for review, and review is terminal.
     pub fn approval_command(self) -> Option<&'static str> {
         match self {
             Phase::PrePlan => Some("/approve-pre-plan"),
             Phase::PrepAndPlan => Some("/approve-plan"),
-            Phase::Implement => Some("/approve-implementation"),
+            Phase::Implement => None,
             Phase::Review => None,
         }
     }
+}
+
+/// Who the workflow is currently waiting for, orthogonal to the phase. Flips
+/// far more often than the phase does: every hand-off and every round of user
+/// feedback moves the ball.
+//
+// The shared `WaitingOn` prefix is deliberate: the kebab-case serializations
+// (`waiting-on-user`, …) are the on-disk format and the config keys.
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Attention {
+    /// Claude has handed off; the user owes an approval, an answer, or a review.
+    WaitingOnUser,
+    /// Claude has instructions to act on. The default: a `work-on` run always
+    /// leaves Claude with something to do.
+    #[default]
+    WaitingOnClaude,
+    /// ghwf's own machinery is doing slow work (worktree/PR prep).
+    WaitingOnGhwf,
 }
 
 /// How an issue's PR left the open state, concluding (or halting) the workflow.
@@ -197,6 +220,16 @@ pub fn pr_outcome(pr: &crate::models::PullRequest) -> Option<PrOutcome> {
 #[derive(Default, Serialize, Deserialize)]
 pub struct IssueState {
     pub phase: Phase,
+    // Who the workflow is waiting for. Defaults to waiting-on-claude for
+    // pre-existing state files: a `work-on` run always leaves Claude with
+    // instructions.
+    #[serde(default)]
+    pub attention: Attention,
+    // What the last label sync applied, so the steady-state loop skips the
+    // API calls entirely. Absent until a sync has run (or when labels are
+    // not configured).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels_synced: Option<LabelSyncRecord>,
     // Ids of comments whose directive has already been acted on. Comment ids
     // are globally unique across the issue and PR conversation threads, so one
     // set dedupes both sources.
@@ -249,6 +282,18 @@ pub struct PostedRef {
     pub created_at: String,
 }
 
+/// What the last label sync applied: the inputs the desired label set is
+/// computed from. A sync is skipped when these all match the current state.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LabelSyncRecord {
+    pub phase: Phase,
+    // `None` once the workflow has concluded (no attention label applies).
+    pub attention: Option<Attention>,
+    // The PR that was labelled alongside the issue, if any. A PR appearing
+    // later forces a re-sync.
+    pub pr_number: Option<u64>,
+}
+
 /// What `work-on` last observed on the issue and its PR, recorded for `wait`
 /// to poll against.
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -274,6 +319,11 @@ pub struct WaitState {
     // a 👍 on an older prompt is still honoured on the next `work-on`.
     #[serde(default)]
     pub reaction_watches: BTreeMap<String, ReactionWatch>,
+    // Whether the PR was a draft when the baseline was recorded. A flip in
+    // either direction wakes the wait: ready-for-review advances the
+    // implement phase. Absent when no PR exists (or for old state files).
+    #[serde(default)]
+    pub pr_draft: Option<bool>,
 }
 
 /// A comment whose 👍 reactions `wait` polls, with the reaction ids already
@@ -313,10 +363,6 @@ pub struct PrepState {
     pub worktree_path: Option<PathBuf>,
     // The draft PR's number, once opened.
     pub pr_number: Option<u64>,
-    // Whether the PR has been flipped from draft to ready-for-review (on entering
-    // the review phase). Kept idempotent so we only mark it once.
-    #[serde(default)]
-    pub pr_ready: bool,
 }
 
 /// Path to the per-issue state file under the ghwf data dir.
@@ -496,8 +542,8 @@ pub fn save(owner: &str, repo: &str, number: u64, state: &IssueState) -> Result<
 mod tests {
     use super::{
         branch_and_slug, find_issue_for_dir, issue_fingerprint, parse_directive,
-        parse_prompted_directive, pr_outcome, Directive, IssueState, Phase, PostedRef, PrOutcome,
-        PrepState, ReactionWatch, WaitState,
+        parse_prompted_directive, pr_outcome, Attention, Directive, IssueState, Phase, PostedRef,
+        PrOutcome, PrepState, ReactionWatch, WaitState,
     };
     use crate::models::PullRequest;
     use std::path::{Path, PathBuf};
@@ -586,6 +632,38 @@ mod tests {
         assert_eq!(state.stop_nudges, 0);
         assert!(state.consumed_reactions.is_empty());
         assert!(state.pr_outcome.is_none());
+        assert_eq!(state.attention, Attention::WaitingOnClaude);
+        assert!(state.labels_synced.is_none());
+    }
+
+    #[test]
+    fn old_prep_state_with_pr_ready_still_loads() {
+        // The retired `pr_ready` flag is an unknown field to serde now.
+        let state: IssueState = serde_json::from_str(
+            r#"{"phase":"review","consumed_directives":[],"prep":{"no_branch":false,
+                "worktree_session_id":null,"branch":"b","worktree_path":"/wt",
+                "pr_number":34,"pr_ready":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(state.prep.unwrap().pr_number, Some(34));
+    }
+
+    #[test]
+    fn attention_round_trips() {
+        for (attention, label) in [
+            (Attention::WaitingOnUser, "waiting-on-user"),
+            (Attention::WaitingOnClaude, "waiting-on-claude"),
+            (Attention::WaitingOnGhwf, "waiting-on-ghwf"),
+        ] {
+            let state = IssueState {
+                attention,
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&state).unwrap();
+            assert!(json.contains(&format!(r#""attention":"{label}""#)));
+            let back: IssueState = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.attention, attention);
+        }
     }
 
     fn pull_request(state: &str, merged: bool) -> PullRequest {
@@ -593,6 +671,7 @@ mod tests {
             number: 33,
             state: state.to_string(),
             merged,
+            draft: false,
             html_url: "https://github.com/o/r/pull/33".to_string(),
         }
     }
@@ -648,6 +727,7 @@ mod tests {
                     },
                 )]
                 .into(),
+                pr_draft: Some(true),
             }),
             last_posted: Some(PostedRef {
                 id: 7,
@@ -661,6 +741,7 @@ mod tests {
         assert_eq!(wait.since, "2026-06-06T10:00:00Z");
         assert_eq!(wait.comments.get(&1).map(String::as_str), Some("h1"));
         assert_eq!(wait.etags.get("issue").map(String::as_str), Some("W/\"x\""));
+        assert_eq!(wait.pr_draft, Some(true));
         let watch = wait.reaction_watches.get("issue").unwrap();
         assert_eq!(watch.comment_id, 9);
         assert!(watch.plus_one_ids.contains(&100));
@@ -734,12 +815,29 @@ mod tests {
 
     #[test]
     fn approval_command_round_trips_through_parse() {
-        for phase in [Phase::PrePlan, Phase::PrepAndPlan, Phase::Implement] {
-            let command = phase.approval_command().expect("non-terminal phase");
+        for phase in [Phase::PrePlan, Phase::PrepAndPlan] {
+            let command = phase.approval_command().expect("command-approved phase");
             let directive = parse_directive(command).expect("command parses");
             assert_eq!(directive.approves(), Some(phase));
         }
+        // Implement advances via the PR's ready-for-review flip, not a command.
+        assert_eq!(Phase::Implement.approval_command(), None);
         assert_eq!(Phase::Review.approval_command(), None);
+    }
+
+    #[test]
+    fn approve_implementation_is_retired() {
+        assert_eq!(Directive::ApproveImplementation.approves(), None);
+        // Still recognised as a typed command, so it can be explained…
+        assert_eq!(
+            parse_directive("/approve-implementation"),
+            Some(Directive::ApproveImplementation)
+        );
+        // …but never a 👍 target.
+        assert_eq!(
+            parse_prompted_directive("comment `/approve-implementation` to advance"),
+            None
+        );
     }
 
     #[test]
