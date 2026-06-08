@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -526,6 +527,50 @@ pub fn delete(owner: &str, repo: &str, number: u64) -> Result<()> {
     }
 }
 
+/// Atomically record an issue as started, claiming it against concurrent local
+/// workers. Returns `true` when this call created the state file, `false` when
+/// some session already holds state for the issue.
+///
+/// The per-issue state file is already the "started" marker that makes `next`
+/// skip an issue; creating it exclusively turns that marker into a claim. The
+/// atomicity is the filesystem's `O_EXCL`, so this only coordinates workers on
+/// one machine — which is the whole contention scope we need.
+pub fn claim(owner: &str, repo: &str, number: u64) -> Result<bool> {
+    let path = state_path(owner, repo, number)?;
+    let dir = path
+        .parent()
+        .expect("state path always has a parent directory");
+    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    claim_file(&path)
+}
+
+/// Exclusively create `path` and seed it with default state, so the claimed
+/// issue's file parses everywhere it is later read. Returns `false` without
+/// touching the file when it already exists. Split from [`claim`] so tests can
+/// drive a concrete path.
+fn claim_file(path: &Path) -> Result<bool> {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => {
+            let json = serde_json::to_string_pretty(&IssueState::default())
+                .context("failed to serialize claimed issue state")?;
+            // A single write is enough; the file was created empty and we hold
+            // the only handle.
+            (&file).write_all(json.as_bytes()).with_context(|| {
+                format!("failed to write claimed issue state {}", path.display())
+            })?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to claim issue state {}", path.display()))
+        }
+    }
+}
+
 /// Persist the state for an issue.
 pub fn save(owner: &str, repo: &str, number: u64, state: &IssueState) -> Result<()> {
     let path = state_path(owner, repo, number)?;
@@ -877,6 +922,24 @@ mod tests {
     fn prompted_directive_ignores_proceed_and_plain_prose() {
         assert_eq!(parse_prompted_directive("`/proceed` is retired"), None);
         assert_eq!(parse_prompted_directive("no commands here"), None);
+    }
+
+    #[test]
+    fn claim_is_exclusive_and_seeds_default_state() {
+        use super::claim_file;
+        let root = scratch("claim");
+        let path = root.join("o").join("r").join("7.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // First claim wins and writes parseable default state.
+        assert!(claim_file(&path).unwrap());
+        let state: IssueState =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(state.phase, Phase::PrePlan);
+
+        // A second claim loses without disturbing the file.
+        assert!(!claim_file(&path).unwrap());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

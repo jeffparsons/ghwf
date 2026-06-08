@@ -47,16 +47,30 @@ enum Commands {
         #[arg(long)]
         no_branch: bool,
     },
-    /// Pick the next issue to work on and start work on it, as `work-on` would.
+    /// Pick the next issue to work on, claim it, and start work on it, as
+    /// `work-on` would.
     ///
     /// Picks from the repo's open issues: ones assigned to you first, then by
     /// the configured `priority_labels` (earlier in the list wins), then the
     /// lowest issue number. Issues assigned to someone else or already started
-    /// by a ghwf session are passed over.
+    /// by a ghwf session are passed over. The pick is claimed (reserved against
+    /// concurrent runs) and assigned to you on GitHub.
+    ///
+    /// With `--wait`, block until an eligible issue appears rather than erroring
+    /// when there is none — run one per terminal as a pool of single-use
+    /// workers that each grab and start the next issue to come along.
     Next {
         /// Work without a dedicated branch/worktree/PR (just write the plan file).
         #[arg(long)]
         no_branch: bool,
+        /// Block until an eligible issue appears, claim it, then start work —
+        /// run one per terminal as a pool of single-use workers.
+        #[arg(long)]
+        wait: bool,
+        /// With --wait: give up after this many seconds, exiting with code 2.
+        /// Omit to wait indefinitely.
+        #[arg(long, requires = "wait")]
+        timeout: Option<u64>,
     },
     /// Clone a GitHub repo into ghwf's preferred layout: a container
     /// directory holding the bare repo (as `<name>.git`), a generated
@@ -158,7 +172,18 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::WorkOn { issue, no_branch } => work_on(&resolve_issue_arg(issue)?, no_branch),
-        Commands::Next { no_branch } => work_on(&next::pick()?.to_string(), no_branch),
+        Commands::Next {
+            no_branch,
+            wait,
+            timeout,
+        } => {
+            let number = if wait {
+                next::wait_for_pick(timeout)?
+            } else {
+                next::pick()?
+            };
+            work_on(&number.to_string(), no_branch)
+        }
         Commands::Clone {
             repo,
             directory,
