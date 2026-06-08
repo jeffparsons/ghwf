@@ -1,16 +1,30 @@
-use anyhow::{bail, Result};
+use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
+use anyhow::{bail, Context, Result};
+
+use crate::github::Conditional;
 use crate::models::IssueListing;
-use crate::{config, github, state};
+use crate::{config, github, state, wait};
 
-/// Pick the next issue to work on, print the pick and its rationale, and
-/// return its number for the caller to hand to `work-on`.
+/// Direct polling starts here…
+const BACKOFF_FLOOR: Duration = Duration::from_secs(5);
+/// …doubles while idle, and caps here.
+const BACKOFF_CAP: Duration = Duration::from_secs(60);
+/// This many consecutive failed polls aborts the wait. Far higher than `wait`'s
+/// threshold: a pool worker runs unattended, so a transient network blip
+/// shouldn't kill it (~30 min at the cap before giving up).
+const MAX_CONSECUTIVE_FAILURES: u32 = 30;
+
+/// Pick the next issue to work on, claim it, print the pick and its rationale,
+/// and return its number for the caller to hand to `work-on`.
 ///
 /// Eligible issues are the repo's open issues, excluding PRs, issues assigned
 /// to someone other than the user, and issues that already have recorded ghwf
 /// state (some session has already started them — `next` can't tell whether
 /// that session is still live, so it never picks them; `ghwf work-on <n>`
-/// resumes them explicitly).
+/// resumes them explicitly). Claiming the winner atomically reserves it against
+/// concurrent `next`/`next --wait` runs, and assigns it on GitHub.
 pub fn pick() -> Result<u64> {
     let priority_labels = match config::find()? {
         Some(located) => located.config.priority_labels,
@@ -20,33 +34,196 @@ pub fn pick() -> Result<u64> {
     let me = github::authenticated_user()?;
     let issues = github::list_open_issues(&owner, &repo)?;
 
-    // A state file that exists but fails to parse still marks the issue as
-    // started — only its details are unreadable.
-    let started = |number: u64| {
-        state::load_if_exists(&owner, &repo, number)
-            .map(|s| s.is_some())
-            .unwrap_or(true)
-    };
-    let selection = select(&issues, &me, &priority_labels, started);
+    let selection = claim_pick(
+        &issues,
+        &me,
+        &priority_labels,
+        started_fn(&owner, &repo),
+        |n| state::claim(&owner, &repo, n),
+    )?;
 
-    for number in &selection.skipped_started {
-        println!("Skipping #{number} — already started; resume it with `ghwf work-on {number}`.");
-    }
-    match selection.picked {
-        Some(issue) => {
-            println!(
-                "Picked #{} \"{}\" — {}.",
-                issue.number,
-                issue.title,
-                rationale(issue, &me, &priority_labels)
-            );
-            Ok(issue.number)
-        }
+    match announce_pick(&selection, &me, &priority_labels, &owner, &repo) {
+        Some(number) => Ok(number),
         None => bail!(
             "no eligible open issues in {owner}/{repo}: every open issue is a PR, is assigned \
              to someone else, or is already started (resume those with `ghwf work-on <n>`)."
         ),
     }
+}
+
+/// Block until an eligible issue can be claimed, returning its number for the
+/// caller to hand to `work-on`. With `Some(timeout)`, exits the process with
+/// [`wait::EXIT_TIMEOUT`] once it elapses with nothing claimed; with `None`,
+/// waits indefinitely — the normal worker-pool case.
+///
+/// Polls the open-issues listing with conditional (ETag) GETs and the same
+/// floor/cap backoff as `wait`; a fresh listing re-arms eager polling. Only one
+/// endpoint is polled per cycle, so even at the cap a worker costs ~60 req/hr —
+/// no events-feed idle mode is needed.
+pub fn wait_for_pick(timeout_secs: Option<u64>) -> Result<u64> {
+    let priority_labels = match config::find()? {
+        Some(located) => located.config.priority_labels,
+        None => Vec::new(),
+    };
+    let (owner, repo) = github::repo_or_cwd()?;
+    let me = github::authenticated_user()?;
+    let endpoint = format!("repos/{owner}/{repo}/issues?state=open&per_page=100");
+
+    match timeout_secs {
+        Some(secs) => {
+            println!("Waiting for an eligible issue to claim in {owner}/{repo} (timeout {secs} s)…")
+        }
+        None => println!("Waiting for an eligible issue to claim in {owner}/{repo}…"),
+    }
+
+    let deadline = timeout_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
+    let mut etag: Option<String> = None;
+    let mut backoff = BACKOFF_FLOOR;
+    let mut consecutive_failures: u32 = 0;
+
+    loop {
+        match github::gh_api_conditional(&endpoint, etag.as_deref()) {
+            Ok(Conditional::NotModified { .. }) => {
+                consecutive_failures = 0;
+            }
+            Ok(Conditional::Fresh {
+                etag: new_etag,
+                body,
+                ..
+            }) => {
+                consecutive_failures = 0;
+                if let Some(new_etag) = new_etag {
+                    etag = Some(new_etag);
+                }
+                let issues: Vec<IssueListing> = serde_json::from_str(&body)
+                    .context("failed to parse open-issues listing while waiting")?;
+                let selection = claim_pick(
+                    &issues,
+                    &me,
+                    &priority_labels,
+                    started_fn(&owner, &repo),
+                    |n| state::claim(&owner, &repo, n),
+                )?;
+                if let Some(number) =
+                    announce_pick(&selection, &me, &priority_labels, &owner, &repo)
+                {
+                    return Ok(number);
+                }
+                // The listing changed but held nothing to claim; poll eagerly
+                // again in case more lands.
+                backoff = BACKOFF_FLOOR;
+            }
+            Err(err) if github::is_rate_limited(&err) => {
+                eprintln!("warning: rate limited; backing off: {err:#}");
+                backoff = BACKOFF_CAP;
+            }
+            Err(err) => {
+                consecutive_failures += 1;
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    return Err(err.context("giving up after repeated polling failures"));
+                }
+                eprintln!("warning: poll failed (attempt {consecutive_failures}): {err:#}");
+            }
+        }
+
+        let pace = backoff;
+        backoff = (backoff * 2).min(BACKOFF_CAP);
+        match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                std::thread::sleep(pace.min(remaining));
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
+            None => std::thread::sleep(pace),
+        }
+    }
+
+    println!(
+        "No eligible issue to claim within {} s. Run `ghwf next --wait` again to keep waiting.",
+        timeout_secs.expect("a reached deadline implies a timeout was set")
+    );
+    std::process::exit(wait::EXIT_TIMEOUT);
+}
+
+/// The "already started" predicate for a repo: an issue is started when it has
+/// any recorded state. A state file that exists but fails to parse still counts
+/// — only its details are unreadable, not the fact that some session began it.
+fn started_fn<'a>(owner: &'a str, repo: &'a str) -> impl Fn(u64) -> bool + 'a {
+    move |number: u64| {
+        state::load_if_exists(owner, repo, number)
+            .map(|s| s.is_some())
+            .unwrap_or(true)
+    }
+}
+
+/// Select the best eligible issue and claim it, re-selecting when a claim is
+/// lost to a concurrent worker. Returns the `Selection` whose `picked` issue
+/// was successfully claimed, or one with `picked: None` when nothing remains.
+///
+/// `claim` returns `true` when this caller won the issue and `false` when
+/// another session already holds it; a lost race excludes that issue and runs
+/// selection again. Both predicates are injected so the loop is testable
+/// without a filesystem or network.
+fn claim_pick<'a>(
+    issues: &'a [IssueListing],
+    me: &str,
+    priority_labels: &[String],
+    already_started: impl Fn(u64) -> bool,
+    mut claim: impl FnMut(u64) -> Result<bool>,
+) -> Result<Selection<'a>> {
+    // Issues lost to other workers this call, excluded from re-selection on top
+    // of those `already_started` already reports.
+    let mut lost: BTreeSet<u64> = BTreeSet::new();
+    loop {
+        let selection = select(issues, me, priority_labels, |n| {
+            already_started(n) || lost.contains(&n)
+        });
+        let Some(picked) = selection.picked else {
+            return Ok(selection);
+        };
+        if claim(picked.number)? {
+            return Ok(selection);
+        }
+        lost.insert(picked.number);
+    }
+}
+
+/// Report a claimed selection: print the skipped-started lines, assign the
+/// picked issue to `me` on GitHub (best-effort — the claim already guarantees
+/// exclusivity, so a failure is only a lost visibility cue), print the pick and
+/// its rationale, and return the picked number. Returns `None` when nothing was
+/// picked.
+fn announce_pick(
+    selection: &Selection,
+    me: &str,
+    priority_labels: &[String],
+    owner: &str,
+    repo: &str,
+) -> Option<u64> {
+    for number in &selection.skipped_started {
+        println!("Skipping #{number} — already started; resume it with `ghwf work-on {number}`.");
+    }
+    let issue = selection.picked?;
+    if !assigned_to(issue, me) {
+        if let Err(err) = github::add_assignee(owner, repo, issue.number, me) {
+            eprintln!(
+                "warning: failed to assign #{} to {me} (the claim still stands): {err:#}",
+                issue.number
+            );
+        }
+    }
+    println!(
+        "Picked #{} \"{}\" — {}.",
+        issue.number,
+        issue.title,
+        rationale(issue, me, priority_labels)
+    );
+    Some(issue.number)
 }
 
 /// The outcome of [`select`]: the winning issue, if any, and the
@@ -142,7 +319,10 @@ fn rationale(issue: &IssueListing, me: &str, priority_labels: &[String]) -> Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{select, Selection};
+    use std::cell::RefCell;
+    use std::collections::BTreeSet;
+
+    use super::{claim_pick, select, Selection};
     use crate::models::{IssueListing, Label, User};
 
     /// An open issue with the given assignees and labels.
@@ -291,5 +471,56 @@ mod tests {
         let selection = pick(&issues, "me", &[]);
         assert!(selection.picked.is_none());
         assert!(selection.skipped_started.is_empty());
+    }
+
+    /// Run `claim_pick` with nothing pre-started, claiming the numbers in
+    /// `won` and losing every other. Records the claim attempts in order.
+    fn claim_with<'a>(
+        issues: &'a [IssueListing],
+        won: &[u64],
+        attempts: &RefCell<Vec<u64>>,
+    ) -> Selection<'a> {
+        let won: BTreeSet<u64> = won.iter().copied().collect();
+        claim_pick(
+            issues,
+            "me",
+            &[],
+            |_| false,
+            |n| {
+                attempts.borrow_mut().push(n);
+                Ok(won.contains(&n))
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn claim_pick_returns_the_first_claimable() {
+        let issues = [issue(3, &[], &[]), issue(5, &[], &[])];
+        let attempts = RefCell::new(Vec::new());
+        // #3 sorts first and is claimed on the first try.
+        let selection = claim_with(&issues, &[3, 5], &attempts);
+        assert_eq!(selection.picked.unwrap().number, 3);
+        assert_eq!(*attempts.borrow(), [3]);
+    }
+
+    #[test]
+    fn claim_pick_falls_through_lost_races() {
+        let issues = [issue(3, &[], &[]), issue(5, &[], &[])];
+        let attempts = RefCell::new(Vec::new());
+        // #3 is lost to another worker, so the next candidate is claimed.
+        let selection = claim_with(&issues, &[5], &attempts);
+        assert_eq!(selection.picked.unwrap().number, 5);
+        assert_eq!(*attempts.borrow(), [3, 5]);
+    }
+
+    #[test]
+    fn claim_pick_none_when_every_candidate_lost() {
+        let issues = [issue(3, &[], &[]), issue(5, &[], &[])];
+        let attempts = RefCell::new(Vec::new());
+        let selection = claim_with(&issues, &[], &attempts);
+        assert!(selection.picked.is_none());
+        // Every candidate was tried exactly once.
+        assert_eq!(*attempts.borrow(), [3, 5]);
     }
 }

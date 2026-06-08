@@ -60,6 +60,27 @@ session has already started are skipped too (ghwf can't tell whether another
 session is still working them); `next` lists the ones it passed over — resume
 those explicitly with `ghwf work-on <n>`.
 
+The pick is **claimed** before work starts: ghwf records the issue's state file
+atomically, reserving it against any other `next` run on the machine, and
+assigns the issue to you on GitHub so the pickup is visible (e.g. from your
+phone). Two `next` runs can therefore never start the same issue.
+
+## A pool of single-use workers
+
+`ghwf next --wait` blocks until an eligible issue appears instead of erroring
+when there is none. Open several terminals, run `ghwf next --wait` in each, and
+you have a pool of single-use workers: as you file (or open) issues — even from
+your phone, via GitHub — each idle worker claims the next one to come along,
+creates its worktree, and launches a Claude session that starts working
+immediately. The atomic claim guarantees exactly one worker per issue; the
+others keep waiting.
+
+Each worker polls the open-issues listing cheaply (conditional requests with
+backoff, capping at one request per minute while idle), so a handful of workers
+sit comfortably inside GitHub's rate limit. Pass `--timeout <secs>` to give up
+after a while (exit code 2, like `wait`); omit it to wait indefinitely.
+`--no-branch` passes through as with plain `next`.
+
 ## Collecting garbage
 
 `ghwf collect-garbage` (alias `gc`) cleans up after merged PRs. After a
@@ -183,6 +204,11 @@ rather than printing the phase banner. It narrates each step as it:
    recorded session (`claude --resume <id>`) when its transcript still exists,
    else starting fresh.
 
+The launched session starts itself: ghwf passes `/work-on` as the initial
+prompt, so the workflow advances without anyone typing — which is what makes
+the flow drivable from a phone. This stays interactive and subscription-billed;
+only `-p`/`--print` (headless) bills separately, and ghwf never uses it.
+
 The launcher exports `GHWF_ISSUE` (the issue's URL) to the `claude` it starts,
 and records `--no-branch` in the issue's state, so ghwf commands inside the
 session need neither the issue argument nor the flag repeated.
@@ -193,11 +219,6 @@ the worktree that has the repo's default branch checked out, so the local
 `main` checkout implicitly stays fresh. The update only happens when that
 worktree has no changes to tracked files, and any failure is just a warning —
 it never blocks the launch.
-
-For a fresh session there's nothing to resume and nothing queued: ghwf reminds
-you to run `/work-on` (no argument needed) once Claude is up. It deliberately
-passes no prompt — programmatic use (`-p`/`--print`) is billed as API traffic
-rather than your subscription.
 
 ## The relaunch constraint
 

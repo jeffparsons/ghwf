@@ -81,6 +81,14 @@ pub fn list_open_issues(owner: &str, repo: &str) -> Result<Vec<IssueListing>> {
     Ok(pages.into_iter().flatten().collect())
 }
 
+/// Add `login` to an issue's assignees. Adding someone already assigned is a
+/// no-op on GitHub's side, so callers needn't pre-check.
+pub fn add_assignee(owner: &str, repo: &str, number: u64, login: &str) -> Result<()> {
+    let endpoint = format!("repos/{owner}/{repo}/issues/{number}/assignees");
+    let payload = serde_json::json!({ "assignees": [login] }).to_string();
+    gh_api_stdin(&["--method", "POST", &endpoint, "--input", "-"], &payload).map(|_| ())
+}
+
 /// The login of the authenticated `gh` user.
 pub fn authenticated_user() -> Result<String> {
     let json = gh_api(&["user"])?;

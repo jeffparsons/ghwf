@@ -73,7 +73,6 @@ pub fn run(issue_arg: &str, no_branch: bool) -> Result<()> {
             });
             state::save(&owner, &repo, number, &issue_state)?;
         }
-        print_fresh_reminder();
         return exec_claude(None, None, permission_mode.as_deref(), &issue_url);
     }
 
@@ -135,7 +134,6 @@ pub fn run(issue_arg: &str, no_branch: bool) -> Result<()> {
                 worktree.display(),
                 mode_note(permission_mode.as_deref())
             );
-            print_fresh_reminder();
         }
     }
     exec_claude(
@@ -190,16 +188,6 @@ fn refresh_main_repo(owner: &str, repo: &str) {
     prep::update_default_worktree(&main_repo, &default);
 }
 
-/// Remind the user how to kick off the workflow in a fresh session. The launcher
-/// can't do it for them: passing Claude a prompt would be programmatic use,
-/// billed as API traffic.
-fn print_fresh_reminder() {
-    println!(
-        "Once Claude is up, run `/work-on` to pick up the workflow \
-         (the issue is inferred from the session environment)."
-    );
-}
-
 /// The session recorded for this worktree, if its transcript still exists under
 /// `claude_dir` (otherwise there is nothing `claude --resume` could load).
 fn resumable_session(
@@ -251,9 +239,13 @@ fn munge(path: &Path) -> String {
 /// `issue_url` is exported as $GHWF_ISSUE so ghwf commands inside the session
 /// can default to it.
 ///
-/// Never pass `-p`/`--print` (or any prompt): that is programmatic use, billed
-/// as API traffic rather than the user's subscription. Because we exec rather
-/// than spawn, quitting Claude returns the user to the shell that ran ghwf.
+/// The session starts itself by passing `/work-on` as a positional initial
+/// prompt. That keeps it interactive (the user stays in the prompt loop) and
+/// subscription-billed — only `-p`/`--print` is the headless/programmatic mode
+/// that bills separately, and we never use it. The auto-start makes the whole
+/// flow drivable from a phone: no one has to type `/work-on` to get going.
+/// Because we exec rather than spawn, quitting Claude returns the user to the
+/// shell that ran ghwf.
 fn exec_claude(
     dir: Option<&Path>,
     resume: Option<&str>,
@@ -268,6 +260,9 @@ fn exec_claude(
     if let Some(mode) = permission_mode {
         cmd.args(["--permission-mode", mode]);
     }
+    // The initial prompt goes last, after any flags, so it is the positional
+    // argument claude treats as the first user message.
+    cmd.arg("/work-on");
     if let Some(dir) = dir {
         std::env::set_current_dir(dir)
             .with_context(|| format!("failed to change directory to `{}`", dir.display()))?;
