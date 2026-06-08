@@ -45,6 +45,23 @@ pub fn fetch_review_comments(owner: &str, repo: &str, pr: u64) -> Result<Vec<Rev
     serde_json::from_str(&json).context("failed to parse review comments JSON from `gh api`")
 }
 
+/// Reply to an inline review comment thread, returning the created reply.
+///
+/// `comment_id` is the id of any comment in the thread (the same ids `work-on`
+/// surfaces); the reply is posted to that comment's thread.
+pub fn reply_review_comment(
+    owner: &str,
+    repo: &str,
+    pr: u64,
+    comment_id: u64,
+    body: &str,
+) -> Result<ReviewComment> {
+    let endpoint = format!("repos/{owner}/{repo}/pulls/{pr}/comments/{comment_id}/replies");
+    let payload = serde_json::json!({ "body": body }).to_string();
+    let json = gh_api_stdin(&["--method", "POST", &endpoint, "--input", "-"], &payload)?;
+    serde_json::from_str(&json).context("failed to parse review-comment reply JSON from `gh api`")
+}
+
 /// Fetch the reactions on a conversation comment, following pagination.
 ///
 /// Issue and PR conversation comments share the issue-comments id namespace,
@@ -261,6 +278,40 @@ pub fn create_draft_pr(
     Ok(number)
 }
 
+/// Update a PR's title and/or body. Only the provided fields are sent, so an
+/// omitted field is left untouched. The body is sent as JSON on stdin so it
+/// needs no shell escaping, mirroring [`post_issue_comment`].
+pub fn update_pr(
+    owner: &str,
+    repo: &str,
+    pr: u64,
+    title: Option<&str>,
+    body: Option<&str>,
+) -> Result<()> {
+    let endpoint = format!("repos/{owner}/{repo}/pulls/{pr}");
+    let payload = pr_update_payload(title, body);
+    gh_api_stdin(&["--method", "PATCH", &endpoint, "--input", "-"], &payload).map(|_| ())
+}
+
+/// Build the JSON request body for [`update_pr`], including only the fields the
+/// caller wants to change.
+fn pr_update_payload(title: Option<&str>, body: Option<&str>) -> String {
+    let mut fields = serde_json::Map::new();
+    if let Some(title) = title {
+        fields.insert(
+            "title".to_string(),
+            serde_json::Value::String(title.to_string()),
+        );
+    }
+    if let Some(body) = body {
+        fields.insert(
+            "body".to_string(),
+            serde_json::Value::String(body.to_string()),
+        );
+    }
+    serde_json::Value::Object(fields).to_string()
+}
+
 /// The label names currently on an issue (or PR — same endpoint).
 pub fn fetch_issue_labels(owner: &str, repo: &str, number: u64) -> Result<Vec<String>> {
     let endpoint = format!("repos/{owner}/{repo}/issues/{number}/labels?per_page=100");
@@ -407,6 +458,96 @@ fn gh(args: &[&str]) -> Result<String> {
     }
 
     String::from_utf8(output.stdout).context("`gh` returned non-UTF-8 output")
+}
+
+/// Run `gh` and capture its outcome *without* bailing on a non-zero exit, for
+/// callers that need the exit status as data rather than an error (e.g. `gh pr
+/// checks`, which exits non-zero when checks are failing or still pending).
+fn gh_capture(args: &[&str]) -> Result<(bool, String, String)> {
+    let output = Command::new("gh")
+        .args(args)
+        .output()
+        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    Ok((output.status.success(), stdout, stderr))
+}
+
+/// Summarise a PR's CI checks by wrapping `gh pr checks` (which aggregates
+/// check-runs and legacy commit statuses the way a human would see them),
+/// returning the table it prints. A non-zero exit means some check is failing
+/// or pending (or none are reported) — a normal reportable state, not an error
+/// here — so the output is returned regardless.
+pub fn pr_checks(owner: &str, repo: &str, pr: u64) -> Result<String> {
+    let repo_flag = format!("{owner}/{repo}");
+    let (_, stdout, stderr) = gh_capture(&["pr", "checks", &pr.to_string(), "-R", &repo_flag])?;
+    // With no checks at all, `gh` is silent on stdout and explains on stderr.
+    if stdout.trim().is_empty() {
+        Ok(stderr.trim().to_string())
+    } else {
+        Ok(stdout.trim_end().to_string())
+    }
+}
+
+/// The failing-job logs for the workflow runs on a PR's head commit, or a note
+/// when none failed. Concatenated with a header per failed run.
+pub fn failed_run_logs(owner: &str, repo: &str, head_sha: &str) -> Result<String> {
+    let repo_flag = format!("{owner}/{repo}");
+    let json = gh(&[
+        "run",
+        "list",
+        "-R",
+        &repo_flag,
+        "-L",
+        "50",
+        "--json",
+        "databaseId,conclusion,workflowName,headSha",
+    ])?;
+
+    #[derive(serde::Deserialize)]
+    struct Run {
+        #[serde(rename = "databaseId")]
+        database_id: u64,
+        conclusion: String,
+        #[serde(rename = "workflowName")]
+        workflow_name: String,
+        #[serde(rename = "headSha")]
+        head_sha: String,
+    }
+
+    let runs: Vec<Run> =
+        serde_json::from_str(&json).context("failed to parse `gh run list` JSON")?;
+    let failed: Vec<&Run> = runs
+        .iter()
+        .filter(|r| r.head_sha == head_sha && r.conclusion == "failure")
+        .collect();
+
+    if failed.is_empty() {
+        return Ok("No failed workflow runs on the PR's head commit.".to_string());
+    }
+
+    let mut out = String::new();
+    for run in failed {
+        out.push_str(&format!(
+            "===== {} (run {}) =====\n",
+            run.workflow_name, run.database_id
+        ));
+        let (_, stdout, stderr) = gh_capture(&[
+            "run",
+            "view",
+            &run.database_id.to_string(),
+            "-R",
+            &repo_flag,
+            "--log-failed",
+        ])?;
+        out.push_str(if stdout.trim().is_empty() {
+            stderr.trim_end()
+        } else {
+            stdout.trim_end()
+        });
+        out.push_str("\n\n");
+    }
+    Ok(out.trim_end().to_string())
 }
 
 /// The outcome of a conditional `gh api` GET. Both variants carry the
@@ -591,7 +732,24 @@ fn gh_api_stdin(args: &[&str], input: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_path_segment, parse_http_head, parse_remote_url};
+    use super::{encode_path_segment, parse_http_head, parse_remote_url, pr_update_payload};
+
+    #[test]
+    fn pr_update_payload_includes_only_provided_fields() {
+        assert_eq!(
+            pr_update_payload(None, Some("new body")),
+            r#"{"body":"new body"}"#
+        );
+        assert_eq!(
+            pr_update_payload(Some("new title"), None),
+            r#"{"title":"new title"}"#
+        );
+        // serde_json's default map is sorted, so `body` precedes `title`.
+        assert_eq!(
+            pr_update_payload(Some("t"), Some("b")),
+            r#"{"body":"b","title":"t"}"#
+        );
+    }
 
     #[test]
     fn path_segment_encoding_covers_label_names() {

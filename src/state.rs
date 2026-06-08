@@ -714,10 +714,16 @@ mod tests {
     fn pull_request(state: &str, merged: bool) -> PullRequest {
         PullRequest {
             number: 33,
+            title: "PR".to_string(),
             state: state.to_string(),
             merged,
             draft: false,
+            body: None,
             html_url: "https://github.com/o/r/pull/33".to_string(),
+            head: crate::models::Head {
+                ref_name: "branch".to_string(),
+                sha: "sha".to_string(),
+            },
         }
     }
 

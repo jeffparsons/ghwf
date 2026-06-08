@@ -36,6 +36,11 @@ Run `ghwf work-on $ARGUMENTS` and follow the phase banner exactly:
   $ARGUMENTS`; when a phase's work is done, hand off with `ghwf hand-off
   $ARGUMENTS` (body from stdin) — ghwf appends the approval prompt itself,
   so never write one.
+- For the PR itself, use ghwf rather than `gh`: `ghwf show-pr` /
+  `ghwf update-pr` (body from stdin, `--title` optional) to read and revise
+  the title and body, `ghwf pr-checks` (`--log-failed` for logs) for CI
+  status, and `ghwf reply-review-comment --id <id>` (body from stdin) to
+  answer an inline review comment.
 - If ghwf hard-errors that the work belongs in a different worktree, relay its
   relaunch command to the user and stop — do not try to work around it.
 

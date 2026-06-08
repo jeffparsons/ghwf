@@ -157,6 +157,48 @@ enum Commands {
         #[arg(long, default_value_t = 540)]
         timeout: u64,
     },
+    /// Print the current title, state, and body of the issue's PR, so Claude
+    /// can read it before revising — no need to reach for `gh`.
+    ShowPr {
+        /// An issue number (resolved against the current repo) or a full GitHub
+        /// issue URL. When omitted, inferred as `work-on` does.
+        issue: Option<String>,
+    },
+    /// Update the issue's PR body (read from stdin) and/or its title.
+    ///
+    /// To change only the title, pass an empty body, e.g.
+    /// `ghwf update-pr 49 --title "…" </dev/null`.
+    UpdatePr {
+        /// An issue number (resolved against the current repo) or a full GitHub
+        /// issue URL. When omitted, inferred as `work-on` does.
+        issue: Option<String>,
+        /// Set the PR title as well as (or instead of) the body.
+        #[arg(long)]
+        title: Option<String>,
+    },
+    /// Summarise the CI check status of the issue's PR (wraps `gh pr checks`).
+    PrChecks {
+        /// An issue number (resolved against the current repo) or a full GitHub
+        /// issue URL. When omitted, inferred as `work-on` does.
+        issue: Option<String>,
+        /// Also dump the failing-job logs for the PR's head commit.
+        #[arg(long)]
+        log_failed: bool,
+    },
+    /// Reply to an inline review comment on the issue's PR, reading the reply
+    /// body from stdin.
+    ///
+    /// The reply is prefixed with a "Claude says" header and tagged with the
+    /// authoring session, like `create-issue-comment`.
+    ReplyReviewComment {
+        /// An issue number (resolved against the current repo) or a full GitHub
+        /// issue URL. When omitted, inferred as `work-on` does.
+        issue: Option<String>,
+        /// The id of any comment in the thread to reply to (as surfaced by
+        /// `work-on`).
+        #[arg(long)]
+        id: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -201,6 +243,16 @@ fn main() -> Result<()> {
         Commands::Install { force } => install::run(force),
         Commands::ClaudeStopHook => stop_hook::run(),
         Commands::Wait { issue, timeout } => wait::run(&resolve_issue_arg(issue)?, timeout),
+        Commands::ShowPr { issue } => show_pr(&resolve_issue_arg(issue)?),
+        Commands::UpdatePr { issue, title } => {
+            update_pr(&resolve_issue_arg(issue)?, title.as_deref())
+        }
+        Commands::PrChecks { issue, log_failed } => {
+            pr_checks(&resolve_issue_arg(issue)?, log_failed)
+        }
+        Commands::ReplyReviewComment { issue, id } => {
+            reply_review_comment(&resolve_issue_arg(issue)?, id)
+        }
     }
 }
 
@@ -1049,6 +1101,102 @@ fn maybe_delete_plan(issue: &models::Issue, number: u64, issue_state: &state::Is
     }
 }
 
+/// Resolve the issue argument to the PR backing its workflow, as `(owner, repo,
+/// pr_number)`. Errors clearly when no PR exists yet (pre-plan, or `--no-branch`
+/// mode never opens one). The argument may name the PR thread itself; this maps
+/// it back to the workflow issue, like `hand_off` does.
+fn resolve_pr(issue: &str) -> Result<(String, String, u64)> {
+    let repo_ctx = github::config_repo()?;
+    let (owner, repo, thread_number) = github::resolve_issue_ref(issue, repo_ctx.as_ref())?;
+    let Some((number, issue_state)) = state::find_workflow_issue(&owner, &repo, thread_number)?
+    else {
+        bail!(
+            "no workflow state recorded for issue #{thread_number}; run \
+             `ghwf work-on {thread_number}` first."
+        );
+    };
+    match issue_state.prep.as_ref().and_then(|p| p.pr_number) {
+        Some(pr) => Ok((owner, repo, pr)),
+        None => bail!("no PR for issue #{number} yet — it is created in the prep-and-plan phase."),
+    }
+}
+
+/// Read a command's body argument from stdin.
+fn read_stdin() -> Result<String> {
+    let mut body = String::new();
+    std::io::stdin()
+        .read_to_string(&mut body)
+        .map_err(anyhow::Error::from)?;
+    Ok(body)
+}
+
+/// Print the issue's PR title, state, and body so Claude can read it before
+/// revising — the read path that pairs with `update-pr`.
+fn show_pr(issue: &str) -> Result<()> {
+    let (owner, repo, pr) = resolve_pr(issue)?;
+    let pr = github::fetch_pr(&owner, &repo, pr)?;
+    println!("{}", render::pr_overview(&pr));
+    Ok(())
+}
+
+/// Update the issue's PR body (from stdin) and/or title. The body is written
+/// verbatim — it is the PR description, not a Claude-attributed comment.
+fn update_pr(issue: &str, title: Option<&str>) -> Result<()> {
+    let stdin = read_stdin()?;
+    let body = stdin.trim();
+    let body = (!body.is_empty()).then_some(body);
+    if body.is_none() && title.is_none() {
+        bail!("nothing to update: provide a body on stdin and/or `--title`.");
+    }
+
+    let (owner, repo, pr) = resolve_pr(issue)?;
+    github::update_pr(&owner, &repo, pr, title, body)?;
+
+    let mut changed = Vec::new();
+    if title.is_some() {
+        changed.push("title");
+    }
+    if body.is_some() {
+        changed.push("body");
+    }
+    println!("Updated PR #{pr} {}.", changed.join(" and "));
+    Ok(())
+}
+
+/// Summarise the issue PR's CI checks, optionally dumping failing-job logs.
+fn pr_checks(issue: &str, log_failed: bool) -> Result<()> {
+    let (owner, repo, pr) = resolve_pr(issue)?;
+    let summary = github::pr_checks(&owner, &repo, pr)?;
+    println!("{summary}");
+    if log_failed {
+        let pr_data = github::fetch_pr(&owner, &repo, pr)?;
+        let logs = github::failed_run_logs(&owner, &repo, &pr_data.head.sha)?;
+        println!("\n{logs}");
+    }
+    Ok(())
+}
+
+/// Reply to an inline review comment on the issue's PR (body from stdin),
+/// attributed like a conversation comment.
+fn reply_review_comment(issue: &str, id: u64) -> Result<()> {
+    let user_body = read_stdin()?;
+    if user_body.trim().is_empty() {
+        bail!("no reply body provided on stdin");
+    }
+
+    // Tag the reply with the authoring session when running under Claude Code.
+    let token = match std::env::var(store::SESSION_ID_ENV) {
+        Ok(session_id) if !session_id.is_empty() => Some(store::session_token(&session_id)?),
+        _ => None,
+    };
+
+    let (owner, repo, pr) = resolve_pr(issue)?;
+    let body = render::build_comment_body(&user_body, token.as_deref());
+    let comment = github::reply_review_comment(&owner, &repo, pr, id, &body)?;
+    println!("Posted reply: {}", comment.html_url);
+    Ok(())
+}
+
 fn create_issue_comment(issue: &str) -> Result<()> {
     let mut user_body = String::new();
     std::io::stdin()
@@ -1368,10 +1516,16 @@ mod tests {
     fn pull_request(draft: bool, state: &str, merged: bool) -> PullRequest {
         PullRequest {
             number: 18,
+            title: "PR".to_string(),
             state: state.to_string(),
             merged,
             draft,
+            body: None,
             html_url: "https://github.com/o/r/pull/18".to_string(),
+            head: crate::models::Head {
+                ref_name: "branch".to_string(),
+                sha: "sha".to_string(),
+            },
         }
     }
 
