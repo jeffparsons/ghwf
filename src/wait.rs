@@ -655,9 +655,25 @@ fn feed_wake_reasons(
                     comment.user.login
                 ));
             }
+            // Only the issue changes direct mode also treats as wakes —
+            // title/body (`edited`) and state (`closed`/`reopened`).
+            // Metadata-only actions (labeled/unlabeled, assigned/unassigned,
+            // pinned, milestoned, locked, …) are noise; ghwf makes some of
+            // them itself (label sync, self-assignment) and must not wake on
+            // them.
             "IssuesEvent" if ours(&event.payload.issue) => {
-                let action = event.payload.action.as_deref().unwrap_or("changed");
-                reasons.push(format!("The issue was {action} (via the events feed)."));
+                match event.payload.action.as_deref() {
+                    Some("closed") => {
+                        reasons.push("The issue was closed (via the events feed).".to_string())
+                    }
+                    Some("reopened") => {
+                        reasons.push("The issue was reopened (via the events feed).".to_string())
+                    }
+                    Some("edited") => {
+                        reasons.push("The issue was edited (via the events feed).".to_string())
+                    }
+                    _ => continue,
+                }
             }
             // Closed concludes (or halts) the workflow; draft flips advance
             // it. Pushes (`synchronize`) and reopens must not wake.
@@ -1118,6 +1134,46 @@ mod tests {
         let reasons = feed_wake_reasons(&events, 7, None, SINCE, None);
         assert_eq!(reasons.len(), 1);
         assert!(reasons[0].contains("closed"));
+    }
+
+    fn feed_issue_event(issue: u64, action: &str, at: &str) -> FeedEvent {
+        FeedEvent {
+            kind: "IssuesEvent".to_string(),
+            created_at: at.to_string(),
+            payload: FeedPayload {
+                action: Some(action.to_string()),
+                issue: Some(FeedSubject {
+                    number: issue,
+                    merged: None,
+                }),
+                pull_request: None,
+                comment: None,
+            },
+        }
+    }
+
+    #[test]
+    fn feed_ignores_issue_metadata_actions() {
+        // ghwf's own label sync and self-assignment must not wake us.
+        let events = [
+            feed_issue_event(7, "labeled", "2026-06-06T13:00:00Z"),
+            feed_issue_event(7, "unlabeled", "2026-06-06T13:00:01Z"),
+            feed_issue_event(7, "assigned", "2026-06-06T13:00:02Z"),
+        ];
+        assert!(feed_wake_reasons(&events, 7, None, SINCE, None).is_empty());
+    }
+
+    #[test]
+    fn feed_wakes_on_issue_edited_and_reopened() {
+        let edited = [feed_issue_event(7, "edited", "2026-06-06T13:00:00Z")];
+        let reasons = feed_wake_reasons(&edited, 7, None, SINCE, None);
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("edited"));
+
+        let reopened = [feed_issue_event(7, "reopened", "2026-06-06T13:00:00Z")];
+        let reasons = feed_wake_reasons(&reopened, 7, None, SINCE, None);
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("reopened"));
     }
 
     fn posted(id: u64, at: &str) -> PostedRef {
