@@ -61,13 +61,39 @@ pub struct Label {
     pub name: String,
 }
 
+/// The issue-dependencies rollup GitHub embeds in an issue object, trimmed to
+/// the one count we act on.
+#[derive(Deserialize, Serialize, Default)]
+pub struct IssueDependenciesSummary {
+    // Count of *open* issues currently blocking this one. Closed blockers are
+    // excluded here (they live in `total_blocked_by`), so this is exactly
+    // "currently blocked".
+    #[serde(default)]
+    pub blocked_by: u64,
+}
+
+/// The sub-issues rollup GitHub embeds in an issue object, trimmed to the one
+/// count we act on.
+#[derive(Deserialize, Serialize, Default)]
+pub struct SubIssuesSummary {
+    // Number of sub-issues; > 0 marks a tracking issue.
+    #[serde(default)]
+    pub total: u64,
+}
+
 /// An entry from the REST issues *listing*, which carries fields the
 /// single-issue [`Issue`] fetch doesn't need (assignees, labels) and may
-/// describe a PR rather than an issue.
+/// describe a PR rather than an issue. The sub-issues endpoint returns the same
+/// shape, so this also models a tracking issue's children.
 #[derive(Deserialize, Serialize)]
 pub struct IssueListing {
     pub number: u64,
     pub title: String,
+    // The repo-wide listing is fetched with `?state=open`, so this is elided in
+    // most tests and defaults to empty (treated as open). It is load-bearing
+    // only for sub-issue children, which the endpoint returns in any state.
+    #[serde(default)]
+    pub state: String,
     #[serde(default)]
     pub assignees: Vec<User>,
     #[serde(default)]
@@ -75,6 +101,32 @@ pub struct IssueListing {
     // Present (with any value) exactly when the entry is a PR.
     #[serde(default)]
     pub pull_request: Option<serde_json::Value>,
+    // Both summaries are `#[serde(default)]` so repos (or GitHub versions)
+    // without the dependencies/sub-issues features parse cleanly and read as
+    // not-blocked / not-tracking.
+    #[serde(default)]
+    pub issue_dependencies_summary: IssueDependenciesSummary,
+    #[serde(default)]
+    pub sub_issues_summary: SubIssuesSummary,
+}
+
+impl IssueListing {
+    /// Blocked by at least one still-open issue.
+    pub fn is_blocked(&self) -> bool {
+        self.issue_dependencies_summary.blocked_by > 0
+    }
+
+    /// Has sub-issues — a tracking issue we shouldn't work directly.
+    pub fn is_tracking(&self) -> bool {
+        self.sub_issues_summary.total > 0
+    }
+
+    /// Open, per the listing's `state`. The repo-wide `?state=open` listing
+    /// elides it in tests, so an empty state counts as open; only closed
+    /// sub-issue children carry a non-open value here.
+    pub fn is_open(&self) -> bool {
+        self.state.is_empty() || self.state == "open"
+    }
 }
 
 /// A PR associated with a branch, from `gh pr list --json`, trimmed to the
@@ -175,7 +227,53 @@ impl ReviewComment {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReviewComment, User};
+    use super::{IssueListing, ReviewComment, User};
+
+    #[test]
+    fn listing_without_summaries_reads_as_eligible() {
+        // A repo (or GitHub version) without the dependencies/sub-issues
+        // features omits both summaries (and `state`); they default such that
+        // the issue is open, not blocked, and not a tracking issue.
+        let listing: IssueListing = serde_json::from_str(r#"{"number":1,"title":"t"}"#).unwrap();
+        assert!(listing.is_open());
+        assert!(!listing.is_blocked());
+        assert!(!listing.is_tracking());
+    }
+
+    #[test]
+    fn blocked_by_open_counts_as_blocked() {
+        let listing: IssueListing = serde_json::from_str(
+            r#"{"number":1,"title":"t","issue_dependencies_summary":{"blocked_by":1,"total_blocked_by":1}}"#,
+        )
+        .unwrap();
+        assert!(listing.is_blocked());
+    }
+
+    #[test]
+    fn closed_only_blockers_are_not_blocked() {
+        // Closed blockers live in `total_blocked_by`; `blocked_by` stays 0.
+        let listing: IssueListing = serde_json::from_str(
+            r#"{"number":1,"title":"t","issue_dependencies_summary":{"blocked_by":0,"total_blocked_by":2}}"#,
+        )
+        .unwrap();
+        assert!(!listing.is_blocked());
+    }
+
+    #[test]
+    fn sub_issues_total_marks_a_tracking_issue() {
+        let listing: IssueListing = serde_json::from_str(
+            r#"{"number":1,"title":"t","sub_issues_summary":{"total":3,"completed":1}}"#,
+        )
+        .unwrap();
+        assert!(listing.is_tracking());
+    }
+
+    #[test]
+    fn explicit_closed_state_is_not_open() {
+        let listing: IssueListing =
+            serde_json::from_str(r#"{"number":1,"title":"t","state":"closed"}"#).unwrap();
+        assert!(!listing.is_open());
+    }
 
     fn review_comment(line: Option<u64>, original_line: Option<u64>) -> ReviewComment {
         ReviewComment {

@@ -98,6 +98,17 @@ pub fn list_open_issues(owner: &str, repo: &str) -> Result<Vec<IssueListing>> {
     Ok(pages.into_iter().flatten().collect())
 }
 
+/// The sub-issues (children) of an issue, as listing entries, following
+/// pagination. The endpoint returns full issue objects — carrying state,
+/// assignees, labels, and the dependency/sub-issue summaries — so the same
+/// [`IssueListing`] shape the repo-wide listing uses applies. An issue with no
+/// sub-issues yields an empty vec.
+pub fn list_sub_issues(owner: &str, repo: &str, number: u64) -> Result<Vec<IssueListing>> {
+    let endpoint = format!("repos/{owner}/{repo}/issues/{number}/sub_issues?per_page=100");
+    let json = gh_api(&["--paginate", &endpoint])?;
+    serde_json::from_str(&json).context("failed to parse sub-issues JSON from `gh api`")
+}
+
 /// Add `login` to an issue's assignees. Adding someone already assigned is a
 /// no-op on GitHub's side, so callers needn't pre-check.
 pub fn add_assignee(owner: &str, repo: &str, number: u64, login: &str) -> Result<()> {
