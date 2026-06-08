@@ -1,3 +1,4 @@
+mod clone;
 mod collect_garbage;
 mod config;
 mod git;
@@ -18,6 +19,7 @@ mod wait;
 mod worktree;
 
 use std::io::Read;
+use std::path::PathBuf;
 
 use anyhow::{bail, Context as _, Result};
 use clap::{Parser, Subcommand};
@@ -54,6 +56,22 @@ enum Commands {
         /// Work without a dedicated branch/worktree/PR (just write the plan file).
         #[arg(long)]
         no_branch: bool,
+    },
+    /// Clone a GitHub repo into ghwf's preferred layout: a container
+    /// directory holding the bare repo (as `<name>.git`), a generated
+    /// `ghwf.toml`, and an empty worktrees directory.
+    Clone {
+        /// The repo to clone: `owner/repo` or a full GitHub URL (HTTPS or
+        /// SSH).
+        repo: String,
+        /// Directory to create (the container). Defaults to the repo name
+        /// under the current directory.
+        directory: Option<PathBuf>,
+        /// Borrow objects from this existing local clone instead of fetching
+        /// them from the network (via `git clone --reference`); the new repo
+        /// is dissociated from it afterwards, so it can be deleted safely.
+        #[arg(long)]
+        reference: Option<PathBuf>,
     },
     /// Delete branches and worktrees for PRs that have already been merged.
     ///
@@ -137,6 +155,11 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::WorkOn { issue, no_branch } => work_on(&resolve_issue_arg(issue)?, no_branch),
         Commands::Next { no_branch } => work_on(&next::pick()?.to_string(), no_branch),
+        Commands::Clone {
+            repo,
+            directory,
+            reference,
+        } => clone::run(&repo, directory.as_deref(), reference.as_deref()),
         Commands::CollectGarbage { dry_run } => collect_garbage::run(dry_run),
         Commands::CreateIssueComment { issue } => create_issue_comment(&resolve_issue_arg(issue)?),
         Commands::HandOff { issue } => hand_off(&resolve_issue_arg(issue)?),

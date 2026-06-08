@@ -113,7 +113,7 @@ pub fn config_repo() -> Result<Option<RepoRef>> {
 /// Parse `(owner, repo)` from a GitHub remote URL, handling the SSH
 /// (`git@github.com:owner/repo.git`) and HTTPS (`https://github.com/owner/repo`)
 /// forms.
-fn parse_remote_url(url: &str) -> Result<RepoRef> {
+pub fn parse_remote_url(url: &str) -> Result<RepoRef> {
     let (_, after) = url
         .trim()
         .split_once("github.com")
@@ -364,6 +364,26 @@ fn issue_endpoint(arg: &str, config_repo: Option<&RepoRef>) -> Result<String> {
         }
         _ => bail!("`{arg}` is not a github.com issue URL of the form owner/repo/issues/number"),
     }
+}
+
+/// The user's preferred git protocol for new clones: `ssh` or `https` (the
+/// default when unset or unknowable). `gh auth login` records the choice
+/// per-host, so that scope is consulted before the top-level key — matching
+/// gh's own resolution order.
+pub fn git_protocol() -> String {
+    for args in [
+        &["config", "get", "-h", "github.com", "git_protocol"][..],
+        &["config", "get", "git_protocol"][..],
+    ] {
+        if let Ok(value) = gh(args) {
+            match value.trim() {
+                "ssh" => return "ssh".to_string(),
+                "https" => return "https".to_string(),
+                _ => {}
+            }
+        }
+    }
+    "https".to_string()
 }
 
 /// Run `gh` with the given arguments and return its stdout.
