@@ -106,7 +106,9 @@ with a full direct sweep every ~5 min as the backstop.
 
 ## Configuration
 
-ghwf needs a `ghwf.toml`, found by walking up from the current directory:
+ghwf needs a `ghwf.toml`, found by walking up from the current directory.
+Run `ghwf config init` to set one up (or extend one) interactively; the
+annotated example below shows what it manages:
 
 ```toml
 # Path to the main git repo (omit or "." if the config sits at the repo root).
