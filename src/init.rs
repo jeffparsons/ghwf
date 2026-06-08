@@ -192,6 +192,29 @@ pub fn run() -> Result<()> {
         }
     }
 
+    if !doc.contains_key("permission_mode")
+        && prompt(
+            Confirm::new(
+                "Set a permission mode for launched Claude sessions? (recommended for unattended use)",
+            )
+            .with_default(true)
+            .prompt(),
+        )?
+    {
+        let mode = prompt(
+            Text::new("Permission mode (passed as `claude --permission-mode`):")
+                .with_default("auto")
+                .prompt(),
+        )?;
+        let mode = mode.trim().to_string();
+        if mode.is_empty() {
+            println!("No mode given; skipping.");
+        } else {
+            set_permission_mode(&mut doc, &mode);
+            doc_changed = true;
+        }
+    }
+
     if !doc.contains_key("labels") {
         if prompt(
             Confirm::new("Set up workflow status labels now? (creates labels in the GitHub repo)")
@@ -405,6 +428,17 @@ fn set_priority_labels(doc: &mut DocumentMut, priority_labels: &[String]) {
     );
 }
 
+/// Write the `permission_mode` key.
+fn set_permission_mode(doc: &mut DocumentMut, mode: &str) {
+    insert_with_comment(
+        doc,
+        "permission_mode",
+        toml_edit::value(mode),
+        "Permission mode for the Claude sessions ghwf launches, passed through\n\
+         as `claude --permission-mode <value>`.",
+    );
+}
+
 /// Parse the comma-separated priority-labels answer: trimmed, empties dropped.
 fn parse_priority_labels(input: &str) -> Vec<String> {
     input
@@ -433,7 +467,9 @@ fn append_line(path: &Path, line: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_priority_labels, set_essentials, set_priority_labels, PR_STUB};
+    use super::{
+        parse_priority_labels, set_essentials, set_permission_mode, set_priority_labels, PR_STUB,
+    };
     use crate::config::Config;
     use std::path::PathBuf;
     use toml_edit::DocumentMut;
@@ -494,6 +530,15 @@ pre-plan = \"a\"
         assert!(out.contains("# A section comment that must survive."));
         let reparsed: DocumentMut = out.parse().unwrap();
         assert!(reparsed.contains_key("priority_labels"));
+    }
+
+    #[test]
+    fn permission_mode_round_trips() {
+        let mut doc = DocumentMut::new();
+        set_essentials(&mut doc, None, "worktrees");
+        set_permission_mode(&mut doc, "auto");
+        let config: Config = toml::from_str(&doc.to_string()).unwrap();
+        assert_eq!(config.permission_mode.as_deref(), Some("auto"));
     }
 
     #[test]
