@@ -34,6 +34,15 @@ A command that doesn't match the current phase (or the retired generic
 `/proceed`) is consumed without advancing anything, and `work-on` reports what
 went wrong and which command applies.
 
+Claude never raises an interactive prompt to ask you something — those can't be
+answered from a phone or asynchronously, which defeats the point. When it needs
+an answer to proceed in any phase, it posts the question with
+`ghwf hand-off <issue> --question`: a hand-off that flips the issue to
+"needs you" (the `waiting-on-user` label) and waits, but — unlike an
+end-of-phase hand-off — carries no approval prompt and stays in the current
+phase, so a 👍 won't advance anything. (`ghwf create-issue-comment` remains the
+non-blocking way to post a note or status that needs no reply.)
+
 Pass `--no-branch` to skip the branch/worktree/PR entirely and just write the plan
 file — handy for trivial tasks or when you're already on a feature branch. The
 mode is recorded in the issue's state on first use (including by the
@@ -201,8 +210,10 @@ delete_plan_on_approval = true
 
 - **The `/work-on` skill**, at `<claude_dir>/skills/work-on/SKILL.md` (where
   `<claude_dir>` is `$CLAUDE_CONFIG_DIR` or `~/.claude`). It tells Claude to
-  run `ghwf work-on`, follow the phase banner, and keep the `wait`/`work-on`
-  loop going until the workflow completes or you tell it to stop.
+  run `ghwf work-on`, follow the phase banner, keep the `wait`/`work-on` loop
+  going until the workflow completes or you tell it to stop, and never raise an
+  interactive prompt — questions go to the thread via `ghwf hand-off --question`
+  instead.
 - **A Stop hook** in `<claude_dir>/settings.json`, pointing at
   `ghwf claude-stop-hook`.
 

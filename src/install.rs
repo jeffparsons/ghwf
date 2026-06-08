@@ -32,6 +32,10 @@ Run `ghwf work-on $ARGUMENTS` and follow the phase banner exactly:
 
 - Never enter Claude Code plan mode; write any plan as a file where ghwf
   tells you.
+- Never ask the user with an interactive prompt (no AskUserQuestion, and
+  don't ask in prose and stop). If you need an answer to proceed, post the
+  question with `ghwf hand-off $ARGUMENTS --question` (body from stdin) — that
+  flips the issue to "needs you" — then `ghwf wait $ARGUMENTS` for the reply.
 - Post questions and clarifications with `ghwf create-issue-comment
   $ARGUMENTS`; when a phase's work is done, hand off with `ghwf hand-off
   $ARGUMENTS` (body from stdin) — ghwf appends the approval prompt itself,
@@ -210,6 +214,14 @@ mod tests {
     #[test]
     fn skill_content_carries_the_marker() {
         assert!(SKILL_CONTENT.contains(SKILL_MARKER));
+    }
+
+    #[test]
+    fn skill_content_routes_questions_to_github() {
+        // The skill must steer Claude off interactive prompts toward a posted
+        // blocking question (see issue #43).
+        assert!(SKILL_CONTENT.contains("--question"));
+        assert!(SKILL_CONTENT.contains("AskUserQuestion"));
     }
 
     #[test]

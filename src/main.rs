@@ -120,6 +120,13 @@ enum Commands {
         /// An issue number (resolved against the current repo) or a full GitHub
         /// issue URL. When omitted, inferred as `work-on` does.
         issue: Option<String>,
+        /// Post a blocking question rather than an end-of-phase hand-off:
+        /// flips the workflow to waiting-on-user (so the needs-you label is
+        /// applied) but stays in the current phase — no advance prompt, and a
+        /// 👍 will not advance the workflow. Use this instead of an
+        /// interactive prompt whenever you need an answer from the user.
+        #[arg(long)]
+        question: bool,
     },
     /// Configure ghwf: subcommands that create or extend `ghwf.toml`.
     Config {
@@ -192,7 +199,7 @@ fn main() -> Result<()> {
         } => clone::run(&repo, directory.as_deref(), reference.as_deref()),
         Commands::CollectGarbage { dry_run } => collect_garbage::run(dry_run),
         Commands::CreateIssueComment { issue } => create_issue_comment(&resolve_issue_arg(issue)?),
-        Commands::HandOff { issue } => hand_off(&resolve_issue_arg(issue)?),
+        Commands::HandOff { issue, question } => hand_off(&resolve_issue_arg(issue)?, question),
         Commands::Config { command } => match command {
             ConfigCommands::Init => init::run(),
             ConfigCommands::Labels => labels::configure(),
@@ -1081,7 +1088,12 @@ fn create_issue_comment(issue: &str) -> Result<()> {
 /// next-step prompt appended by ghwf, flip the workflow to waiting-on-user,
 /// and sync labels. The prompt makes the hand-off the thread's 👍 target
 /// where an approval command applies.
-fn hand_off(issue: &str) -> Result<()> {
+///
+/// In `question` mode the comment is a blocking question rather than an
+/// end-of-phase hand-off: the body is posted as-is (no advance prompt) and no
+/// 👍-advances-the-phase watch is armed, but attention still flips to the user
+/// so the needs-you label is applied while Claude waits for an answer.
+fn hand_off(issue: &str, question: bool) -> Result<()> {
     let mut user_body = String::new();
     std::io::stdin()
         .read_to_string(&mut user_body)
@@ -1109,22 +1121,31 @@ fn hand_off(issue: &str) -> Result<()> {
     }
     let phase = issue_state.phase;
     let no_branch = issue_state.prep.as_ref().is_some_and(|p| p.no_branch);
-    let Some(prompt) = render::hand_off_prompt(phase, no_branch) else {
+    // A normal hand-off needs a phase advance prompt; the review phase has
+    // none (the PR is already with the user), so it can't be handed off. A
+    // question carries no prompt, so it's allowed in any phase.
+    let prompt = render::hand_off_prompt(phase, no_branch);
+    if !question && prompt.is_none() {
         bail!(
             "the workflow for issue #{number} is in the review phase — the PR is \
              already with the user; there is nothing to hand off."
         );
-    };
+    }
 
     // Tag the comment with the authoring session when running under Claude Code.
     let token = match std::env::var(store::SESSION_ID_ENV) {
         Ok(session_id) if !session_id.is_empty() => Some(store::session_token(&session_id)?),
         _ => None,
     };
-    let full_body = render::build_comment_body(
-        &format!("{}\n\n{prompt}", user_body.trim()),
-        token.as_deref(),
-    );
+    // A question is posted as-is; an end-of-phase hand-off gets the advance
+    // prompt appended so the comment is its own 👍 target.
+    let full_body = match prompt {
+        Some(prompt) if !question => render::build_comment_body(
+            &format!("{}\n\n{prompt}", user_body.trim()),
+            token.as_deref(),
+        ),
+        _ => render::build_comment_body(user_body.trim(), token.as_deref()),
+    };
 
     // Full comment on the phase's primary thread; when a PR exists, the other
     // thread gets a one-line stub linking to it, best-effort.
@@ -1142,8 +1163,9 @@ fn hand_off(issue: &str) -> Result<()> {
         } else {
             (pr, "PR", "issue")
         };
+        let noun = if question { "Question" } else { "Hand-off" };
         let stub = render::build_status_comment_body(&format!(
-            "Hand-off posted on the {primary_noun}: {}",
+            "{noun} posted on the {primary_noun}: {}",
             comment.html_url
         ));
         if let Err(err) =
@@ -1160,7 +1182,9 @@ fn hand_off(issue: &str) -> Result<()> {
         id: comment.id,
         created_at: comment.created_at.clone(),
     });
-    if state::parse_prompted_directive(&full_body).is_some() {
+    // A question never advances the phase, so it arms no 👍 watch even if its
+    // body happens to mention an approval command.
+    if !question && state::parse_prompted_directive(&full_body).is_some() {
         if let Some(wait) = issue_state.wait.as_mut() {
             let thread = if primary_is_pr { "pr" } else { "issue" };
             wait.reaction_watches.insert(

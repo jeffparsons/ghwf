@@ -154,8 +154,9 @@ fn branch_body(
          complete and ready for human review, hand off with `ghwf hand-off {number}` (body \
          from stdin): a comment summarising the change. ghwf appends the next-step \
          instructions (the user marks the draft PR ready for review) — do not write \
-         them yourself.\n\n{}",
+         them yourself.\n\n{}\n\n{}",
         pr_maintenance_instruction(pr_instructions),
+        crate::render::question_instruction(number),
         crate::render::wait_instruction(number)
     )
 }
@@ -165,7 +166,8 @@ fn no_branch_body(number: u64, plan_rel: &str) -> String {
         "Implement (--no-branch) — code the change per `{plan_rel}`.\n\n\
          You are managing the branch and commits yourself; there is no ghwf worktree or PR. \
          When the work is complete, hand off with `ghwf hand-off {number}` (body from \
-         stdin).\n\n{}",
+         stdin).\n\n{}\n\n{}",
+        crate::render::question_instruction(number),
         crate::render::wait_instruction(number)
     )
 }
@@ -175,8 +177,9 @@ fn review_body(pr_url: &str, number: u64, pr_instructions: Option<&Path>) -> Str
         "Review — awaiting human review.\n\n\
          The PR is ready for review: {pr_url}\n\n\
          Nothing more is needed from you unless review feedback arrives; it will appear below \
-         on future `ghwf work-on {number}` runs. {}\n\n{}",
+         on future `ghwf work-on {number}` runs. {}\n\n{}\n\n{}",
         pr_maintenance_instruction(pr_instructions),
+        crate::render::question_instruction(number),
         crate::render::wait_instruction(number)
     )
 }
@@ -185,7 +188,8 @@ fn review_no_branch_body(number: u64) -> String {
     format!(
         "Review — the work is complete.\n\n\
          There is no ghwf PR to mark ready (this issue was worked with --no-branch); hand off \
-         for human review however you normally would.\n\n{}",
+         for human review however you normally would.\n\n{}\n\n{}",
+        crate::render::question_instruction(number),
         crate::render::wait_instruction(number)
     )
 }
@@ -246,6 +250,21 @@ mod tests {
             review_no_branch_body(7),
         ] {
             assert!(body.contains("`ghwf wait 7`"), "missing in: {body}");
+        }
+    }
+
+    #[test]
+    fn waiting_bodies_route_questions_off_interactive_prompts() {
+        for body in [
+            branch_body("/wt", "plans/7-x.md", None, 7, None),
+            no_branch_body(7, "plans/7-x.md"),
+            review_body("https://github.com/o/r/pull/18", 7, None),
+            review_no_branch_body(7),
+        ] {
+            assert!(
+                body.contains("`ghwf hand-off 7 --question`"),
+                "missing in: {body}"
+            );
         }
     }
 

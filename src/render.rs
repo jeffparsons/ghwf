@@ -101,6 +101,17 @@ pub fn strip_ghwf_marker(body: &str) -> String {
     }
 }
 
+/// One-line reminder, shared across phase banners, to route a question that
+/// blocks progress to the thread rather than an interactive prompt.
+pub fn question_instruction(number: u64) -> String {
+    format!(
+        "If you need an answer from the user to proceed, never use an interactive \
+         prompt (no AskUserQuestion, and don't ask in prose and stop): post the \
+         question with `ghwf hand-off {number} --question` (body from stdin) — that \
+         flips the issue to \"needs you\" — then `ghwf wait {number}` for the reply."
+    )
+}
+
 /// How Claude should wait for the next human response, appended to every
 /// banner body that ends in a waiting state.
 pub fn wait_instruction(number: u64) -> String {
@@ -141,7 +152,10 @@ pub fn pre_plan_body(number: u64) -> String {
     format!(
         "Pre-plan — gathering the information needed to write a plan.\n\n\
          Discuss on the issue itself. Post questions and clarifications as comments with \
-         `ghwf create-issue-comment {number}`. When you have enough information, hand off \
+         `ghwf create-issue-comment {number}`; if an answer is needed before you can \
+         proceed, use `ghwf hand-off {number} --question` instead so the issue flips to \
+         \"needs you\". Either way, never raise an interactive prompt (no AskUserQuestion). \
+         When you have enough information, hand off \
          with `ghwf hand-off {number}` (body from stdin): a comment that summarises your \
          understanding and clearly states you are ready to write a plan. ghwf appends the \
          approval prompt itself — do not write one.\n\n\
@@ -662,6 +676,21 @@ mod tests {
         let body = super::pre_plan_body(7);
         assert!(body.contains("`ghwf wait 7`"));
         assert!(body.contains("`ghwf work-on 7`"));
+    }
+
+    #[test]
+    fn question_instruction_names_the_command_and_number() {
+        let out = super::question_instruction(7);
+        assert!(out.contains("`ghwf hand-off 7 --question`"));
+        assert!(out.contains("`ghwf wait 7`"));
+        assert!(out.contains("AskUserQuestion"));
+    }
+
+    #[test]
+    fn pre_plan_body_steers_questions_off_interactive_prompts() {
+        let body = super::pre_plan_body(7);
+        assert!(body.contains("`ghwf hand-off 7 --question`"));
+        assert!(body.contains("AskUserQuestion"));
     }
 
     #[test]
