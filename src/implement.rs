@@ -2,8 +2,9 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use crate::git;
 use crate::models::Issue;
-use crate::state::{self, IssueState};
+use crate::state::{self, IssueState, PrepState};
 
 /// Build the implement-phase banner: where the work lives and what to do next.
 ///
@@ -75,6 +76,44 @@ pub fn review(
 
     let pr_url = format!("https://github.com/{owner}/{repo}/pull/{pr}");
     review_body(&pr_url, number, pr_instructions)
+}
+
+/// Detect whether the open PR's branch conflicts with the freshly-fetched
+/// base. Returns `Some(base_branch_name)` when it does.
+///
+/// Best-effort: any failure (no worktree on disk, offline, a git error) logs a
+/// warning and returns `None` — conflict detection must never break a
+/// `work-on` run. Detection is local: a `git fetch` of the base ref plus an
+/// in-memory `git merge-tree`, with no GitHub API calls.
+///
+/// The caller gates this on the workflow having an open PR (so `pr_number` is
+/// expected); here we re-check the branch-mode preconditions defensively.
+pub fn detect_conflict(prep: &PrepState) -> Option<String> {
+    if prep.no_branch || prep.pr_number.is_none() {
+        return None;
+    }
+    let worktree = prep.worktree_path.as_ref()?;
+    if !worktree.is_dir() {
+        return None;
+    }
+    match try_detect_conflict(worktree) {
+        Ok(result) => result,
+        Err(err) => {
+            eprintln!("warning: could not check for merge conflicts: {err:#}");
+            None
+        }
+    }
+}
+
+/// The fallible mechanics of [`detect_conflict`].
+fn try_detect_conflict(worktree: &Path) -> Result<Option<String>> {
+    git::fetch(worktree)?;
+    let base = git::default_remote_branch(worktree)?;
+    if git::would_conflict(worktree, &format!("origin/{base}"))? {
+        Ok(Some(base))
+    } else {
+        Ok(None)
+    }
 }
 
 /// The "keep the PR title/body current" paragraph, pointing at the project's
@@ -160,8 +199,43 @@ fn no_prep_body(number: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{branch_body, no_branch_body, review_body, review_no_branch_body};
+    use super::{branch_body, detect_conflict, no_branch_body, review_body, review_no_branch_body};
+    use crate::state::PrepState;
     use std::path::Path;
+
+    #[test]
+    fn detect_conflict_skips_when_preconditions_unmet() {
+        // --no-branch: nothing to check.
+        let no_branch = PrepState {
+            no_branch: true,
+            pr_number: Some(1),
+            worktree_path: Some("/wt".into()),
+            ..Default::default()
+        };
+        assert!(detect_conflict(&no_branch).is_none());
+
+        // No PR recorded yet.
+        let no_pr = PrepState {
+            worktree_path: Some("/wt".into()),
+            ..Default::default()
+        };
+        assert!(detect_conflict(&no_pr).is_none());
+
+        // PR recorded but no worktree path.
+        let no_worktree = PrepState {
+            pr_number: Some(1),
+            ..Default::default()
+        };
+        assert!(detect_conflict(&no_worktree).is_none());
+
+        // Worktree path that doesn't exist on disk: skipped, not an error.
+        let missing = PrepState {
+            pr_number: Some(1),
+            worktree_path: Some("/nonexistent/ghwf/worktree".into()),
+            ..Default::default()
+        };
+        assert!(detect_conflict(&missing).is_none());
+    }
 
     #[test]
     fn waiting_bodies_include_wait_instruction() {
