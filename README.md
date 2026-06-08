@@ -123,6 +123,11 @@ priority_labels = ["urgent", "soon"]
 # updating; when it doesn't, a brief generic instruction applies instead. The
 # file is free-form prose and may itself refer to repo-versioned templates.
 pr_instructions = "pull-request.md"
+# Permission mode for the Claude sessions ghwf launches, passed through as
+# `claude --permission-mode <value>` (optional; omit for Claude's default
+# prompting behaviour). "auto" is recommended for unattended use — without
+# it, sessions quickly stall on permission prompts.
+permission_mode = "auto"
 ```
 
 ## Installing the Claude Code integration
