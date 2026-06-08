@@ -10,6 +10,7 @@ mod labels;
 mod launch;
 mod models;
 mod next;
+mod plan_cleanup;
 mod prep;
 mod render;
 mod seen;
@@ -315,11 +316,29 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     // so no phase work runs (in particular review's draft→ready flip, which
     // would fail against a merged or closed PR).
     let phase = issue_state.phase;
+    let located = config::find()?;
     // The project's PR instructions file, when one exists; the implement and
     // review banners point Claude at it.
-    let pr_instructions = config::find()?
+    let pr_instructions = located
+        .as_ref()
         .map(|located| located.pr_instructions_path())
         .filter(|path| path.is_file());
+
+    // If configured, erase the plan commit now that the implementation has been
+    // approved — i.e. the draft PR was just marked ready for review this run
+    // (advance_on_pr_ready pushed the transition). It fires at most once: on
+    // later runs the phase is already Review and the transition won't recur.
+    let delete_plan_on_approval = located
+        .as_ref()
+        .is_some_and(|located| located.config.delete_plan_on_approval);
+    if delete_plan_on_approval
+        && outcome
+            .transitions
+            .iter()
+            .any(|transition| matches!(transition.trigger, render::Trigger::PrReady))
+    {
+        maybe_delete_plan(&issue_data, number, &issue_state);
+    }
     let body = match issue_state.pr_outcome {
         Some(pr_outcome) => render::concluded_body(
             pr_outcome,
@@ -998,6 +1017,36 @@ fn advance_on_pr_ready(
         to: state::Phase::Review,
         trigger: render::Trigger::PrReady,
     });
+}
+
+/// Erase the plan commit from the branch's history, then force-push, when the
+/// implementation has just been approved and `delete_plan_on_approval` is set.
+/// Branch-mode only; every outcome is a printed note or a warning, never a hard
+/// failure (the cleanup must not break the workflow).
+fn maybe_delete_plan(issue: &models::Issue, number: u64, issue_state: &state::IssueState) {
+    let Some(prep) = issue_state.prep.as_ref() else {
+        return;
+    };
+    // No ghwf-managed commits exist in --no-branch mode.
+    if prep.no_branch {
+        return;
+    }
+    let (Some(worktree), Some(branch)) = (prep.worktree_path.as_ref(), prep.branch.as_ref()) else {
+        return;
+    };
+    let (_, slug) = state::branch_and_slug(number, &issue.title);
+    let plan_rel = format!("plans/{number}-{slug}.md");
+    match plan_cleanup::remove_plan_commit(worktree, branch, &plan_rel) {
+        Ok(plan_cleanup::Removal::Removed) => {
+            println!("Removed the plan commit (`{plan_rel}`) from `{branch}` and force-pushed.");
+        }
+        Ok(plan_cleanup::Removal::Skipped(reason)) => {
+            eprintln!("warning: not removing the plan commit: {reason}.");
+        }
+        Err(err) => {
+            eprintln!("warning: failed to remove the plan commit: {err:#}");
+        }
+    }
 }
 
 fn create_issue_comment(issue: &str) -> Result<()> {

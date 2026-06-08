@@ -33,6 +33,13 @@ pub struct Config {
     /// `--permission-mode <value>` (e.g. "auto"). Absent means Claude's
     /// default prompting behaviour.
     pub permission_mode: Option<String>,
+    /// When true, ghwf rewrites the plan commit out of the branch's history once
+    /// the implementation is approved (the draft PR is marked ready for review),
+    /// then force-pushes the branch. For repos that don't want Claude's plans
+    /// committed. A no-op in `--no-branch` mode, and skipped (with a warning)
+    /// when the rewrite can't be done safely.
+    #[serde(default)]
+    pub delete_plan_on_approval: bool,
 }
 
 /// The `[labels]` section: one GitHub label name per phase and per attention
@@ -225,6 +232,25 @@ mod tests {
         // Pre-existing configs without the key keep loading.
         let config: Config = toml::from_str(r#"worktrees_dir = "worktrees""#).unwrap();
         assert!(config.permission_mode.is_none());
+    }
+
+    #[test]
+    fn delete_plan_on_approval_parses() {
+        let config: Config = toml::from_str(
+            r#"
+            worktrees_dir = "worktrees"
+            delete_plan_on_approval = true
+            "#,
+        )
+        .unwrap();
+        assert!(config.delete_plan_on_approval);
+    }
+
+    #[test]
+    fn delete_plan_on_approval_defaults_to_false() {
+        // Pre-existing configs without the key keep loading.
+        let config: Config = toml::from_str(r#"worktrees_dir = "worktrees""#).unwrap();
+        assert!(!config.delete_plan_on_approval);
     }
 
     #[test]

@@ -215,6 +215,20 @@ pub fn run() -> Result<()> {
         }
     }
 
+    if !doc.contains_key("delete_plan_on_approval")
+        && prompt(
+            Confirm::new(
+                "Delete the plan commit from history once implementation is approved? \
+                 (force-pushes the branch)",
+            )
+            .with_default(false)
+            .prompt(),
+        )?
+    {
+        set_delete_plan_on_approval(&mut doc);
+        doc_changed = true;
+    }
+
     if !doc.contains_key("labels") {
         if prompt(
             Confirm::new("Set up workflow status labels now? (creates labels in the GitHub repo)")
@@ -439,6 +453,20 @@ fn set_permission_mode(doc: &mut DocumentMut, mode: &str) {
     );
 }
 
+/// Write the `delete_plan_on_approval` key (only ever set to `true` — the
+/// wizard offers it only when absent, and the default is `false`).
+fn set_delete_plan_on_approval(doc: &mut DocumentMut) {
+    insert_with_comment(
+        doc,
+        "delete_plan_on_approval",
+        toml_edit::value(true),
+        "When true, ghwf rewrites the plan commit out of the branch's history\n\
+         once the implementation is approved (the draft PR is marked ready for\n\
+         review), then force-pushes the branch. Skipped with a warning when it\n\
+         can't be done safely; a no-op in --no-branch mode.",
+    );
+}
+
 /// Parse the comma-separated priority-labels answer: trimmed, empties dropped.
 fn parse_priority_labels(input: &str) -> Vec<String> {
     input
@@ -468,7 +496,8 @@ fn append_line(path: &Path, line: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_priority_labels, set_essentials, set_permission_mode, set_priority_labels, PR_STUB,
+        parse_priority_labels, set_delete_plan_on_approval, set_essentials, set_permission_mode,
+        set_priority_labels, PR_STUB,
     };
     use crate::config::Config;
     use std::path::PathBuf;
@@ -539,6 +568,15 @@ pre-plan = \"a\"
         set_permission_mode(&mut doc, "auto");
         let config: Config = toml::from_str(&doc.to_string()).unwrap();
         assert_eq!(config.permission_mode.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn delete_plan_on_approval_round_trips() {
+        let mut doc = DocumentMut::new();
+        set_essentials(&mut doc, None, "worktrees");
+        set_delete_plan_on_approval(&mut doc);
+        let config: Config = toml::from_str(&doc.to_string()).unwrap();
+        assert!(config.delete_plan_on_approval);
     }
 
     #[test]
