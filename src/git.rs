@@ -230,6 +230,49 @@ pub fn list_remote_branches(repo: &Path) -> Result<Vec<String>> {
     .collect())
 }
 
+/// The default branch as `dir`'s remote knows it, derived from the
+/// `origin/HEAD` symref (e.g. `main`). Local-only: no network, no GitHub API.
+/// Every ghwf-managed clone has `origin/HEAD` set (`setup_conventional_remote`
+/// runs `remote set-head origin --auto`).
+pub fn default_remote_branch(dir: &Path) -> Result<String> {
+    let head = git(dir, &["rev-parse", "--abbrev-ref", "origin/HEAD"])?;
+    let head = head.trim();
+    head.strip_prefix("origin/")
+        .map(str::to_string)
+        .with_context(|| format!("unexpected origin/HEAD form: `{head}`"))
+}
+
+/// Whether merging `base` into the commit at `dir`'s HEAD would conflict. A
+/// read-only trial merge: `git merge-tree --write-tree` writes a tree object
+/// but never touches the index or working tree.
+pub fn would_conflict(dir: &Path, base: &str) -> Result<bool> {
+    // merge-tree exits 1 for conflicts *and* for a rev that doesn't resolve
+    // (printing nothing to stdout), so pre-validate both revs to disambiguate.
+    if rev_parse_ok(dir, "HEAD").is_none() {
+        bail!("HEAD does not resolve in {}", dir.display());
+    }
+    if rev_parse_ok(dir, base).is_none() {
+        bail!("`{base}` does not resolve in {}", dir.display());
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["merge-tree", "--write-tree", "HEAD", base])
+        .output()
+        .context("failed to run `git merge-tree` — is git installed and on PATH?")?;
+    match output.status.code() {
+        // A clean merge.
+        Some(0) => Ok(false),
+        // Conflicts: merge-tree prints the conflicted tree OID and entries to
+        // stdout. Empty stdout on exit 1 means an error, not a conflict.
+        Some(1) if !output.stdout.is_empty() => Ok(true),
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("`git merge-tree` failed:\n{}", stderr.trim());
+        }
+    }
+}
+
 /// The commit a rev points at, or `None` when it doesn't resolve.
 pub fn rev_parse_ok(repo: &Path, rev: &str) -> Option<String> {
     git(repo, &["rev-parse", "--verify", "--quiet", rev])
@@ -273,9 +316,9 @@ pub fn remove_worktree(repo: &Path, path: &Path) -> Result<()> {
 #[cfg(test)]
 pub mod tests {
     use super::{
-        delete_local_branch, delete_remote_branch, fetch, has_untracked_files, is_ancestor,
-        is_tree_clean, list_local_branches, list_remote_branches, merge_ff_only,
-        parse_worktree_list, remove_worktree, rev_parse_ok,
+        default_remote_branch, delete_local_branch, delete_remote_branch, fetch,
+        has_untracked_files, is_ancestor, is_tree_clean, list_local_branches, list_remote_branches,
+        merge_ff_only, parse_worktree_list, remove_worktree, rev_parse_ok, would_conflict,
     };
     use std::path::{Path, PathBuf};
 
@@ -514,6 +557,64 @@ pub mod tests {
         run_git(&root, &["add", "other.txt"]);
         run_git(&root, &["commit", "-m", "diverge"]);
         assert!(merge_ff_only(&root, "main").is_err());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn would_conflict_detects_conflicts_and_clean_merges() {
+        let root = scratch("conflict");
+        init_repo(&root);
+
+        // A branch that edits the same line main also edits: a conflict.
+        run_git(&root, &["checkout", "-b", "feat"]);
+        std::fs::write(root.join("file.txt"), "feat\n").unwrap();
+        run_git(&root, &["commit", "-am", "feat edit"]);
+        run_git(&root, &["checkout", "main"]);
+        std::fs::write(root.join("file.txt"), "main\n").unwrap();
+        run_git(&root, &["commit", "-am", "main edit"]);
+
+        // HEAD is `main`; merging `feat` in conflicts.
+        assert!(would_conflict(&root, "feat").unwrap());
+
+        // A branch touching only a different file merges cleanly.
+        run_git(&root, &["checkout", "-b", "clean", "main"]);
+        std::fs::write(root.join("other.txt"), "x\n").unwrap();
+        run_git(&root, &["add", "other.txt"]);
+        run_git(&root, &["commit", "-m", "add other"]);
+        run_git(&root, &["checkout", "main"]);
+        assert!(!would_conflict(&root, "clean").unwrap());
+
+        // A non-resolving base is an error, not a silent "no conflict".
+        assert!(would_conflict(&root, "nonexistent").is_err());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn default_remote_branch_reads_origin_head() {
+        let root = scratch("origin-head");
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        run_git(&origin, &["init", "--bare", "-b", "main"]);
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        run_git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        run_git(&repo, &["push", "origin", "main"]);
+        run_git(&repo, &["fetch", "origin"]);
+        run_git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        assert_eq!(default_remote_branch(&repo).unwrap(), "main");
 
         std::fs::remove_dir_all(&root).unwrap();
     }

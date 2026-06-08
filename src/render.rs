@@ -151,6 +151,22 @@ pub fn pre_plan_body(number: u64) -> String {
     )
 }
 
+/// The conflict-resolution block shown above the phase body when the branch
+/// conflicts with the base. An instruction to act now (auto-resolve), not a
+/// workflow transition — so it leads the banner but is never posted to a
+/// thread, and clears itself once the merge is pushed.
+pub fn conflict_notice(base: &str, number: u64) -> String {
+    format!(
+        "⚠️ Merge conflict with `origin/{base}`\n\n\
+         The base branch has moved on and the branch for issue #{number} now conflicts \
+         with it. Resolve this before other work:\n\n\
+         1. In the worktree, run `git merge origin/{base}`.\n\
+         2. Resolve the conflicted files, then `git add` them and commit the merge.\n\
+         3. Push the branch (the PR updates automatically).\n\n\
+         Then carry on below."
+    )
+}
+
 /// A phase transition that fired this run, for banner reporting.
 pub struct Transition {
     pub from: Phase,
@@ -583,13 +599,21 @@ fn blockquote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_comment_body, build_status_comment_body, extract_marker, hand_off_prompt,
-        hidden_from_digest, render_phase_banner, render_status_comment, render_status_stub,
-        render_work_on, status_primary_is_pr, strip_ghwf_marker, CommentView, DirectiveNote,
-        Marker, NoteKind, ReviewCommentView, Transition, Trigger,
+        build_comment_body, build_status_comment_body, conflict_notice, extract_marker,
+        hand_off_prompt, hidden_from_digest, render_phase_banner, render_status_comment,
+        render_status_stub, render_work_on, status_primary_is_pr, strip_ghwf_marker, CommentView,
+        DirectiveNote, Marker, NoteKind, ReviewCommentView, Transition, Trigger,
     };
     use crate::models::{Comment, Issue, ReviewComment, User};
     use crate::state::{Directive, Phase, PrOutcome};
+
+    #[test]
+    fn conflict_notice_names_base_command_and_issue() {
+        let notice = conflict_notice("main", 45);
+        assert!(notice.contains("origin/main"));
+        assert!(notice.contains("git merge origin/main"));
+        assert!(notice.contains("#45"));
+    }
 
     fn note(kind: NoteKind, command: &'static str, phase_at: Phase) -> DirectiveNote {
         DirectiveNote {
