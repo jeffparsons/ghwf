@@ -151,9 +151,17 @@ implement and review phases, so it can act on the PR without a permission prompt
 - `ghwf reply-review-comment [issue] --id <comment-id>` — reply (body from stdin)
   to an inline review comment thread; the comment ids are the ones `work-on`
   surfaces.
+- `ghwf create-issue --title "<title>" [issue] [--label <name>]… [--no-block]` —
+  file a follow-up issue (body from stdin) for a deferral or discovery. By
+  default it's marked blocked by the originating issue (the optional `[issue]`,
+  else inferred like the other commands): the `blocked_label` is set atomically
+  in the create payload so a worker can't grab the follow-up before it's marked,
+  and the native GitHub `blocked_by` dependency is set right after. `--no-block`
+  files a standalone issue; `--label` attaches extra labels. The new issue is
+  created unassigned and prints as JSON.
 
-Each resolves the issue argument the same way the other commands do, and errors
-clearly when the issue has no PR yet.
+The PR commands each resolve the issue argument the same way the other commands
+do, and error clearly when the issue has no PR yet.
 
 ## Setting up a project
 
@@ -202,6 +210,11 @@ worktrees_dir = "worktrees"
 # Labels marking an issue as urgent, most urgent first (optional; used by
 # `ghwf next`).
 priority_labels = ["urgent", "soon"]
+# Label `ghwf create-issue` applies to a follow-up to mark it blocked by the
+# issue it was filed from (optional; defaults to `blocked`). It's set in the
+# create payload so the follow-up carries it from the moment it exists, with the
+# native GitHub `blocked_by` dependency set right after.
+blocked_label = "blocked"
 # Markdown file of instructions for writing PR titles and bodies (optional;
 # defaults to `pull-request.md` next to this config). When the file exists,
 # the implement- and review-phase instructions point Claude at it and tell it

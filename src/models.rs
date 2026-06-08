@@ -9,6 +9,9 @@ pub struct User {
 /// A GitHub issue (or PR, for the fields shared with issues).
 #[derive(Deserialize, Serialize)]
 pub struct Issue {
+    // The REST database id (distinct from `number`). The issue-dependencies API
+    // identifies a blocker by this id, not its number.
+    pub id: u64,
     pub number: u64,
     pub title: String,
     pub state: String,

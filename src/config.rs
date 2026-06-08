@@ -40,6 +40,19 @@ pub struct Config {
     /// when the rewrite can't be done safely.
     #[serde(default)]
     pub delete_plan_on_approval: bool,
+    /// Label `ghwf create-issue` applies to a follow-up to mark it blocked by
+    /// the issue it was filed from. It's included in the create payload so the
+    /// guard is on the issue from the moment it exists (no window for a worker
+    /// to grab it unblocked), with the native `blocked_by` dependency set right
+    /// after as the GitHub-UI truth. Defaults to `blocked`.
+    #[serde(default = "default_blocked_label")]
+    pub blocked_label: String,
+}
+
+/// The default name for [`Config::blocked_label`], also used by callers that
+/// run without a `ghwf.toml` (where there is no `Config` to read it from).
+pub fn default_blocked_label() -> String {
+    "blocked".to_string()
 }
 
 /// The `[labels]` section: one GitHub label name per phase and per attention
@@ -304,6 +317,25 @@ mod tests {
             "#,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn blocked_label_parses() {
+        let config: Config = toml::from_str(
+            r#"
+            worktrees_dir = "worktrees"
+            blocked_label = "needs-unblock"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.blocked_label, "needs-unblock");
+    }
+
+    #[test]
+    fn blocked_label_defaults_to_blocked() {
+        // Pre-existing configs without the key keep loading and get the default.
+        let config: Config = toml::from_str(r#"worktrees_dir = "worktrees""#).unwrap();
+        assert_eq!(config.blocked_label, "blocked");
     }
 
     #[test]
