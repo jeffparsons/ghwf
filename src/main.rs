@@ -262,6 +262,11 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     // so no phase work runs (in particular review's draft→ready flip, which
     // would fail against a merged or closed PR).
     let phase = issue_state.phase;
+    // The project's PR instructions file, when one exists; the implement and
+    // review banners point Claude at it.
+    let pr_instructions = config::find()?
+        .map(|located| located.pr_instructions_path())
+        .filter(|path| path.is_file());
     let body = match issue_state.pr_outcome {
         Some(pr_outcome) => render::concluded_body(
             pr_outcome,
@@ -294,10 +299,21 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
                     &mut issue_state,
                 )?
             }
-            state::Phase::Implement => {
-                implement::run(&issue_data, &owner, &repo, number, &issue_state)?
-            }
-            state::Phase::Review => implement::review(&owner, &repo, number, &issue_state),
+            state::Phase::Implement => implement::run(
+                &issue_data,
+                &owner,
+                &repo,
+                number,
+                &issue_state,
+                pr_instructions.as_deref(),
+            )?,
+            state::Phase::Review => implement::review(
+                &owner,
+                &repo,
+                number,
+                &issue_state,
+                pr_instructions.as_deref(),
+            ),
         },
     };
 

@@ -8,6 +8,9 @@ use crate::state::{Attention, Phase};
 /// Name of the config file ghwf walks up the directory tree to find.
 const CONFIG_FILE: &str = "ghwf.toml";
 
+/// Default name of the PR instructions file, next to the config.
+const PR_INSTRUCTIONS_FILE: &str = "pull-request.md";
+
 /// Contents of a `ghwf.toml`. Paths are relative to the file's own directory.
 #[derive(Deserialize)]
 pub struct Config {
@@ -19,6 +22,9 @@ pub struct Config {
     /// prefers issues carrying a label earlier in this list.
     #[serde(default)]
     pub priority_labels: Vec<String>,
+    /// Path to a markdown file of instructions for writing PR titles and
+    /// bodies. Defaults to `pull-request.md` next to the config.
+    pub pr_instructions: Option<PathBuf>,
     /// Workflow status labels, mirrored onto the issue and PR as the workflow
     /// advances. Absent means the feature is off; `ghwf config labels`
     /// bootstraps the section.
@@ -112,6 +118,14 @@ impl Located {
     pub fn worktrees_dir_path(&self) -> PathBuf {
         self.dir.join(&self.config.worktrees_dir)
     }
+
+    /// Absolute path to the PR instructions file (which may not exist).
+    pub fn pr_instructions_path(&self) -> PathBuf {
+        match &self.config.pr_instructions {
+            Some(p) => self.dir.join(p),
+            None => self.dir.join(PR_INSTRUCTIONS_FILE),
+        }
+    }
 }
 
 /// Walk up from the current directory looking for a `ghwf.toml`, returning its
@@ -165,7 +179,8 @@ pub fn require() -> Result<Located> {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, Located};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn priority_labels_parse() {
@@ -238,5 +253,38 @@ mod tests {
             "#,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn pr_instructions_resolves_relative_to_config_dir() {
+        let config: Config = toml::from_str(
+            r#"
+            worktrees_dir = "worktrees"
+            pr_instructions = "docs/pr.md"
+            "#,
+        )
+        .unwrap();
+        let located = Located {
+            dir: PathBuf::from("/base"),
+            config,
+        };
+        assert_eq!(
+            located.pr_instructions_path(),
+            Path::new("/base/docs/pr.md")
+        );
+    }
+
+    #[test]
+    fn pr_instructions_defaults_next_to_config() {
+        // Pre-existing configs without the key keep loading and get the default.
+        let config: Config = toml::from_str(r#"worktrees_dir = "worktrees""#).unwrap();
+        let located = Located {
+            dir: PathBuf::from("/base"),
+            config,
+        };
+        assert_eq!(
+            located.pr_instructions_path(),
+            Path::new("/base/pull-request.md")
+        );
     }
 }
