@@ -128,6 +128,32 @@ enum Commands {
         #[arg(long)]
         question: bool,
     },
+    /// File a follow-up issue, reading its body from stdin.
+    ///
+    /// Use this for deferrals and discoveries while planning or implementing —
+    /// "defer X to later", "found Y out of scope" — instead of dropping them. By
+    /// default the new issue is marked blocked by the issue it was filed from
+    /// (the optional `[issue]`, else inferred as `work-on` does), so a worker
+    /// won't pick it up until that issue is done; the blocking label is set
+    /// atomically at creation, with the native GitHub `blocked_by` dependency set
+    /// right after. The new issue is created unassigned and prints as JSON.
+    CreateIssue {
+        /// The new issue's title.
+        #[arg(long)]
+        title: String,
+        /// The originating issue this follow-up is blocked by: a number
+        /// (resolved against the current repo) or a full GitHub issue URL. When
+        /// omitted, inferred as `work-on` does. An explicitly given issue that
+        /// can't be resolved is an error; a merely inferred one that's absent
+        /// just skips blocking.
+        issue: Option<String>,
+        /// Extra label to attach (repeatable), in addition to the blocked label.
+        #[arg(long = "label")]
+        labels: Vec<String>,
+        /// Create a standalone issue: no blocked label and no dependency.
+        #[arg(long)]
+        no_block: bool,
+    },
     /// Configure ghwf: subcommands that create or extend `ghwf.toml`.
     Config {
         #[command(subcommand)]
@@ -241,6 +267,12 @@ fn main() -> Result<()> {
         } => clone::run(&repo, directory.as_deref(), reference.as_deref()),
         Commands::CollectGarbage { dry_run } => collect_garbage::run(dry_run),
         Commands::CreateIssueComment { issue } => create_issue_comment(&resolve_issue_arg(issue)?),
+        Commands::CreateIssue {
+            title,
+            issue,
+            labels,
+            no_block,
+        } => create_issue(&title, issue, &labels, no_block),
         Commands::HandOff { issue, question } => hand_off(&resolve_issue_arg(issue)?, question),
         Commands::Config { command } => match command {
             ConfigCommands::Init => init::run(),
@@ -271,15 +303,8 @@ fn resolve_issue_arg(arg: Option<String>) -> Result<String> {
     if let Some(arg) = arg {
         return Ok(arg);
     }
-    if let Ok(value) = std::env::var(store::ISSUE_ENV) {
-        if !value.is_empty() {
-            return Ok(value);
-        }
-    }
-    let issues_root = store::data_dir()?.join("issues");
-    let cwd = std::env::current_dir().context("failed to determine the current directory")?;
-    if let Some((owner, repo, number)) = state::find_issue_for_dir(&issues_root, &cwd)? {
-        return Ok(format!("https://github.com/{owner}/{repo}/issues/{number}"));
+    if let Some(inferred) = infer_issue_arg()? {
+        return Ok(inferred);
     }
     bail!(
         "no issue given and none could be inferred (${} is unset and the current \
@@ -287,6 +312,27 @@ fn resolve_issue_arg(arg: Option<String>) -> Result<String> {
          e.g. `ghwf work-on 13`.",
         store::ISSUE_ENV
     );
+}
+
+/// The issue inferred from the session environment, without an explicit
+/// argument: $GHWF_ISSUE (set by the outside-Claude launcher) first, else the
+/// issue whose recorded worktree contains the current directory. `None` when
+/// neither applies — for callers (like `create-issue`) where an absent
+/// inference is a soft skip rather than an error.
+fn infer_issue_arg() -> Result<Option<String>> {
+    if let Ok(value) = std::env::var(store::ISSUE_ENV) {
+        if !value.is_empty() {
+            return Ok(Some(value));
+        }
+    }
+    let issues_root = store::data_dir()?.join("issues");
+    let cwd = std::env::current_dir().context("failed to determine the current directory")?;
+    if let Some((owner, repo, number)) = state::find_issue_for_dir(&issues_root, &cwd)? {
+        return Ok(Some(format!(
+            "https://github.com/{owner}/{repo}/issues/{number}"
+        )));
+    }
+    Ok(None)
 }
 
 /// Print the absolute worktree path recorded for an issue (for scripts and the
@@ -1232,6 +1278,117 @@ fn create_issue_comment(issue: &str) -> Result<()> {
     Ok(())
 }
 
+/// File a follow-up issue (body from stdin), blocked by the originating issue
+/// by default.
+///
+/// The blocking guard is the label: it's included in the create payload, so the
+/// issue carries it from the instant it exists and a worker pool can't grab it
+/// in the gap before the dependency is set. The native `blocked_by` dependency
+/// is set right after as the GitHub-UI truth; if that second call fails the
+/// issue still stands (and stays guarded by the label).
+fn create_issue(
+    title: &str,
+    issue_arg: Option<String>,
+    labels: &[String],
+    no_block: bool,
+) -> Result<()> {
+    if title.trim().is_empty() {
+        bail!("an issue title is required (`--title`)");
+    }
+    // Issues may have empty bodies, so — unlike the comment commands — empty
+    // stdin is fine.
+    let body = read_stdin()?;
+    let body = body.trim();
+
+    let repo_ctx = github::config_repo()?;
+    let (owner, repo) = github::repo_or_cwd()?;
+    let blocked_label = config::find()?
+        .map(|located| located.config.blocked_label)
+        .unwrap_or_else(config::default_blocked_label);
+
+    // Resolve the originating (blocker) issue unless --no-block. An explicit arg
+    // resolves strictly; a merely inferred one that doesn't pan out is a soft
+    // skip, so a stray invocation still files the issue rather than erroring.
+    let blocker = if no_block {
+        None
+    } else if let Some(arg) = issue_arg {
+        Some(github::fetch_issue(&arg, repo_ctx.as_ref())?)
+    } else if let Some(arg) = infer_issue_arg()? {
+        match github::fetch_issue(&arg, repo_ctx.as_ref()) {
+            Ok(issue) => Some(issue),
+            Err(err) => {
+                eprintln!(
+                    "warning: couldn't resolve the inferred originating issue, so \
+                     filing an unblocked issue: {err:#}"
+                );
+                None
+            }
+        }
+    } else {
+        eprintln!(
+            "warning: no originating issue given or inferred, so filing an unblocked \
+             issue (pass an issue, or --no-block to silence this)."
+        );
+        None
+    };
+
+    // The guard label, when blocking — empty (a misconfigured `blocked_label`)
+    // disables the guard but not the native dependency.
+    let guard_label = blocker
+        .as_ref()
+        .map(|_| blocked_label.trim())
+        .filter(|name| !name.is_empty());
+    if blocker.is_some() && guard_label.is_none() {
+        eprintln!(
+            "warning: `blocked_label` is empty, so no guard label is applied; the \
+             follow-up's native blocked_by dependency is still set, but a worker \
+             could pick it up before then."
+        );
+    }
+    let label_names = assemble_labels(guard_label, labels);
+    // Ensure the guard label exists before it goes in the create payload —
+    // GitHub silently drops unknown labels on issue creation, which would leave
+    // the issue unguarded. (User --labels follow the usual "must already exist"
+    // rule, as elsewhere.)
+    if let Some(guard_label) = guard_label {
+        github::ensure_label(&owner, &repo, guard_label)?;
+    }
+
+    let label_refs: Vec<&str> = label_names.iter().map(String::as_str).collect();
+    let issue = github::create_issue(&owner, &repo, title, body, &label_refs)?;
+
+    if let Some(blocker) = &blocker {
+        if let Err(err) = github::add_blocked_by(&owner, &repo, issue.number, blocker.id) {
+            eprintln!(
+                "warning: filed #{} but couldn't set its `blocked_by` dependency on \
+                 #{}: {err:#}\nthe `{blocked_label}` label is set, so a worker still \
+                 won't pick it up; add the dependency by hand for the GitHub UI.",
+                issue.number, blocker.number
+            );
+        }
+    }
+
+    println!("{}", render::issue_json(&issue)?);
+    Ok(())
+}
+
+/// The labels for a new follow-up issue: the blocked label first (when
+/// blocking), then any extras, trimmed, with empties and case-insensitive
+/// duplicates dropped.
+fn assemble_labels(blocked: Option<&str>, extra: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(blocked) = blocked {
+        out.push(blocked.to_string());
+    }
+    for label in extra {
+        let label = label.trim();
+        if !label.is_empty() && !out.iter().any(|seen| seen.eq_ignore_ascii_case(label)) {
+            out.push(label.to_string());
+        }
+    }
+    out
+}
+
 /// Post Claude's hand-off comment (body from stdin) with the current phase's
 /// next-step prompt appended by ghwf, flip the workflow to waiting-on-user,
 /// and sync labels. The prompt makes the hand-off the thread's 👍 target
@@ -1397,12 +1554,29 @@ fn record_last_posted(
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_on_pr_ready, advance_phase, latest_prompt_watch, needs_worktree_guard,
-        AdvanceOutcome, PromptThumbs,
+        advance_on_pr_ready, advance_phase, assemble_labels, latest_prompt_watch,
+        needs_worktree_guard, AdvanceOutcome, PromptThumbs,
     };
     use crate::models::{Comment, PullRequest, Reaction, User};
     use crate::render::{NoteKind, Transition, Trigger};
     use crate::state::{Directive, IssueState, Phase, PrOutcome, PrepState};
+
+    #[test]
+    fn assemble_labels_puts_blocked_first_and_dedupes() {
+        // Blocked label leads; extras follow; a case-insensitive duplicate of
+        // the blocked label and empty entries are dropped.
+        assert_eq!(
+            assemble_labels(Some("blocked"), &["foo".into(), "Blocked".into(), "  ".into()]),
+            vec!["blocked", "foo"]
+        );
+        // No blocker: just the (trimmed, de-duplicated) extras.
+        assert_eq!(
+            assemble_labels(None, &[" foo ".into(), "foo".into()]),
+            vec!["foo"]
+        );
+        // No blocker, no extras: empty.
+        assert!(assemble_labels(None, &[]).is_empty());
+    }
 
     /// Unpack a directive-fired transition, panicking on a PR-ready one.
     fn directive_parts(transition: &Transition) -> (&'static str, &str, bool) {

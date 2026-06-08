@@ -46,6 +46,11 @@ pub fn comment_json(comment: &Comment) -> Result<String> {
     serde_json::to_string_pretty(comment).context("failed to serialize comment as JSON")
 }
 
+/// Render an issue (e.g. one just created) as pretty-printed JSON.
+pub fn issue_json(issue: &Issue) -> Result<String> {
+    serde_json::to_string_pretty(issue).context("failed to serialize issue as JSON")
+}
+
 /// A human-readable overview of a PR's metadata: a header line with number,
 /// title, and state, the URL, then the body (or a placeholder when empty).
 pub fn pr_overview(pr: &PullRequest) -> String {
@@ -1049,6 +1054,7 @@ mod tests {
 
     fn issue() -> Issue {
         Issue {
+            id: 900,
             number: 9,
             title: "A PR".to_string(),
             state: "open".to_string(),

@@ -229,6 +229,30 @@ pub fn run() -> Result<()> {
         doc_changed = true;
     }
 
+    if !doc.contains_key("blocked_label")
+        && prompt(
+            Confirm::new(
+                "Customise the label `ghwf create-issue` marks follow-ups blocked with? \
+                 (defaults to `blocked`)",
+            )
+            .with_default(false)
+            .prompt(),
+        )?
+    {
+        let label = prompt(
+            Text::new("Blocked label name:")
+                .with_default("blocked")
+                .prompt(),
+        )?;
+        let label = label.trim().to_string();
+        if label.is_empty() {
+            println!("No label given; keeping the default.");
+        } else {
+            set_blocked_label(&mut doc, &label);
+            doc_changed = true;
+        }
+    }
+
     if !doc.contains_key("labels") {
         if prompt(
             Confirm::new("Set up workflow status labels now? (creates labels in the GitHub repo)")
@@ -467,6 +491,17 @@ fn set_delete_plan_on_approval(doc: &mut DocumentMut) {
     );
 }
 
+/// Write the `blocked_label` key.
+fn set_blocked_label(doc: &mut DocumentMut, label: &str) {
+    insert_with_comment(
+        doc,
+        "blocked_label",
+        toml_edit::value(label),
+        "Label `ghwf create-issue` applies to a follow-up to mark it blocked by\n\
+         the issue it was filed from (default `blocked`).",
+    );
+}
+
 /// Parse the comma-separated priority-labels answer: trimmed, empties dropped.
 fn parse_priority_labels(input: &str) -> Vec<String> {
     input
@@ -496,8 +531,8 @@ fn append_line(path: &Path, line: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_priority_labels, set_delete_plan_on_approval, set_essentials, set_permission_mode,
-        set_priority_labels, PR_STUB,
+        parse_priority_labels, set_blocked_label, set_delete_plan_on_approval, set_essentials,
+        set_permission_mode, set_priority_labels, PR_STUB,
     };
     use crate::config::Config;
     use std::path::PathBuf;
@@ -577,6 +612,15 @@ pre-plan = \"a\"
         set_delete_plan_on_approval(&mut doc);
         let config: Config = toml::from_str(&doc.to_string()).unwrap();
         assert!(config.delete_plan_on_approval);
+    }
+
+    #[test]
+    fn blocked_label_round_trips() {
+        let mut doc = DocumentMut::new();
+        set_essentials(&mut doc, None, "worktrees");
+        set_blocked_label(&mut doc, "needs-unblock");
+        let config: Config = toml::from_str(&doc.to_string()).unwrap();
+        assert_eq!(config.blocked_label, "needs-unblock");
     }
 
     #[test]

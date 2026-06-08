@@ -40,6 +40,9 @@ Run `ghwf work-on $ARGUMENTS` and follow the phase banner exactly:
   $ARGUMENTS`; when a phase's work is done, hand off with `ghwf hand-off
   $ARGUMENTS` (body from stdin) — ghwf appends the approval prompt itself,
   so never write one.
+- When you decide to defer work or discover something out of scope, file it
+  with `ghwf create-issue --title "..."` (body from stdin) instead of dropping
+  it; by default the new issue is marked blocked by the one you're working on.
 - For the PR itself, use ghwf rather than `gh`: `ghwf show-pr` /
   `ghwf update-pr` (body from stdin, `--title` optional) to read and revise
   the title and body, `ghwf pr-checks` (`--log-failed` for logs) for CI
@@ -227,6 +230,13 @@ mod tests {
         // blocking question (see issue #43).
         assert!(SKILL_CONTENT.contains("--question"));
         assert!(SKILL_CONTENT.contains("AskUserQuestion"));
+    }
+
+    #[test]
+    fn skill_advertises_create_issue() {
+        // The skill must point Claude at `create-issue` for deferrals/discoveries
+        // (see issue #54) rather than dropping them.
+        assert!(SKILL_CONTENT.contains("ghwf create-issue"));
     }
 
     #[test]

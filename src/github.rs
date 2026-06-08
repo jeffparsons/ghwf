@@ -364,6 +364,60 @@ pub fn create_label(
     gh_api_stdin(&["--method", "POST", &endpoint, "--input", "-"], &payload).map(|_| ())
 }
 
+/// Create an issue, returning the created issue (its number, id, and html_url
+/// among the fields). `labels` must already exist in the repo — GitHub silently
+/// drops unknown label names on issue creation.
+pub fn create_issue(
+    owner: &str,
+    repo: &str,
+    title: &str,
+    body: &str,
+    labels: &[&str],
+) -> Result<Issue> {
+    let endpoint = format!("repos/{owner}/{repo}/issues");
+    let payload = issue_create_payload(title, body, labels);
+    let json = gh_api_stdin(&["--method", "POST", &endpoint, "--input", "-"], &payload)?;
+    serde_json::from_str(&json).context("failed to parse created-issue JSON from `gh api`")
+}
+
+/// Build the JSON request body for [`create_issue`].
+fn issue_create_payload(title: &str, body: &str, labels: &[&str]) -> String {
+    serde_json::json!({
+        "title": title,
+        "body": body,
+        "labels": labels,
+    })
+    .to_string()
+}
+
+/// Declare that issue `issue_number` is blocked by the issue with database id
+/// `blocker_id`. `blocker_id` is the REST database id (see [`Issue::id`]), not
+/// the blocker's issue number.
+pub fn add_blocked_by(
+    owner: &str,
+    repo: &str,
+    issue_number: u64,
+    blocker_id: u64,
+) -> Result<()> {
+    let endpoint =
+        format!("repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by");
+    let payload = serde_json::json!({ "issue_id": blocker_id }).to_string();
+    gh_api_stdin(&["--method", "POST", &endpoint, "--input", "-"], &payload).map(|_| ())
+}
+
+/// Ensure a label exists in the repo, creating it (with a neutral colour and
+/// description) when absent. Idempotent: an already-present label is left as-is,
+/// so a user who has customised its colour/description keeps their version.
+pub fn ensure_label(owner: &str, repo: &str, name: &str) -> Result<()> {
+    let existing = list_repo_labels(owner, repo)?;
+    if existing.iter().any(|l| l.eq_ignore_ascii_case(name)) {
+        return Ok(());
+    }
+    // A muted grey, distinct from the workflow status labels; description states
+    // the meaning so a human browsing labels understands it.
+    create_label(owner, repo, name, "cccccc", "Blocked by another issue")
+}
+
 /// Percent-encode a string for use as one URL path segment (label names may
 /// contain spaces and other reserved characters).
 fn encode_path_segment(s: &str) -> String {
@@ -732,7 +786,23 @@ fn gh_api_stdin(args: &[&str], input: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_path_segment, parse_http_head, parse_remote_url, pr_update_payload};
+    use super::{
+        encode_path_segment, issue_create_payload, parse_http_head, parse_remote_url,
+        pr_update_payload,
+    };
+
+    #[test]
+    fn issue_create_payload_carries_title_body_and_labels() {
+        assert_eq!(
+            issue_create_payload("Follow-up", "details", &["blocked", "foo"]),
+            r#"{"body":"details","labels":["blocked","foo"],"title":"Follow-up"}"#
+        );
+        // No labels still sends an (empty) array, which GitHub accepts.
+        assert_eq!(
+            issue_create_payload("t", "", &[]),
+            r#"{"body":"","labels":[],"title":"t"}"#
+        );
+    }
 
     #[test]
     fn pr_update_payload_includes_only_provided_fields() {
