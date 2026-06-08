@@ -29,6 +29,10 @@ pub struct Config {
     /// advances. Absent means the feature is off; `ghwf config labels`
     /// bootstraps the section.
     pub labels: Option<LabelsConfig>,
+    /// Permission mode passed to launched Claude sessions as
+    /// `--permission-mode <value>` (e.g. "auto"). Absent means Claude's
+    /// default prompting behaviour.
+    pub permission_mode: Option<String>,
 }
 
 /// The `[labels]` section: one GitHub label name per phase and per attention
@@ -202,6 +206,25 @@ mod tests {
         let config: Config = toml::from_str(r#"worktrees_dir = "worktrees""#).unwrap();
         assert!(config.priority_labels.is_empty());
         assert!(config.labels.is_none());
+    }
+
+    #[test]
+    fn permission_mode_parses() {
+        let config: Config = toml::from_str(
+            r#"
+            worktrees_dir = "worktrees"
+            permission_mode = "auto"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.permission_mode.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn permission_mode_defaults_to_none() {
+        // Pre-existing configs without the key keep loading.
+        let config: Config = toml::from_str(r#"worktrees_dir = "worktrees""#).unwrap();
+        assert!(config.permission_mode.is_none());
     }
 
     #[test]

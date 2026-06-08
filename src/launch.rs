@@ -42,12 +42,27 @@ pub fn run(issue_arg: &str, no_branch: bool) -> Result<()> {
     // ghwf commands inside the session don't need an issue argument.
     let issue_url = format!("https://github.com/{owner}/{repo}/issues/{number}");
 
+    // The configured permission mode for the launched session, resolved
+    // best-effort: several launch paths must keep working without a config.
+    let permission_mode = match config::find() {
+        Ok(Some(located)) => located.config.permission_mode,
+        Ok(None) => None,
+        Err(err) => {
+            eprintln!(
+                "warning: launching without a permission mode — \
+                 failed to load the config: {err:#}"
+            );
+            None
+        }
+    };
+
     // --no-branch work has no worktree to anchor a session to: launch a fresh
     // Claude where we are.
     if use_no_branch {
         println!(
             "Issue #{number} is being worked with --no-branch (no dedicated worktree), \
-             so Claude will start in the current directory."
+             so Claude will start in the current directory{}.",
+            mode_note(permission_mode.as_deref())
         );
         // Record the mode now so the in-session run honours it even though the
         // user won't repeat the flag (recorded mode wins over the flag there).
@@ -59,7 +74,7 @@ pub fn run(issue_arg: &str, no_branch: bool) -> Result<()> {
             state::save(&owner, &repo, number, &issue_state)?;
         }
         print_fresh_reminder();
-        return exec_claude(None, None, &issue_url);
+        return exec_claude(None, None, permission_mode.as_deref(), &issue_url);
     }
 
     // Find or create the worktree. The launcher creates it immediately — even
@@ -110,18 +125,34 @@ pub fn run(issue_arg: &str, no_branch: bool) -> Result<()> {
     match &resume {
         Some(id) => println!(
             "Resuming this worktree's previous Claude session: launching \
-             `claude --resume {id}` in `{}`.",
-            worktree.display()
+             `claude --resume {id}` in `{}`{}.",
+            worktree.display(),
+            mode_note(permission_mode.as_deref())
         ),
         None => {
             println!(
-                "Starting a fresh Claude session in `{}`.",
-                worktree.display()
+                "Starting a fresh Claude session in `{}`{}.",
+                worktree.display(),
+                mode_note(permission_mode.as_deref())
             );
             print_fresh_reminder();
         }
     }
-    exec_claude(Some(&worktree), resume.as_deref(), &issue_url)
+    exec_claude(
+        Some(&worktree),
+        resume.as_deref(),
+        permission_mode.as_deref(),
+        &issue_url,
+    )
+}
+
+/// Note appended to launch messages when a permission mode is configured, so
+/// the user can see why Claude came up in that mode. Empty when none is.
+fn mode_note(permission_mode: Option<&str>) -> String {
+    match permission_mode {
+        Some(mode) => format!(" with `--permission-mode {mode}`"),
+        None => String::new(),
+    }
 }
 
 /// Best-effort fetch plus default-branch worktree update, so every launch is a
@@ -215,17 +246,27 @@ fn munge(path: &Path) -> String {
 }
 
 /// Replace this process with an interactive `claude`, launched in `dir` when
-/// given, resuming `resume` when given. `issue_url` is exported as $GHWF_ISSUE
-/// so ghwf commands inside the session can default to it.
+/// given, resuming `resume` when given, in `permission_mode` when given (the
+/// value is passed through verbatim; claude rejects invalid modes itself).
+/// `issue_url` is exported as $GHWF_ISSUE so ghwf commands inside the session
+/// can default to it.
 ///
 /// Never pass `-p`/`--print` (or any prompt): that is programmatic use, billed
 /// as API traffic rather than the user's subscription. Because we exec rather
 /// than spawn, quitting Claude returns the user to the shell that ran ghwf.
-fn exec_claude(dir: Option<&Path>, resume: Option<&str>, issue_url: &str) -> Result<()> {
+fn exec_claude(
+    dir: Option<&Path>,
+    resume: Option<&str>,
+    permission_mode: Option<&str>,
+    issue_url: &str,
+) -> Result<()> {
     let mut cmd = Command::new("claude");
     cmd.env(store::ISSUE_ENV, issue_url);
     if let Some(id) = resume {
         cmd.args(["--resume", id]);
+    }
+    if let Some(mode) = permission_mode {
+        cmd.args(["--permission-mode", mode]);
     }
     if let Some(dir) = dir {
         std::env::set_current_dir(dir)
