@@ -123,7 +123,7 @@ pub fn run(
     let plan_rel = format!("plans/{number}-{slug}.md");
 
     if prep.no_branch {
-        return Ok(no_branch_body(&plan_rel));
+        return Ok(no_branch_body(number, &plan_rel));
     }
 
     // 1. Ensure the worktree/branch exists.
@@ -171,11 +171,12 @@ pub fn run(
     Ok(complete_body(&worktree, &branch, &pr_url, number))
 }
 
-fn no_branch_body(plan_rel: &str) -> String {
+fn no_branch_body(number: u64, plan_rel: &str) -> String {
     format!(
         "Prep-and-plan (--no-branch).\n\n\
          Write the plan to `{plan_rel}` as a file (do not use Claude Code plan mode). \
-         No branch, worktree, or PR will be created — you are managing the branch and commits yourself."
+         No branch, worktree, or PR will be created — you are managing the branch and commits yourself.\n\n{}",
+        crate::render::question_instruction(number),
     )
 }
 
@@ -183,9 +184,10 @@ fn plan_needed_body(worktree: &Path, branch: &str, plan_abs: &Path, number: u64)
     format!(
         "Prep-and-plan: worktree ready at `{}` on branch `{branch}`.\n\n\
          Write the plan to `{}` as a file (do not use Claude Code plan mode), then re-run \
-         `ghwf work-on {number}`. ghwf will commit it, push the branch, and open a draft PR.",
+         `ghwf work-on {number}`. ghwf will commit it, push the branch, and open a draft PR.\n\n{}",
         worktree.display(),
         plan_abs.display(),
+        crate::render::question_instruction(number),
     )
 }
 
@@ -205,7 +207,7 @@ fn complete_body(worktree: &Path, branch: &str, pr_url: &str, number: u64) -> St
 
 #[cfg(test)]
 mod tests {
-    use super::{complete_body, update_default_worktree};
+    use super::{complete_body, no_branch_body, plan_needed_body, update_default_worktree};
     use crate::git::tests::{init_repo, rev_parse, run_git, scratch};
     use std::path::Path;
 
@@ -215,6 +217,19 @@ mod tests {
         assert!(body.contains("`ghwf wait 7`"));
         // The hand-off goes through ghwf, which owns the approval prompt.
         assert!(body.contains("`ghwf hand-off 7`"));
+    }
+
+    #[test]
+    fn plan_bodies_route_questions_off_interactive_prompts() {
+        for body in [
+            plan_needed_body(Path::new("/wt"), "b", Path::new("/wt/plans/7-x.md"), 7),
+            no_branch_body(7, "plans/7-x.md"),
+        ] {
+            assert!(
+                body.contains("`ghwf hand-off 7 --question`"),
+                "missing in: {body}"
+            );
+        }
     }
 
     #[test]
