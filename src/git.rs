@@ -33,6 +33,58 @@ fn git_ok(dir: &Path, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// Clone `url` as a bare repo at `dest`, optionally borrowing objects from a
+/// local `reference` repo instead of fetching them over the network.
+///
+/// `--single-branch` keeps the bare repo's `refs/heads/*` down to just the
+/// default branch — a plain `--bare` clone mirrors every remote branch into
+/// `refs/heads/*`, where they would sit frozen forever (fetch `--prune` only
+/// tends `refs/remotes/*`) and pollute [`list_local_branches`].
+///
+/// A reference clone is always dissociated: the reference repo is exactly
+/// what a migrating user is likely to delete, so the new repo must never
+/// keep depending on it.
+pub fn clone_bare(url: &str, dest: &Path, reference: Option<&Path>) -> Result<()> {
+    let dest = dest
+        .to_str()
+        .context("destination path is not valid UTF-8")?;
+    let mut args = vec!["clone", "--bare", "--single-branch"];
+    // Canonicalize: git resolves a relative reference path against its own
+    // cwd, and the canonical form keeps error messages unambiguous.
+    let reference = match reference {
+        Some(path) => Some(
+            path.canonicalize()
+                .with_context(|| format!("--reference repo `{}` was not found", path.display()))?,
+        ),
+        None => None,
+    };
+    let reference_arg;
+    if let Some(path) = &reference {
+        reference_arg = path.to_str().context("reference path is not valid UTF-8")?;
+        args.extend(["--reference", reference_arg, "--dissociate"]);
+    }
+    args.extend([url, dest]);
+    git(Path::new("."), &args).map(|_| ())
+}
+
+/// Configure `repo`'s origin to behave like a normal (working-copy) clone's:
+/// the conventional fetch refspec, populated remote-tracking refs, and
+/// `origin/HEAD` pointing at the default branch. A bare clone sets none of
+/// these up, but ghwf relies on them (`fetch --prune origin` and
+/// `origin/<default>` worktree starts).
+pub fn setup_conventional_remote(repo: &Path) -> Result<()> {
+    git(
+        repo,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    )?;
+    git(repo, &["fetch", "--prune", "origin"])?;
+    git(repo, &["remote", "set-head", "origin", "--auto"]).map(|_| ())
+}
+
 /// Whether `dir` is inside a git work tree (false in a bare repo or outside
 /// git entirely).
 pub fn is_inside_work_tree(dir: &Path) -> bool {
@@ -299,6 +351,11 @@ pub mod tests {
             .unwrap()
             .trim()
             .to_string()
+    }
+
+    /// Run git in `dir` and return its trimmed stdout, panicking on failure.
+    pub fn git_stdout(dir: &Path, args: &[&str]) -> String {
+        super::git(dir, args).unwrap().trim().to_string()
     }
 
     /// Init a repo at `dir` with one committed file on branch `main`.
