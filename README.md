@@ -125,11 +125,44 @@ to watching the repo events feed — one rate-limit-free request per cycle —
 after verifying the feed currently shows ghwf's own latest post (it can lag),
 with a full direct sweep every ~5 min as the backstop.
 
+## Setting up a project
+
+`ghwf clone` clones a GitHub repo into ghwf's preferred layout in one step:
+
+```
+$ ghwf clone owner/repo        # or a full HTTPS/SSH URL
+```
+
+creates, under the current directory:
+
+```
+repo/                  # container directory (override with a second argument)
+├── repo.git/          # bare repo, remote configured like a normal clone's
+├── ghwf.toml          # generated, essentials only
+└── worktrees/         # per-issue worktrees land here
+```
+
+The bare repo keeps the container free of a working copy that would shadow
+the per-issue worktrees, while its remote is set up to behave exactly like a
+normal clone's (`origin/<default>` resolves and stays fresh on fetch).
+
+For big repos, `--reference <path>` borrows objects from an existing local
+clone instead of fetching them over the network. The new repo is dissociated
+from the reference afterwards, so it's safe to delete the old clone — the
+typical migration move.
+
+`ghwf clone` generates only the config essentials; run `ghwf config init`
+afterwards for the optional extras (priority labels, PR instructions,
+workflow status labels). Other layouts remain fully supported — the command
+is just the opinionated default; any layout you can describe in a `ghwf.toml`
+works.
+
 ## Configuration
 
 ghwf needs a `ghwf.toml`, found by walking up from the current directory.
-Run `ghwf config init` to set one up (or extend one) interactively; the
-annotated example below shows what it manages:
+`ghwf clone` generates one; `ghwf config init` sets one up (or extends one)
+interactively for other layouts. The annotated example below shows what it
+manages:
 
 ```toml
 # Path to the main git repo (omit or "." if the config sits at the repo root).
