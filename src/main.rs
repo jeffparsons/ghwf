@@ -3,6 +3,7 @@ mod config;
 mod git;
 mod github;
 mod implement;
+mod init;
 mod install;
 mod labels;
 mod launch;
@@ -127,6 +128,9 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ConfigCommands {
+    /// Interactively create or extend `ghwf.toml`: the essentials when
+    /// missing, then optional extras.
+    Init,
     /// Set up workflow status labels: create them in the GitHub repo and add
     /// a `[labels]` section to `ghwf.toml`.
     Labels,
@@ -141,6 +145,7 @@ fn main() -> Result<()> {
         Commands::CreateIssueComment { issue } => create_issue_comment(&resolve_issue_arg(issue)?),
         Commands::HandOff { issue } => hand_off(&resolve_issue_arg(issue)?),
         Commands::Config { command } => match command {
+            ConfigCommands::Init => init::run(),
             ConfigCommands::Labels => labels::configure(),
         },
         Commands::WorktreePath { issue } => worktree_path(&resolve_issue_arg(issue)?),
