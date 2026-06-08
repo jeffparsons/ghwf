@@ -4,6 +4,7 @@ mod git;
 mod github;
 mod implement;
 mod install;
+mod labels;
 mod launch;
 mod models;
 mod next;
@@ -75,6 +76,22 @@ enum Commands {
         /// issue URL. When omitted, inferred as `work-on` does.
         issue: Option<String>,
     },
+    /// Post Claude's hand-off comment, reading the body from stdin, and flip
+    /// the workflow to waiting-on-user.
+    ///
+    /// ghwf appends the phase-appropriate next-step prompt (the approval
+    /// command, or the ready-for-review button in the implement phase) — the
+    /// body should not include one.
+    HandOff {
+        /// An issue number (resolved against the current repo) or a full GitHub
+        /// issue URL. When omitted, inferred as `work-on` does.
+        issue: Option<String>,
+    },
+    /// Configure ghwf: subcommands that create or extend `ghwf.toml`.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
     /// Print the absolute path of the worktree recorded for an issue.
     WorktreePath {
         /// An issue number (resolved against the current repo) or a full GitHub
@@ -108,6 +125,13 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Set up workflow status labels: create them in the GitHub repo and add
+    /// a `[labels]` section to `ghwf.toml`.
+    Labels,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -115,6 +139,10 @@ fn main() -> Result<()> {
         Commands::Next { no_branch } => work_on(&next::pick()?.to_string(), no_branch),
         Commands::CollectGarbage { dry_run } => collect_garbage::run(dry_run),
         Commands::CreateIssueComment { issue } => create_issue_comment(&resolve_issue_arg(issue)?),
+        Commands::HandOff { issue } => hand_off(&resolve_issue_arg(issue)?),
+        Commands::Config { command } => match command {
+            ConfigCommands::Labels => labels::configure(),
+        },
         Commands::WorktreePath { issue } => worktree_path(&resolve_issue_arg(issue)?),
         Commands::Install { force } => install::run(force),
         Commands::ClaudeStopHook => stop_hook::run(),
@@ -201,12 +229,14 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     // Recompute how (or whether) the PR left the open state, remembering the
     // previous value so a fresh conclusion can be announced exactly once.
     // Recomputing rather than latching lets a closed-then-reopened PR resume
-    // the workflow.
-    let prior_pr_outcome = issue_state.pr_outcome;
-    issue_state.pr_outcome = match pr_number {
-        Some(pr) => state::pr_outcome(&github::fetch_pr(&owner, &repo, pr)?),
+    // the workflow. The PR object is kept: its draft flag drives the
+    // implement → review transition below.
+    let pr_object = match pr_number {
+        Some(pr) => Some(github::fetch_pr(&owner, &repo, pr)?),
         None => None,
     };
+    let prior_pr_outcome = issue_state.pr_outcome;
+    issue_state.pr_outcome = pr_object.as_ref().and_then(state::pr_outcome);
     let new_conclusion = (issue_state.pr_outcome != prior_pr_outcome)
         .then_some(issue_state.pr_outcome)
         .flatten();
@@ -216,12 +246,15 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     if let Some(comments) = early_pr_comments.as_deref() {
         prompt_thumbs.extend(collect_prompt_thumbs(&owner, &repo, comments, "PR")?);
     }
-    let outcome = advance_phase(
+    let mut outcome = advance_phase(
         &mut issue_state,
         &issue_comments,
         early_pr_comments.as_deref(),
         &prompt_thumbs,
     );
+    // The implement phase has no approval command: the user marking the draft
+    // PR ready for review is what advances it.
+    advance_on_pr_ready(&mut issue_state, pr_object.as_ref(), &mut outcome);
 
     // The phase-specific banner body. Prep-and-plan does real work here (and
     // hard-errors if it needs a config that's missing); implement/review are light.
@@ -244,14 +277,28 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         ),
         None => match phase {
             state::Phase::PrePlan => render::pre_plan_body(number),
-            state::Phase::PrepAndPlan => prep::run(
-                &issue_data,
-                &owner,
-                &repo,
-                number,
-                no_branch,
-                &mut issue_state,
-            )?,
+            state::Phase::PrepAndPlan => {
+                // The worktree-creation stretch is ghwf's own slow work; let
+                // the labels say so while it runs. The end-of-run settle
+                // below hands the ball back to Claude.
+                let needs_worktree = !no_branch
+                    && issue_state
+                        .prep
+                        .as_ref()
+                        .is_none_or(|p| !p.no_branch && p.branch.is_none());
+                if needs_worktree {
+                    issue_state.attention = state::Attention::WaitingOnGhwf;
+                    labels::sync(&owner, &repo, number, pr_number, &mut issue_state);
+                }
+                prep::run(
+                    &issue_data,
+                    &owner,
+                    &repo,
+                    number,
+                    no_branch,
+                    &mut issue_state,
+                )?
+            }
             state::Phase::Implement => implement::run(
                 &issue_data,
                 &owner,
@@ -264,9 +311,9 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
                 &owner,
                 &repo,
                 number,
-                &mut issue_state,
+                &issue_state,
                 pr_instructions.as_deref(),
-            )?,
+            ),
         },
     };
 
@@ -398,6 +445,10 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
             issue_data.body.as_deref(),
             &issue_data.state,
         ),
+        // A PR opened during this run's phase body has no fetched object yet;
+        // its baseline starts on the next run (it was just created as a
+        // draft, so no flip can be missed).
+        pr_draft: pr_object.as_ref().map(|pr| pr.draft),
         ..Default::default()
     };
     for comment in issue_comments
@@ -496,14 +547,27 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     // changing, or fresh digest content — resets the Stop hook's
     // consecutive-nudge counter, so its cap only counts stops where nothing
     // had changed (see stop_hook.rs).
-    if !outcome.transitions.is_empty()
+    let activity = !outcome.transitions.is_empty()
         || !outcome.notes.is_empty()
         || body_changed
         || !new_issue.is_empty()
         || !new_pr.is_empty()
-        || !new_review.is_empty()
-    {
+        || !new_review.is_empty();
+    if activity {
         issue_state.stop_nudges = 0;
+    }
+
+    // Settle the attention axis. Review leaves nothing for Claude; otherwise
+    // activity puts the ball in Claude's court (it now has something to act
+    // on). A quiet re-run changes nothing — it must not steal the ball back
+    // from the user after a hand-off. A concluded workflow waits on nobody;
+    // the label sync below drops the attention label in that case.
+    if issue_state.pr_outcome.is_none() {
+        if issue_state.phase == state::Phase::Review {
+            issue_state.attention = state::Attention::WaitingOnUser;
+        } else if activity {
+            issue_state.attention = state::Attention::WaitingOnClaude;
+        }
     }
 
     println!(
@@ -553,6 +617,9 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     // fetched. A fresh baseline invalidates any stored poll ETags (the poll
     // URLs embed `since`), so they start empty.
     issue_state.wait = Some(wait_state);
+    // Mirror the workflow state onto GitHub labels, best-effort, when
+    // configured. Mutates `labels_synced`, so it runs before the save.
+    labels::sync(&owner, &repo, number, pr_number, &mut issue_state);
     state::save(&owner, &repo, number, &issue_state)?;
 
     Ok(())
@@ -812,9 +879,11 @@ fn advance_phase(
                 outcome.transitions.push(render::Transition {
                     from: phase,
                     to,
-                    command: directive.command(),
-                    by: by.clone(),
-                    via_reaction,
+                    trigger: render::Trigger::Directive {
+                        command: directive.command(),
+                        by: by.clone(),
+                        via_reaction,
+                    },
                 });
                 continue;
             }
@@ -832,6 +901,31 @@ fn advance_phase(
         });
     }
     outcome
+}
+
+/// Advance implement → review when the user has marked the draft PR ready for
+/// review. Only an open PR counts: a concluded workflow runs no phase work,
+/// and `!draft` on a merged or closed PR means nothing.
+fn advance_on_pr_ready(
+    issue_state: &mut state::IssueState,
+    pr: Option<&models::PullRequest>,
+    outcome: &mut AdvanceOutcome,
+) {
+    if issue_state.phase != state::Phase::Implement || issue_state.pr_outcome.is_some() {
+        return;
+    }
+    let Some(pr) = pr else {
+        return;
+    };
+    if pr.draft {
+        return;
+    }
+    issue_state.phase = state::Phase::Review;
+    outcome.transitions.push(render::Transition {
+        from: state::Phase::Implement,
+        to: state::Phase::Review,
+        trigger: render::Trigger::PrReady,
+    });
 }
 
 fn create_issue_comment(issue: &str) -> Result<()> {
@@ -857,6 +951,110 @@ fn create_issue_comment(issue: &str) -> Result<()> {
     if let Err(err) = record_last_posted(issue, &comment, repo_ctx.as_ref()) {
         eprintln!("warning: failed to record the post for wait calibration: {err:#}");
     }
+
+    println!("{}", render::comment_json(&comment)?);
+    Ok(())
+}
+
+/// Post Claude's hand-off comment (body from stdin) with the current phase's
+/// next-step prompt appended by ghwf, flip the workflow to waiting-on-user,
+/// and sync labels. The prompt makes the hand-off the thread's 👍 target
+/// where an approval command applies.
+fn hand_off(issue: &str) -> Result<()> {
+    let mut user_body = String::new();
+    std::io::stdin()
+        .read_to_string(&mut user_body)
+        .map_err(anyhow::Error::from)?;
+    if user_body.trim().is_empty() {
+        bail!("no comment body provided on stdin");
+    }
+
+    let repo_ctx = github::config_repo()?;
+    let (owner, repo, thread_number) = github::resolve_issue_ref(issue, repo_ctx.as_ref())?;
+    // The argument may name the PR thread; map back to the workflow issue.
+    let Some((number, mut issue_state)) = state::find_workflow_issue(&owner, &repo, thread_number)?
+    else {
+        bail!(
+            "no workflow state recorded for issue #{thread_number}; run \
+             `ghwf work-on {thread_number}` first."
+        );
+    };
+
+    if issue_state.pr_outcome.is_some() {
+        bail!(
+            "the workflow for issue #{number} has concluded (its PR was merged or \
+             closed); there is nothing to hand off."
+        );
+    }
+    let phase = issue_state.phase;
+    let no_branch = issue_state.prep.as_ref().is_some_and(|p| p.no_branch);
+    let Some(prompt) = render::hand_off_prompt(phase, no_branch) else {
+        bail!(
+            "the workflow for issue #{number} is in the review phase — the PR is \
+             already with the user; there is nothing to hand off."
+        );
+    };
+
+    // Tag the comment with the authoring session when running under Claude Code.
+    let token = match std::env::var(store::SESSION_ID_ENV) {
+        Ok(session_id) if !session_id.is_empty() => Some(store::session_token(&session_id)?),
+        _ => None,
+    };
+    let full_body = render::build_comment_body(
+        &format!("{}\n\n{prompt}", user_body.trim()),
+        token.as_deref(),
+    );
+
+    // Full comment on the phase's primary thread; when a PR exists, the other
+    // thread gets a one-line stub linking to it, best-effort.
+    let pr_number = issue_state.prep.as_ref().and_then(|p| p.pr_number);
+    let primary_is_pr = pr_number.is_some() && render::status_primary_is_pr(phase);
+    let primary = if primary_is_pr {
+        pr_number.expect("primary_is_pr requires a PR")
+    } else {
+        number
+    };
+    let comment = github::post_issue_comment(&primary.to_string(), &full_body, repo_ctx.as_ref())?;
+    if let Some(pr) = pr_number {
+        let (secondary, secondary_noun, primary_noun) = if primary_is_pr {
+            (number, "issue", "PR")
+        } else {
+            (pr, "PR", "issue")
+        };
+        let stub = render::build_status_comment_body(&format!(
+            "Hand-off posted on the {primary_noun}: {}",
+            comment.html_url
+        ));
+        if let Err(err) =
+            github::post_issue_comment(&secondary.to_string(), &stub, repo_ctx.as_ref())
+        {
+            eprintln!("warning: failed to post the hand-off stub to the {secondary_noun}: {err:#}");
+        }
+    }
+
+    // The ball is with the user now. Remember the post for feed-lag
+    // self-calibration, and watch it for 👍s when its prompt maps one.
+    issue_state.attention = state::Attention::WaitingOnUser;
+    issue_state.last_posted = Some(state::PostedRef {
+        id: comment.id,
+        created_at: comment.created_at.clone(),
+    });
+    if state::parse_prompted_directive(&full_body).is_some() {
+        if let Some(wait) = issue_state.wait.as_mut() {
+            let thread = if primary_is_pr { "pr" } else { "issue" };
+            wait.reaction_watches.insert(
+                thread.to_string(),
+                state::ReactionWatch {
+                    comment_id: comment.id,
+                    plus_one_ids: Default::default(),
+                },
+            );
+            // The watch endpoint's URL changed with it; drop the stale ETag.
+            wait.etags.remove(&format!("reactions_{thread}"));
+        }
+    }
+    labels::sync(&owner, &repo, number, pr_number, &mut issue_state);
+    state::save(&owner, &repo, number, &issue_state)?;
 
     println!("{}", render::comment_json(&comment)?);
     Ok(())
@@ -905,10 +1103,25 @@ fn record_last_posted(
 
 #[cfg(test)]
 mod tests {
-    use super::{advance_phase, latest_prompt_watch, needs_worktree_guard, PromptThumbs};
-    use crate::models::{Comment, Reaction, User};
-    use crate::render::NoteKind;
+    use super::{
+        advance_on_pr_ready, advance_phase, latest_prompt_watch, needs_worktree_guard,
+        AdvanceOutcome, PromptThumbs,
+    };
+    use crate::models::{Comment, PullRequest, Reaction, User};
+    use crate::render::{NoteKind, Transition, Trigger};
     use crate::state::{Directive, IssueState, Phase, PrOutcome, PrepState};
+
+    /// Unpack a directive-fired transition, panicking on a PR-ready one.
+    fn directive_parts(transition: &Transition) -> (&'static str, &str, bool) {
+        match &transition.trigger {
+            Trigger::Directive {
+                command,
+                by,
+                via_reaction,
+            } => (command, by.as_str(), *via_reaction),
+            Trigger::PrReady => panic!("expected a directive trigger"),
+        }
+    }
 
     fn comment(id: u64, body: &str, created_at: &str) -> Comment {
         Comment {
@@ -974,7 +1187,10 @@ mod tests {
         let outcome = advance_phase(&mut state, &comments, None, &[]);
         assert_eq!(state.phase, Phase::PrepAndPlan);
         assert_eq!(outcome.transitions.len(), 1);
-        assert_eq!(outcome.transitions[0].command, "/approve-pre-plan");
+        assert_eq!(
+            directive_parts(&outcome.transitions[0]).0,
+            "/approve-pre-plan"
+        );
         assert!(state.consumed_directives.contains(&1));
         assert!(outcome.notes.is_empty());
     }
@@ -986,7 +1202,7 @@ mod tests {
         let outcome = advance_phase(&mut state, &[], Some(&pr), &[]);
         assert_eq!(state.phase, Phase::Implement);
         assert_eq!(outcome.transitions.len(), 1);
-        assert_eq!(outcome.transitions[0].by, "user");
+        assert_eq!(directive_parts(&outcome.transitions[0]).1, "user");
     }
 
     #[test]
@@ -1006,11 +1222,7 @@ mod tests {
     #[test]
     fn premature_directive_is_noted_not_fired() {
         let mut state = state_in(Phase::PrePlan);
-        let comments = [comment(
-            1,
-            "/approve-implementation",
-            "2026-01-01T00:00:00Z",
-        )];
+        let comments = [comment(1, "/approve-plan", "2026-01-01T00:00:00Z")];
         let outcome = advance_phase(&mut state, &comments, None, &[]);
         assert_eq!(state.phase, Phase::PrePlan);
         assert!(outcome.transitions.is_empty());
@@ -1020,14 +1232,83 @@ mod tests {
     }
 
     #[test]
-    fn retired_proceed_is_noted_not_fired() {
-        let mut state = state_in(Phase::PrePlan);
-        let comments = [comment(1, "/proceed", "2026-01-01T00:00:00Z")];
-        let outcome = advance_phase(&mut state, &comments, None, &[]);
-        assert_eq!(state.phase, Phase::PrePlan);
+    fn retired_commands_are_noted_not_fired() {
+        for command in ["/proceed", "/approve-implementation"] {
+            let mut state = state_in(Phase::PrePlan);
+            let comments = [comment(1, command, "2026-01-01T00:00:00Z")];
+            let outcome = advance_phase(&mut state, &comments, None, &[]);
+            assert_eq!(state.phase, Phase::PrePlan);
+            assert!(outcome.transitions.is_empty());
+            assert!(matches!(outcome.notes[0].kind, NoteKind::Retired));
+            assert!(state.consumed_directives.contains(&1));
+        }
+    }
+
+    fn pull_request(draft: bool, state: &str, merged: bool) -> PullRequest {
+        PullRequest {
+            number: 18,
+            state: state.to_string(),
+            merged,
+            draft,
+            html_url: "https://github.com/o/r/pull/18".to_string(),
+        }
+    }
+
+    #[test]
+    fn pr_ready_advances_implement_to_review() {
+        let mut state = state_in(Phase::Implement);
+        let mut outcome = AdvanceOutcome::default();
+        advance_on_pr_ready(
+            &mut state,
+            Some(&pull_request(false, "open", false)),
+            &mut outcome,
+        );
+        assert_eq!(state.phase, Phase::Review);
+        assert_eq!(outcome.transitions.len(), 1);
+        assert!(matches!(outcome.transitions[0].trigger, Trigger::PrReady));
+    }
+
+    #[test]
+    fn draft_pr_does_not_advance_implement() {
+        let mut state = state_in(Phase::Implement);
+        let mut outcome = AdvanceOutcome::default();
+        advance_on_pr_ready(
+            &mut state,
+            Some(&pull_request(true, "open", false)),
+            &mut outcome,
+        );
+        assert_eq!(state.phase, Phase::Implement);
         assert!(outcome.transitions.is_empty());
-        assert!(matches!(outcome.notes[0].kind, NoteKind::Retired));
-        assert!(state.consumed_directives.contains(&1));
+        // No PR recorded at all: likewise nothing fires.
+        advance_on_pr_ready(&mut state, None, &mut outcome);
+        assert_eq!(state.phase, Phase::Implement);
+    }
+
+    #[test]
+    fn pr_ready_fires_only_from_implement_and_only_while_open() {
+        // Other phases: a ready PR means nothing (it is ready throughout review).
+        for phase in [Phase::PrePlan, Phase::PrepAndPlan, Phase::Review] {
+            let mut state = state_in(phase);
+            let mut outcome = AdvanceOutcome::default();
+            advance_on_pr_ready(
+                &mut state,
+                Some(&pull_request(false, "open", false)),
+                &mut outcome,
+            );
+            assert_eq!(state.phase, phase);
+            assert!(outcome.transitions.is_empty());
+        }
+        // A concluded workflow runs no transition either.
+        let mut state = state_in(Phase::Implement);
+        state.pr_outcome = Some(PrOutcome::Merged);
+        let mut outcome = AdvanceOutcome::default();
+        advance_on_pr_ready(
+            &mut state,
+            Some(&pull_request(false, "closed", true)),
+            &mut outcome,
+        );
+        assert_eq!(state.phase, Phase::Implement);
+        assert!(outcome.transitions.is_empty());
     }
 
     #[test]
@@ -1119,8 +1400,11 @@ mod tests {
         let outcome = advance_phase(&mut state, &issue, Some(&pr), &[]);
         assert_eq!(state.phase, Phase::Implement);
         assert_eq!(outcome.transitions.len(), 2);
-        assert_eq!(outcome.transitions[0].command, "/approve-pre-plan");
-        assert_eq!(outcome.transitions[1].command, "/approve-plan");
+        assert_eq!(
+            directive_parts(&outcome.transitions[0]).0,
+            "/approve-pre-plan"
+        );
+        assert_eq!(directive_parts(&outcome.transitions[1]).0, "/approve-plan");
         assert!(outcome.notes.is_empty());
     }
 
@@ -1135,9 +1419,10 @@ mod tests {
         let outcome = advance_phase(&mut state, &[], None, &prompts);
         assert_eq!(state.phase, Phase::PrepAndPlan);
         assert_eq!(outcome.transitions.len(), 1);
-        assert!(outcome.transitions[0].via_reaction);
-        assert_eq!(outcome.transitions[0].command, "/approve-pre-plan");
-        assert_eq!(outcome.transitions[0].by, "reactor");
+        let (command, by, via_reaction) = directive_parts(&outcome.transitions[0]);
+        assert!(via_reaction);
+        assert_eq!(command, "/approve-pre-plan");
+        assert_eq!(by, "reactor");
         assert!(state.consumed_reactions.contains(&100));
         // Re-running with the same reaction is a no-op.
         let outcome = advance_phase(&mut state, &[], None, &prompts);
@@ -1158,7 +1443,7 @@ mod tests {
         let outcome = advance_phase(&mut state, &comments, None, &prompts);
         assert_eq!(state.phase, Phase::PrepAndPlan);
         assert_eq!(outcome.transitions.len(), 1);
-        assert!(!outcome.transitions[0].via_reaction);
+        assert!(!directive_parts(&outcome.transitions[0]).2);
         assert_eq!(outcome.notes.len(), 1);
         assert!(matches!(outcome.notes[0].kind, NoteKind::Stale));
         assert!(outcome.notes[0].via_reaction);
@@ -1170,7 +1455,7 @@ mod tests {
         let mut state = state_in(Phase::PrePlan);
         let prompts = [thumbs(
             10,
-            Directive::ApproveImplementation,
+            Directive::ApprovePlan,
             vec![reaction(100, "+1", "2026-01-01T00:00:00Z")],
         )];
         let outcome = advance_phase(&mut state, &[], None, &prompts);
@@ -1212,10 +1497,12 @@ mod tests {
         let outcome = advance_phase(&mut state, &comments, None, &prompts);
         assert_eq!(state.phase, Phase::Implement);
         assert_eq!(outcome.transitions.len(), 2);
-        assert!(outcome.transitions[0].via_reaction);
-        assert_eq!(outcome.transitions[0].command, "/approve-pre-plan");
-        assert!(!outcome.transitions[1].via_reaction);
-        assert_eq!(outcome.transitions[1].command, "/approve-plan");
+        let (command, _, via_reaction) = directive_parts(&outcome.transitions[0]);
+        assert!(via_reaction);
+        assert_eq!(command, "/approve-pre-plan");
+        let (command, _, via_reaction) = directive_parts(&outcome.transitions[1]);
+        assert!(!via_reaction);
+        assert_eq!(command, "/approve-plan");
     }
 
     #[test]

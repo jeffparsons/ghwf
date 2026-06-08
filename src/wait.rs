@@ -379,10 +379,11 @@ fn evaluate_fresh(
         EndpointKind::PrObject => {
             let pr: PullRequest = serde_json::from_str(body)
                 .with_context(|| format!("failed to parse PR JSON from {}", endpoint.url))?;
-            // No baseline: a wait only runs while the PR is open (work-on
-            // stops the loop once it isn't), so any left-the-open-state
-            // response is a wake. The PR's ETag also bumps on pushes and
-            // comment activity; a fresh-but-open response is not a reason.
+            // No conclusion baseline: a wait only runs while the PR is open
+            // (work-on stops the loop once it isn't), so any
+            // left-the-open-state response is a wake. The PR's ETag also
+            // bumps on pushes and comment activity; a fresh-but-open
+            // response is not a reason by itself.
             match state::pr_outcome(&pr) {
                 Some(state::PrOutcome::Merged) => {
                     reasons.push("The PR was merged.".to_string());
@@ -390,7 +391,17 @@ fn evaluate_fresh(
                 Some(state::PrOutcome::Closed) => {
                     reasons.push("The PR was closed without merging.".to_string());
                 }
-                None => {}
+                // Still open: a draft flip wakes — ready-for-review is what
+                // advances the implement phase.
+                None => match wait.pr_draft {
+                    Some(true) if !pr.draft => {
+                        reasons.push("The PR was marked ready for review.".to_string());
+                    }
+                    Some(false) if pr.draft => {
+                        reasons.push("The PR was converted back to draft.".to_string());
+                    }
+                    _ => {}
+                },
             }
         }
         EndpointKind::Conversation(noun) => {
@@ -648,22 +659,30 @@ fn feed_wake_reasons(
                 let action = event.payload.action.as_deref().unwrap_or("changed");
                 reasons.push(format!("The issue was {action} (via the events feed)."));
             }
-            // Only the closed action matters: it concludes (or halts) the
-            // workflow. Pushes (`synchronize`) and reopens must not wake.
+            // Closed concludes (or halts) the workflow; draft flips advance
+            // it. Pushes (`synchronize`) and reopens must not wake.
             "PullRequestEvent" if ours(&event.payload.pull_request) => {
-                if event.payload.action.as_deref() != Some("closed") {
-                    continue;
+                match event.payload.action.as_deref() {
+                    Some("closed") => {
+                        let merged = event
+                            .payload
+                            .pull_request
+                            .as_ref()
+                            .is_some_and(|pr| pr.merged == Some(true));
+                        reasons.push(if merged {
+                            "The PR was merged (via the events feed).".to_string()
+                        } else {
+                            "The PR was closed without merging (via the events feed).".to_string()
+                        });
+                    }
+                    Some("ready_for_review") => reasons.push(
+                        "The PR was marked ready for review (via the events feed).".to_string(),
+                    ),
+                    Some("converted_to_draft") => reasons.push(
+                        "The PR was converted back to draft (via the events feed).".to_string(),
+                    ),
+                    _ => continue,
                 }
-                let merged = event
-                    .payload
-                    .pull_request
-                    .as_ref()
-                    .is_some_and(|pr| pr.merged == Some(true));
-                reasons.push(if merged {
-                    "The PR was merged (via the events feed).".to_string()
-                } else {
-                    "The PR was closed without merging (via the events feed).".to_string()
-                });
             }
             _ => {}
         }
@@ -910,6 +929,58 @@ mod tests {
         assert!(pr_object_reasons("open", false).is_empty());
     }
 
+    /// Run `evaluate_fresh` for the PR-object endpoint with an open PR in the
+    /// given draft state, against a recorded draft baseline.
+    fn pr_draft_reasons(draft: bool, baseline: Option<bool>) -> Vec<String> {
+        let endpoint = Endpoint {
+            key: "pr",
+            url: "repos/o/r/pulls/18".to_string(),
+            kind: EndpointKind::PrObject,
+        };
+        let body = serde_json::json!({
+            "number": 18,
+            "state": "open",
+            "merged": false,
+            "draft": draft,
+            "html_url": "https://github.com/o/r/pull/18",
+        });
+        let wait = WaitState {
+            pr_draft: baseline,
+            ..Default::default()
+        };
+        let mut reasons = Vec::new();
+        evaluate_fresh(
+            &endpoint,
+            &body.to_string(),
+            &wait,
+            Some("tok"),
+            &mut reasons,
+        )
+        .unwrap();
+        reasons
+    }
+
+    #[test]
+    fn ready_for_review_flip_wakes() {
+        let reasons = pr_draft_reasons(false, Some(true));
+        assert_eq!(reasons, ["The PR was marked ready for review."]);
+    }
+
+    #[test]
+    fn converted_to_draft_flip_wakes() {
+        let reasons = pr_draft_reasons(true, Some(false));
+        assert_eq!(reasons, ["The PR was converted back to draft."]);
+    }
+
+    #[test]
+    fn unchanged_or_unbaselined_draft_state_does_not_wake() {
+        assert!(pr_draft_reasons(true, Some(true)).is_empty());
+        assert!(pr_draft_reasons(false, Some(false)).is_empty());
+        // No baseline recorded (PR opened during the recording run): quiet.
+        assert!(pr_draft_reasons(true, None).is_empty());
+        assert!(pr_draft_reasons(false, None).is_empty());
+    }
+
     fn feed_pr_event(pr: u64, action: &str, merged: bool, at: &str) -> FeedEvent {
         FeedEvent {
             kind: "PullRequestEvent".to_string(),
@@ -936,6 +1007,32 @@ mod tests {
         assert_eq!(
             reasons,
             ["The PR was closed without merging (via the events feed)."]
+        );
+    }
+
+    #[test]
+    fn feed_wakes_on_draft_flip_events() {
+        let events = [feed_pr_event(
+            18,
+            "ready_for_review",
+            false,
+            "2026-06-06T13:00:00Z",
+        )];
+        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, None);
+        assert_eq!(
+            reasons,
+            ["The PR was marked ready for review (via the events feed)."]
+        );
+        let events = [feed_pr_event(
+            18,
+            "converted_to_draft",
+            false,
+            "2026-06-06T13:00:00Z",
+        )];
+        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, None);
+        assert_eq!(
+            reasons,
+            ["The PR was converted back to draft (via the events feed)."]
         );
     }
 

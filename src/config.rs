@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
+use crate::state::{Attention, Phase};
+
 /// Name of the config file ghwf walks up the directory tree to find.
 const CONFIG_FILE: &str = "ghwf.toml";
 
@@ -23,6 +25,73 @@ pub struct Config {
     /// Path to a markdown file of instructions for writing PR titles and
     /// bodies. Defaults to `pull-request.md` next to the config.
     pub pr_instructions: Option<PathBuf>,
+    /// Workflow status labels, mirrored onto the issue and PR as the workflow
+    /// advances. Absent means the feature is off; `ghwf config labels`
+    /// bootstraps the section.
+    pub labels: Option<LabelsConfig>,
+}
+
+/// The `[labels]` section: one GitHub label name per phase and per attention
+/// state. All names are required once the section is present — partial
+/// configs would make the sync's remove-undesired step ambiguous.
+#[derive(Deserialize)]
+pub struct LabelsConfig {
+    pub phase: PhaseLabels,
+    pub attention: AttentionLabels,
+}
+
+/// Label names for the `[labels.phase]` table.
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PhaseLabels {
+    pub pre_plan: String,
+    pub prep_and_plan: String,
+    pub implement: String,
+    pub review: String,
+}
+
+/// Label names for the `[labels.attention]` table.
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct AttentionLabels {
+    pub waiting_on_user: String,
+    pub waiting_on_claude: String,
+    pub waiting_on_ghwf: String,
+}
+
+impl LabelsConfig {
+    /// The configured label for a phase.
+    pub fn for_phase(&self, phase: Phase) -> &str {
+        match phase {
+            Phase::PrePlan => &self.phase.pre_plan,
+            Phase::PrepAndPlan => &self.phase.prep_and_plan,
+            Phase::Implement => &self.phase.implement,
+            Phase::Review => &self.phase.review,
+        }
+    }
+
+    /// The configured label for an attention state.
+    pub fn for_attention(&self, attention: Attention) -> &str {
+        match attention {
+            Attention::WaitingOnUser => &self.attention.waiting_on_user,
+            Attention::WaitingOnClaude => &self.attention.waiting_on_claude,
+            Attention::WaitingOnGhwf => &self.attention.waiting_on_ghwf,
+        }
+    }
+
+    /// Every configured label name. Only these are ever added or removed by
+    /// the sync; the user's other labels are invisible to it.
+    pub fn all(&self) -> [&str; 7] {
+        [
+            &self.phase.pre_plan,
+            &self.phase.prep_and_plan,
+            &self.phase.implement,
+            &self.phase.review,
+            &self.attention.waiting_on_user,
+            &self.attention.waiting_on_claude,
+            &self.attention.waiting_on_ghwf,
+        ]
+    }
 }
 
 /// A parsed config together with the directory it was found in.
@@ -32,6 +101,11 @@ pub struct Located {
 }
 
 impl Located {
+    /// Absolute path to the config file itself.
+    pub fn file_path(&self) -> PathBuf {
+        self.dir.join(CONFIG_FILE)
+    }
+
     /// Absolute path to the main repo.
     pub fn main_repo_path(&self) -> PathBuf {
         match &self.config.main_repo {
@@ -125,6 +199,60 @@ mod tests {
         // Pre-existing configs without the key keep loading.
         let config: Config = toml::from_str(r#"worktrees_dir = "worktrees""#).unwrap();
         assert!(config.priority_labels.is_empty());
+        assert!(config.labels.is_none());
+    }
+
+    #[test]
+    fn labels_section_parses_and_maps() {
+        use crate::state::{Attention, Phase};
+        let config: Config = toml::from_str(
+            r#"
+            worktrees_dir = "worktrees"
+
+            [labels.phase]
+            pre-plan = "ghwf:pre-plan"
+            prep-and-plan = "ghwf:planning"
+            implement = "ghwf:implementing"
+            review = "ghwf:review"
+
+            [labels.attention]
+            waiting-on-user = "ghwf:needs-you"
+            waiting-on-claude = "ghwf:claude-working"
+            waiting-on-ghwf = "ghwf:preparing"
+            "#,
+        )
+        .unwrap();
+        let labels = config.labels.unwrap();
+        assert_eq!(labels.for_phase(Phase::PrePlan), "ghwf:pre-plan");
+        assert_eq!(labels.for_phase(Phase::Review), "ghwf:review");
+        assert_eq!(
+            labels.for_attention(Attention::WaitingOnUser),
+            "ghwf:needs-you"
+        );
+        assert_eq!(
+            labels.for_attention(Attention::WaitingOnGhwf),
+            "ghwf:preparing"
+        );
+        assert_eq!(labels.all().len(), 7);
+    }
+
+    #[test]
+    fn labels_section_missing_key_errors() {
+        // All-or-nothing: a partial table is a config error, not a default.
+        let result: Result<Config, _> = toml::from_str(
+            r#"
+            worktrees_dir = "worktrees"
+
+            [labels.phase]
+            pre-plan = "ghwf:pre-plan"
+
+            [labels.attention]
+            waiting-on-user = "ghwf:needs-you"
+            waiting-on-claude = "ghwf:claude-working"
+            waiting-on-ghwf = "ghwf:preparing"
+            "#,
+        );
+        assert!(result.is_err());
     }
 
     #[test]

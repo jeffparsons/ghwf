@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use url::Url;
 
 use crate::models::{
-    BranchPr, Comment, Issue, IssueListing, PullRequest, Reaction, ReviewComment, User,
+    BranchPr, Comment, Issue, IssueListing, Label, PullRequest, Reaction, ReviewComment, User,
 };
 use crate::{config, git};
 
@@ -253,16 +253,71 @@ pub fn create_draft_pr(
     Ok(number)
 }
 
-/// Mark a draft PR as ready for review.
-pub fn mark_pr_ready(owner: &str, repo: &str, number: u64) -> Result<()> {
-    gh(&[
-        "pr",
-        "ready",
-        &number.to_string(),
-        "-R",
-        &format!("{owner}/{repo}"),
-    ])
-    .map(|_| ())
+/// The label names currently on an issue (or PR — same endpoint).
+pub fn fetch_issue_labels(owner: &str, repo: &str, number: u64) -> Result<Vec<String>> {
+    let endpoint = format!("repos/{owner}/{repo}/issues/{number}/labels?per_page=100");
+    let json = gh_api(&["--paginate", &endpoint])?;
+    let labels: Vec<Label> =
+        serde_json::from_str(&json).context("failed to parse labels JSON from `gh api`")?;
+    Ok(labels.into_iter().map(|label| label.name).collect())
+}
+
+/// Add labels to an issue (or PR). The labels must already exist in the repo.
+pub fn add_issue_labels(owner: &str, repo: &str, number: u64, labels: &[&str]) -> Result<()> {
+    let endpoint = format!("repos/{owner}/{repo}/issues/{number}/labels");
+    let payload = serde_json::json!({ "labels": labels }).to_string();
+    gh_api_stdin(&["--method", "POST", &endpoint, "--input", "-"], &payload).map(|_| ())
+}
+
+/// Remove one label from an issue (or PR).
+pub fn remove_issue_label(owner: &str, repo: &str, number: u64, label: &str) -> Result<()> {
+    let endpoint = format!(
+        "repos/{owner}/{repo}/issues/{number}/labels/{}",
+        encode_path_segment(label)
+    );
+    gh_api(&["--method", "DELETE", &endpoint]).map(|_| ())
+}
+
+/// The names of every label defined in the repo.
+pub fn list_repo_labels(owner: &str, repo: &str) -> Result<Vec<String>> {
+    let endpoint = format!("repos/{owner}/{repo}/labels?per_page=100");
+    let json = gh_api(&["--paginate", &endpoint])?;
+    let labels: Vec<Label> =
+        serde_json::from_str(&json).context("failed to parse repo labels JSON from `gh api`")?;
+    Ok(labels.into_iter().map(|label| label.name).collect())
+}
+
+/// Create a label in the repo.
+pub fn create_label(
+    owner: &str,
+    repo: &str,
+    name: &str,
+    color: &str,
+    description: &str,
+) -> Result<()> {
+    let endpoint = format!("repos/{owner}/{repo}/labels");
+    let payload = serde_json::json!({
+        "name": name,
+        "color": color,
+        "description": description,
+    })
+    .to_string();
+    gh_api_stdin(&["--method", "POST", &endpoint, "--input", "-"], &payload).map(|_| ())
+}
+
+/// Percent-encode a string for use as one URL path segment (label names may
+/// contain spaces and other reserved characters).
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::new();
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// Resolve an issue argument to a `gh api` issues endpoint path.
@@ -508,7 +563,17 @@ fn gh_api_stdin(args: &[&str], input: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_http_head, parse_remote_url};
+    use super::{encode_path_segment, parse_http_head, parse_remote_url};
+
+    #[test]
+    fn path_segment_encoding_covers_label_names() {
+        assert_eq!(encode_path_segment("ghwf:needs-you"), "ghwf%3Aneeds-you");
+        assert_eq!(encode_path_segment("needs you"), "needs%20you");
+        assert_eq!(
+            encode_path_segment("plain-label_1.0~x"),
+            "plain-label_1.0~x"
+        );
+    }
 
     #[test]
     fn http_head_200_with_etag_and_body() {

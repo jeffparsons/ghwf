@@ -2,7 +2,6 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::github;
 use crate::models::Issue;
 use crate::state::{self, IssueState};
 
@@ -51,38 +50,31 @@ pub fn run(
     ))
 }
 
-/// Build the review-phase banner, flipping the draft PR to ready-for-review once.
+/// Build the review-phase banner. The PR is already ready for review — the
+/// user marking it so is what advanced the workflow into this phase.
 ///
 /// `pr_instructions` is the project's PR instructions file, when one exists.
 pub fn review(
     owner: &str,
     repo: &str,
     number: u64,
-    state: &mut IssueState,
+    state: &IssueState,
     pr_instructions: Option<&Path>,
-) -> Result<String> {
-    let Some(prep) = state.prep.as_mut() else {
-        return Ok(no_prep_body(number));
+) -> String {
+    let Some(prep) = state.prep.as_ref() else {
+        return no_prep_body(number);
     };
 
     if prep.no_branch {
-        return Ok(review_no_branch_body(number));
+        return review_no_branch_body(number);
     }
 
     let Some(pr) = prep.pr_number else {
-        return Ok(
-            "Review — awaiting human review. (No ghwf PR was recorded to mark ready.)".to_string(),
-        );
+        return "Review — awaiting human review. (No ghwf PR was recorded.)".to_string();
     };
 
-    // Flip draft → ready exactly once, then remember we did.
-    if !prep.pr_ready {
-        github::mark_pr_ready(owner, repo, pr)?;
-        prep.pr_ready = true;
-    }
-
     let pr_url = format!("https://github.com/{owner}/{repo}/pull/{pr}");
-    Ok(review_body(&pr_url, number, pr_instructions))
+    review_body(&pr_url, number, pr_instructions)
 }
 
 /// The "keep the PR title/body current" paragraph, pointing at the project's
@@ -120,9 +112,10 @@ fn branch_body(
          {pr_line}\n\
          Implement per the plan, committing and pushing to the branch as you go (the draft \
          PR updates automatically). Address any PR feedback shown below. {} When the work is \
-         complete and ready for human review, post a hand-off comment on issue #{number} \
-         and on the PR prompting the user to comment `/approve-implementation` on either \
-         thread (or react 👍 to that comment).\n\n{}",
+         complete and ready for human review, hand off with `ghwf hand-off {number}` (body \
+         from stdin): a comment summarising the change. ghwf appends the next-step \
+         instructions (the user marks the draft PR ready for review) — do not write \
+         them yourself.\n\n{}",
         pr_maintenance_instruction(pr_instructions),
         crate::render::wait_instruction(number)
     )
@@ -132,8 +125,8 @@ fn no_branch_body(number: u64, plan_rel: &str) -> String {
     format!(
         "Implement (--no-branch) — code the change per `{plan_rel}`.\n\n\
          You are managing the branch and commits yourself; there is no ghwf worktree or PR. \
-         When the work is complete, post a comment on issue #{number} prompting the user to \
-         comment `/approve-implementation` (or react 👍 to that comment).\n\n{}",
+         When the work is complete, hand off with `ghwf hand-off {number}` (body from \
+         stdin).\n\n{}",
         crate::render::wait_instruction(number)
     )
 }
@@ -141,7 +134,7 @@ fn no_branch_body(number: u64, plan_rel: &str) -> String {
 fn review_body(pr_url: &str, number: u64, pr_instructions: Option<&Path>) -> String {
     format!(
         "Review — awaiting human review.\n\n\
-         The PR has been marked ready for review: {pr_url}\n\n\
+         The PR is ready for review: {pr_url}\n\n\
          Nothing more is needed from you unless review feedback arrives; it will appear below \
          on future `ghwf work-on {number}` runs. {}\n\n{}",
         pr_maintenance_instruction(pr_instructions),
@@ -179,6 +172,20 @@ mod tests {
             review_no_branch_body(7),
         ] {
             assert!(body.contains("`ghwf wait 7`"), "missing in: {body}");
+        }
+    }
+
+    #[test]
+    fn implement_bodies_hand_off_without_retired_command() {
+        for body in [
+            branch_body("/wt", "plans/7-x.md", None, 7, None),
+            no_branch_body(7, "plans/7-x.md"),
+        ] {
+            assert!(body.contains("`ghwf hand-off 7`"), "missing in: {body}");
+            assert!(
+                !body.contains("/approve-implementation"),
+                "retired in: {body}"
+            );
         }
     }
 

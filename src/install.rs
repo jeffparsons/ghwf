@@ -32,8 +32,10 @@ Run `ghwf work-on $ARGUMENTS` and follow the phase banner exactly:
 
 - Never enter Claude Code plan mode; write any plan as a file where ghwf
   tells you.
-- In pre-plan, post questions and your final summary with
-  `ghwf create-issue-comment $ARGUMENTS`.
+- Post questions and clarifications with `ghwf create-issue-comment
+  $ARGUMENTS`; when a phase's work is done, hand off with `ghwf hand-off
+  $ARGUMENTS` (body from stdin) — ghwf appends the approval prompt itself,
+  so never write one.
 - If ghwf hard-errors that the work belongs in a different worktree, relay its
   relaunch command to the user and stop — do not try to work around it.
 
