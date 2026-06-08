@@ -22,17 +22,37 @@ pub struct Issue {
 }
 
 /// A pull request, trimmed to the fields conclusion and draft-flip detection
-/// need. Only the single-PR fetch carries `merged`.
+/// need, plus the title/body/head the proxy commands read. Only the single-PR
+/// fetch carries `merged`.
 #[derive(Deserialize, Serialize)]
 pub struct PullRequest {
     pub number: u64,
+    // `title`, `body`, and `head` always come back from the single-PR fetch the
+    // proxy commands use; they're `#[serde(default)]` so the conclusion/draft
+    // detection in `wait` can parse a PR object carrying only the fields it
+    // needs.
+    #[serde(default)]
+    pub title: String,
     pub state: String,
     pub merged: bool,
     // Whether the PR is still a draft. The user marking it ready for review
     // is what advances the implement phase.
     #[serde(default)]
     pub draft: bool,
+    // An empty PR body comes back as `null`, hence `Option`.
+    #[serde(default)]
+    pub body: Option<String>,
     pub html_url: String,
+    #[serde(default)]
+    pub head: Head,
+}
+
+/// The head ref of a PR: the branch its commits live on, and its tip SHA.
+#[derive(Deserialize, Serialize, Default)]
+pub struct Head {
+    #[serde(rename = "ref")]
+    pub ref_name: String,
+    pub sha: String,
 }
 
 /// A label on an issue, trimmed to the fields we care about.

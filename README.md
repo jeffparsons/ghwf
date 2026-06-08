@@ -134,6 +134,27 @@ to watching the repo events feed — one rate-limit-free request per cycle —
 after verifying the feed currently shows ghwf's own latest post (it can lag),
 with a full direct sweep every ~5 min as the backstop.
 
+## Proxied GitHub commands
+
+The Claude integration only pre-approves `Bash(ghwf:*)`, so a session never gets
+to run `gh` directly. ghwf proxies the GitHub operations Claude needs during the
+implement and review phases, so it can act on the PR without a permission prompt:
+
+- `ghwf show-pr [issue]` — print the PR's current title, state, and body, the
+  read path for revising it.
+- `ghwf update-pr [issue] [--title <title>]` — set the PR body (read from stdin)
+  and/or its title. To change only the title, pass an empty body, e.g.
+  `ghwf update-pr 49 --title "…" </dev/null`.
+- `ghwf pr-checks [issue] [--log-failed]` — summarise the PR's CI checks
+  (wrapping `gh pr checks`); with `--log-failed`, also dump the failing-job logs
+  for the PR's head commit.
+- `ghwf reply-review-comment [issue] --id <comment-id>` — reply (body from stdin)
+  to an inline review comment thread; the comment ids are the ones `work-on`
+  surfaces.
+
+Each resolves the issue argument the same way the other commands do, and errors
+clearly when the issue has no PR yet.
+
 ## Setting up a project
 
 `ghwf clone` clones a GitHub repo into ghwf's preferred layout in one step:

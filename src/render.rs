@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 
-use crate::models::{Comment, Issue, ReviewComment};
+use crate::models::{Comment, Issue, PullRequest, ReviewComment};
 use crate::state::{Phase, PrOutcome};
 
 /// Opening shared by every hidden ghwf metadata marker, for detection/stripping.
@@ -44,6 +44,24 @@ pub struct ReviewCommentView<'a> {
 /// Render a single comment (e.g. one just created) as pretty-printed JSON.
 pub fn comment_json(comment: &Comment) -> Result<String> {
     serde_json::to_string_pretty(comment).context("failed to serialize comment as JSON")
+}
+
+/// A human-readable overview of a PR's metadata: a header line with number,
+/// title, and state, the URL, then the body (or a placeholder when empty).
+pub fn pr_overview(pr: &PullRequest) -> String {
+    let state = if pr.draft {
+        format!("{}, draft", pr.state)
+    } else {
+        pr.state.clone()
+    };
+    let body = match pr.body.as_deref().map(str::trim) {
+        Some(body) if !body.is_empty() => body,
+        _ => "(no body)",
+    };
+    format!(
+        "#{} {}  ({state})\n{}\n\n{body}",
+        pr.number, pr.title, pr.html_url
+    )
 }
 
 /// Assemble the body of a Claude-authored comment: a visible attribution header,
@@ -614,11 +632,12 @@ fn blockquote(text: &str) -> String {
 mod tests {
     use super::{
         build_comment_body, build_status_comment_body, conflict_notice, extract_marker,
-        hand_off_prompt, hidden_from_digest, render_phase_banner, render_status_comment,
-        render_status_stub, render_work_on, status_primary_is_pr, strip_ghwf_marker, CommentView,
-        DirectiveNote, Marker, NoteKind, ReviewCommentView, Transition, Trigger,
+        hand_off_prompt, hidden_from_digest, pr_overview, render_phase_banner,
+        render_status_comment, render_status_stub, render_work_on, status_primary_is_pr,
+        strip_ghwf_marker, CommentView, DirectiveNote, Marker, NoteKind, ReviewCommentView,
+        Transition, Trigger,
     };
-    use crate::models::{Comment, Issue, ReviewComment, User};
+    use crate::models::{Comment, Head, Issue, PullRequest, ReviewComment, User};
     use crate::state::{Directive, Phase, PrOutcome};
 
     #[test]
@@ -627,6 +646,39 @@ mod tests {
         assert!(notice.contains("origin/main"));
         assert!(notice.contains("git merge origin/main"));
         assert!(notice.contains("#45"));
+    }
+
+    fn pr(body: Option<&str>, draft: bool) -> PullRequest {
+        PullRequest {
+            number: 53,
+            title: "Add a thing".to_string(),
+            state: "open".to_string(),
+            merged: false,
+            draft,
+            body: body.map(str::to_string),
+            html_url: "https://github.com/o/r/pull/53".to_string(),
+            head: Head {
+                ref_name: "branch".to_string(),
+                sha: "deadbeef".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn pr_overview_shows_metadata_and_body() {
+        let out = pr_overview(&pr(Some("The description."), true));
+        assert!(out.contains("#53 Add a thing"));
+        assert!(out.contains("(open, draft)"));
+        assert!(out.contains("https://github.com/o/r/pull/53"));
+        assert!(out.contains("The description."));
+    }
+
+    #[test]
+    fn pr_overview_placeholders_an_empty_body() {
+        assert!(pr_overview(&pr(None, false)).contains("(no body)"));
+        assert!(pr_overview(&pr(Some("   "), false)).contains("(no body)"));
+        // A ready PR omits the draft marker.
+        assert!(!pr_overview(&pr(None, false)).contains("draft"));
     }
 
     fn note(kind: NoteKind, command: &'static str, phase_at: Phase) -> DirectiveNote {
