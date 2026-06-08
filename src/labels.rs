@@ -162,7 +162,13 @@ pub fn configure() -> Result<()> {
             located.file_path().display()
         );
     }
+    configure_at(&located)
+}
 
+/// The body of [`configure`], for callers (the `config init` wizard) that
+/// have already located the config and ruled out an existing `[labels]`
+/// section.
+pub fn configure_at(located: &config::Located) -> Result<()> {
     let (owner, repo) = github::repo_or_cwd()?;
     let existing: BTreeSet<String> = github::list_repo_labels(&owner, &repo)?
         .into_iter()

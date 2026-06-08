@@ -85,6 +85,31 @@ pub fn setup_conventional_remote(repo: &Path) -> Result<()> {
     git(repo, &["remote", "set-head", "origin", "--auto"]).map(|_| ())
 }
 
+/// Whether `dir` is inside a git work tree (false in a bare repo or outside
+/// git entirely).
+pub fn is_inside_work_tree(dir: &Path) -> bool {
+    git(dir, &["rev-parse", "--is-inside-work-tree"])
+        .map(|out| out.trim() == "true")
+        .unwrap_or(false)
+}
+
+/// Root of the work tree containing `dir`.
+pub fn toplevel(dir: &Path) -> Result<PathBuf> {
+    Ok(PathBuf::from(
+        git(dir, &["rev-parse", "--show-toplevel"])?.trim(),
+    ))
+}
+
+/// Whether `dir` is (or is inside) a git repository, bare or not.
+pub fn is_repo(dir: &Path) -> bool {
+    dir.is_dir() && git_ok(dir, &["rev-parse", "--git-dir"])
+}
+
+/// Whether `relpath` is already ignored by the repo's gitignore rules.
+pub fn is_ignored(repo: &Path, relpath: &str) -> bool {
+    git_ok(repo, &["check-ignore", "-q", relpath])
+}
+
 /// The URL of the repo's `origin` remote.
 pub fn remote_url(repo: &Path) -> Result<String> {
     Ok(git(repo, &["remote", "get-url", "origin"])?

@@ -6,10 +6,10 @@ use serde::Deserialize;
 use crate::state::{Attention, Phase};
 
 /// Name of the config file ghwf walks up the directory tree to find.
-const CONFIG_FILE: &str = "ghwf.toml";
+pub const CONFIG_FILE: &str = "ghwf.toml";
 
 /// Default name of the PR instructions file, next to the config.
-const PR_INSTRUCTIONS_FILE: &str = "pull-request.md";
+pub const PR_INSTRUCTIONS_FILE: &str = "pull-request.md";
 
 /// Contents of a `ghwf.toml`. Paths are relative to the file's own directory.
 #[derive(Deserialize)]
@@ -29,6 +29,10 @@ pub struct Config {
     /// advances. Absent means the feature is off; `ghwf config labels`
     /// bootstraps the section.
     pub labels: Option<LabelsConfig>,
+    /// Permission mode passed to launched Claude sessions as
+    /// `--permission-mode <value>` (e.g. "auto"). Absent means Claude's
+    /// default prompting behaviour.
+    pub permission_mode: Option<String>,
 }
 
 /// The `[labels]` section: one GitHub label name per phase and per attention
@@ -130,7 +134,7 @@ impl Located {
 
 /// Walk up from the current directory looking for a `ghwf.toml`, returning its
 /// path if found.
-fn locate() -> Option<PathBuf> {
+pub fn locate() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     cwd.ancestors()
         .map(|dir| dir.join(CONFIG_FILE))
@@ -161,7 +165,8 @@ pub fn warn_if_absent() {
     if locate().is_none() {
         eprintln!(
             "warning: no {CONFIG_FILE} found in this or any parent directory; \
-             commands that create worktrees will require one."
+             commands that create worktrees will require one. \
+             Run `ghwf config init` to set one up."
         );
     }
 }
@@ -172,7 +177,8 @@ pub fn require() -> Result<Located> {
         Some(located) => Ok(located),
         None => bail!(
             "this step requires a {CONFIG_FILE} (with `worktrees_dir`) in this or a parent \
-             directory; none found. Use --no-branch to work without one."
+             directory; none found. Run `ghwf config init` to set one up, or use --no-branch \
+             to work without one."
         ),
     }
 }
@@ -200,6 +206,25 @@ mod tests {
         let config: Config = toml::from_str(r#"worktrees_dir = "worktrees""#).unwrap();
         assert!(config.priority_labels.is_empty());
         assert!(config.labels.is_none());
+    }
+
+    #[test]
+    fn permission_mode_parses() {
+        let config: Config = toml::from_str(
+            r#"
+            worktrees_dir = "worktrees"
+            permission_mode = "auto"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.permission_mode.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn permission_mode_defaults_to_none() {
+        // Pre-existing configs without the key keep loading.
+        let config: Config = toml::from_str(r#"worktrees_dir = "worktrees""#).unwrap();
+        assert!(config.permission_mode.is_none());
     }
 
     #[test]

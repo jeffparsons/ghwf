@@ -138,8 +138,10 @@ works.
 
 ## Configuration
 
-ghwf needs a `ghwf.toml`, found by walking up from the current directory —
-`ghwf clone` generates one, or write it by hand for other layouts:
+ghwf needs a `ghwf.toml`, found by walking up from the current directory.
+`ghwf clone` generates one; `ghwf config init` sets one up (or extends one)
+interactively for other layouts. The annotated example below shows what it
+manages:
 
 ```toml
 # Path to the main git repo (omit or "." if the config sits at the repo root).
@@ -156,6 +158,11 @@ priority_labels = ["urgent", "soon"]
 # updating; when it doesn't, a brief generic instruction applies instead. The
 # file is free-form prose and may itself refer to repo-versioned templates.
 pr_instructions = "pull-request.md"
+# Permission mode for the Claude sessions ghwf launches, passed through as
+# `claude --permission-mode <value>` (optional; omit for Claude's default
+# prompting behaviour). "auto" is recommended for unattended use — without
+# it, sessions quickly stall on permission prompts.
+permission_mode = "auto"
 ```
 
 ## Installing the Claude Code integration
