@@ -389,6 +389,23 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         },
     };
 
+    // Detect a merge conflict with the moved-on base, for the implement and
+    // review phases of an open PR. Detection is local (a git fetch plus an
+    // in-memory merge-tree, no GitHub API), and surfaced by leading the banner
+    // with a resolve-it-now instruction. The notice is never posted to a
+    // thread and clears itself once Claude pushes the merge.
+    let conflict_base = match (issue_state.pr_outcome, phase) {
+        (None, state::Phase::Implement | state::Phase::Review) => issue_state
+            .prep
+            .as_ref()
+            .and_then(implement::detect_conflict),
+        _ => None,
+    };
+    let body = match &conflict_base {
+        Some(base) => format!("{}\n\n{body}", render::conflict_notice(base, number)),
+        None => body,
+    };
+
     // We didn't hard-need a config (or we'd have errored above); still nudge if
     // it's absent.
     config::warn_if_absent();
@@ -624,7 +641,9 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         || body_changed
         || !new_issue.is_empty()
         || !new_pr.is_empty()
-        || !new_review.is_empty();
+        || !new_review.is_empty()
+        // A standing conflict keeps the ball with Claude until it's resolved.
+        || conflict_base.is_some();
     if activity {
         issue_state.stop_nudges = 0;
     }
