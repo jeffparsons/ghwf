@@ -69,6 +69,20 @@ session has already started are skipped too (ghwf can't tell whether another
 session is still working them); `next` lists the ones it passed over — resume
 those explicitly with `ghwf work-on <n>`.
 
+`next` also respects GitHub's issue relationships, again listing what it passes
+over:
+
+- **Currently-blocked issues** — those with at least one *open* "blocked by"
+  dependency — are skipped until the blocker closes. (A blocker that's already
+  closed no longer counts.) When the last open blocker closes, the issue
+  becomes pickable automatically — `next --wait` even wakes on the change.
+- **Tracking issues** — those with sub-issues — are never worked directly. Their
+  sub-issues are ordinary open issues, so they're picked on their own merits;
+  running `ghwf work-on <tracking-issue>` redirects to one of its workable
+  sub-issues (the same ordering above, skipping blocked ones, descending through
+  nested tracking issues, and resuming one already in progress when there is
+  one).
+
 The pick is **claimed** before work starts: ghwf records the issue's state file
 atomically, reserving it against any other `next` run on the machine, and
 assigns the issue to you on GitHub so the pickup is visible (e.g. from your

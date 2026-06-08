@@ -20,11 +20,13 @@ const MAX_CONSECUTIVE_FAILURES: u32 = 30;
 /// and return its number for the caller to hand to `work-on`.
 ///
 /// Eligible issues are the repo's open issues, excluding PRs, issues assigned
-/// to someone other than the user, and issues that already have recorded ghwf
-/// state (some session has already started them — `next` can't tell whether
-/// that session is still live, so it never picks them; `ghwf work-on <n>`
-/// resumes them explicitly). Claiming the winner atomically reserves it against
-/// concurrent `next`/`next --wait` runs, and assigns it on GitHub.
+/// to someone other than the user, issues that already have recorded ghwf state
+/// (some session has already started them — `next` can't tell whether that
+/// session is still live, so it never picks them; `ghwf work-on <n>` resumes
+/// them explicitly), issues currently blocked by an open dependency, and
+/// tracking issues (those with sub-issues — their sub-issues are picked
+/// instead). Claiming the winner atomically reserves it against concurrent
+/// `next`/`next --wait` runs, and assigns it on GitHub.
 pub fn pick() -> Result<u64> {
     let priority_labels = match config::find()? {
         Some(located) => located.config.priority_labels,
@@ -208,6 +210,15 @@ fn announce_pick(
     for number in &selection.skipped_started {
         println!("Skipping #{number} — already started; resume it with `ghwf work-on {number}`.");
     }
+    for number in &selection.skipped_blocked {
+        println!("Skipping #{number} — blocked by an open issue.");
+    }
+    for number in &selection.skipped_tracking {
+        println!(
+            "Skipping #{number} — a tracking issue (has sub-issues); \
+             work a sub-issue with `ghwf work-on {number}` or `ghwf work-on <sub>`."
+        );
+    }
     let issue = selection.picked?;
     if !assigned_to(issue, me) {
         if let Err(err) = github::add_assignee(owner, repo, issue.number, me) {
@@ -226,11 +237,13 @@ fn announce_pick(
     Some(issue.number)
 }
 
-/// The outcome of [`select`]: the winning issue, if any, and the
-/// already-started issues passed over (in listing order).
+/// The outcome of [`select`]: the winning issue, if any, and the issues passed
+/// over for a reportable reason (each in listing order).
 struct Selection<'a> {
     picked: Option<&'a IssueListing>,
     skipped_started: Vec<u64>,
+    skipped_blocked: Vec<u64>,
+    skipped_tracking: Vec<u64>,
 }
 
 /// Choose the most important eligible issue.
@@ -238,8 +251,10 @@ struct Selection<'a> {
 /// Sort key, ascending — first wins: issues assigned to `me` before
 /// unassigned ones, then the best (earliest-in-list) priority label, then the
 /// lowest issue number. PRs and issues assigned to someone else are excluded
-/// outright; otherwise-eligible issues for which `already_started` returns
-/// true are skipped and reported.
+/// outright; otherwise-eligible issues that are already started, currently
+/// blocked, or tracking issues (have sub-issues) are skipped and reported. When
+/// an issue qualifies for several skips, the precedence is started → blocked →
+/// tracking.
 fn select<'a>(
     issues: &'a [IssueListing],
     me: &str,
@@ -247,6 +262,8 @@ fn select<'a>(
     already_started: impl Fn(u64) -> bool,
 ) -> Selection<'a> {
     let mut skipped_started = Vec::new();
+    let mut skipped_blocked = Vec::new();
+    let mut skipped_tracking = Vec::new();
     let mut candidates: Vec<&IssueListing> = Vec::new();
     for issue in issues {
         if issue.pull_request.is_some() {
@@ -259,19 +276,33 @@ fn select<'a>(
             skipped_started.push(issue.number);
             continue;
         }
+        if issue.is_blocked() {
+            skipped_blocked.push(issue.number);
+            continue;
+        }
+        if issue.is_tracking() {
+            skipped_tracking.push(issue.number);
+            continue;
+        }
         candidates.push(issue);
     }
-    candidates.sort_by_key(|issue| {
-        (
-            !assigned_to(issue, me),
-            label_rank(issue, priority_labels),
-            issue.number,
-        )
-    });
+    candidates.sort_by_key(|issue| sort_key(issue, me, priority_labels));
     Selection {
         picked: candidates.first().copied(),
         skipped_started,
+        skipped_blocked,
+        skipped_tracking,
     }
+}
+
+/// The ascending sort key shared by `select` and the tracking-issue redirect:
+/// assigned-to-`me` first, then best priority label, then lowest number.
+fn sort_key(issue: &IssueListing, me: &str, priority_labels: &[String]) -> (bool, usize, u64) {
+    (
+        !assigned_to(issue, me),
+        label_rank(issue, priority_labels),
+        issue.number,
+    )
 }
 
 /// Whether `me` is among the issue's assignees. GitHub logins are
@@ -317,19 +348,137 @@ fn rationale(issue: &IssueListing, me: &str, priority_labels: &[String]) -> Stri
     }
 }
 
+/// Resolve the issue a launch should actually work on.
+///
+/// For a normal issue this is `number` itself. For a *tracking* issue (one with
+/// sub-issues) it is a workable descendant, chosen by the same ordering `select`
+/// uses but preferring an already-started one so re-running `work-on <parent>`
+/// resumes in-progress work. Recurses through tracking-issue children to reach a
+/// workable leaf.
+///
+/// Best-effort about *discovering* relationships: if the first sub-issues lookup
+/// fails (offline, or the feature is unavailable) it warns and returns `number`
+/// unchanged, preserving the launcher's offline path. A genuine "this is a
+/// tracking issue but nothing under it is workable" outcome is surfaced as an
+/// error rather than silently working the parent.
+pub fn resolve_workable(owner: &str, repo: &str, number: u64) -> Result<u64> {
+    let children = match github::list_sub_issues(owner, repo, number) {
+        Ok(children) => children,
+        Err(err) => {
+            eprintln!(
+                "warning: couldn't check issue relationships for #{number} \
+                 (working it as given): {err:#}"
+            );
+            return Ok(number);
+        }
+    };
+    if children.is_empty() {
+        // Not a tracking issue: work it directly.
+        return Ok(number);
+    }
+
+    let priority_labels = match config::find()? {
+        Some(located) => located.config.priority_labels,
+        None => Vec::new(),
+    };
+    let me = github::authenticated_user()?;
+    pick_workable_leaf(
+        number,
+        children,
+        &me,
+        &priority_labels,
+        &|n| github::list_sub_issues(owner, repo, n),
+        &started_fn(owner, repo),
+    )
+}
+
+/// Choose a workable descendant leaf of tracking issue `parent`, whose direct
+/// `children` have already been fetched. Recurses into tracking children via
+/// `list_children`; `already_started` reports whether a leaf has recorded ghwf
+/// state. Both are injected so the traversal is testable without the network or
+/// a filesystem.
+///
+/// Preference order: an already-started leaf (resumed — even if now blocked,
+/// since work is underway) before the best fresh, non-blocked one. Errors when
+/// no descendant is workable.
+fn pick_workable_leaf(
+    parent: u64,
+    children: Vec<IssueListing>,
+    me: &str,
+    priority_labels: &[String],
+    list_children: &impl Fn(u64) -> Result<Vec<IssueListing>>,
+    already_started: &impl Fn(u64) -> bool,
+) -> Result<u64> {
+    // Guard against a malformed cycle in the sub-issue graph, and dedupe a leaf
+    // reachable via more than one parent.
+    let mut visited: BTreeSet<u64> = BTreeSet::new();
+    visited.insert(parent);
+    let mut leaves: Vec<IssueListing> = Vec::new();
+    for child in children.into_iter().filter(IssueListing::is_open) {
+        collect_leaves(child, list_children, &mut visited, &mut leaves)?;
+    }
+
+    if let Some(best) = leaves
+        .iter()
+        .filter(|leaf| already_started(leaf.number))
+        .min_by_key(|leaf| sort_key(leaf, me, priority_labels))
+    {
+        return Ok(best.number);
+    }
+    if let Some(best) = leaves
+        .iter()
+        .filter(|leaf| !leaf.is_blocked())
+        .min_by_key(|leaf| sort_key(leaf, me, priority_labels))
+    {
+        return Ok(best.number);
+    }
+    bail!(
+        "#{parent} is a tracking issue, but none of its sub-issues are workable \
+         (all are blocked, closed, or already complete); pick a specific sub-issue \
+         with `ghwf work-on <sub>`."
+    )
+}
+
+/// Depth-first walk from `node`, pushing each open non-tracking leaf into
+/// `leaves`. Tracking nodes are descended into (their children fetched via
+/// `list_children`); `visited` dedupes and stops cycles.
+fn collect_leaves(
+    node: IssueListing,
+    list_children: &impl Fn(u64) -> Result<Vec<IssueListing>>,
+    visited: &mut BTreeSet<u64>,
+    leaves: &mut Vec<IssueListing>,
+) -> Result<()> {
+    if !visited.insert(node.number) {
+        return Ok(());
+    }
+    if node.is_tracking() {
+        for child in list_children(node.number)?
+            .into_iter()
+            .filter(IssueListing::is_open)
+        {
+            collect_leaves(child, list_children, visited, leaves)?;
+        }
+    } else {
+        leaves.push(node);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeSet;
 
-    use super::{claim_pick, select, Selection};
-    use crate::models::{IssueListing, Label, User};
+    use super::{claim_pick, pick_workable_leaf, select, Selection};
+    use crate::models::{IssueDependenciesSummary, IssueListing, Label, SubIssuesSummary, User};
 
-    /// An open issue with the given assignees and labels.
+    /// An open issue with the given assignees and labels, not blocked and not a
+    /// tracking issue.
     fn issue(number: u64, assignees: &[&str], labels: &[&str]) -> IssueListing {
         IssueListing {
             number,
             title: format!("issue {number}"),
+            state: String::new(),
             assignees: assignees
                 .iter()
                 .map(|login| User {
@@ -343,6 +492,8 @@ mod tests {
                 })
                 .collect(),
             pull_request: None,
+            issue_dependencies_summary: IssueDependenciesSummary::default(),
+            sub_issues_summary: SubIssuesSummary::default(),
         }
     }
 
@@ -352,6 +503,28 @@ mod tests {
             pull_request: Some(serde_json::json!({})),
             ..issue(number, &[], &[])
         }
+    }
+
+    /// An issue blocked by `n` open issues.
+    fn blocked(number: u64, n: u64) -> IssueListing {
+        IssueListing {
+            issue_dependencies_summary: IssueDependenciesSummary { blocked_by: n },
+            ..issue(number, &[], &[])
+        }
+    }
+
+    /// A tracking issue: one carrying `n` sub-issues.
+    fn tracking(number: u64, n: u64) -> IssueListing {
+        IssueListing {
+            sub_issues_summary: SubIssuesSummary { total: n },
+            ..issue(number, &[], &[])
+        }
+    }
+
+    /// Set a non-open state on an issue (sub-issue children can be closed).
+    fn closed(mut issue: IssueListing) -> IssueListing {
+        issue.state = "closed".to_string();
+        issue
     }
 
     fn labels(names: &[&str]) -> Vec<String> {
@@ -522,5 +695,121 @@ mod tests {
         assert!(selection.picked.is_none());
         // Every candidate was tried exactly once.
         assert_eq!(*attempts.borrow(), [3, 5]);
+    }
+
+    #[test]
+    fn blocked_issue_is_skipped_and_reported() {
+        // #1 would sort first but is blocked, so #2 wins.
+        let issues = [blocked(1, 1), issue(2, &[], &[])];
+        let selection = pick(&issues, "me", &[]);
+        assert_eq!(selection.picked.unwrap().number, 2);
+        assert_eq!(selection.skipped_blocked, [1]);
+    }
+
+    #[test]
+    fn tracking_issue_is_skipped_and_reported() {
+        let issues = [tracking(1, 2), issue(2, &[], &[])];
+        let selection = pick(&issues, "me", &[]);
+        assert_eq!(selection.picked.unwrap().number, 2);
+        assert_eq!(selection.skipped_tracking, [1]);
+    }
+
+    #[test]
+    fn closed_only_blockers_stay_pickable() {
+        // `blocked_by` counts open blockers; closed-only blockers leave it at 0,
+        // so the issue is not currently blocked.
+        let issues = [blocked(1, 0)];
+        let selection = pick(&issues, "me", &[]);
+        assert_eq!(selection.picked.unwrap().number, 1);
+        assert!(selection.skipped_blocked.is_empty());
+    }
+
+    #[test]
+    fn started_takes_precedence_over_blocked_and_tracking() {
+        // An issue that is started, blocked, and tracking is reported as started.
+        let mut both = blocked(1, 1);
+        both.sub_issues_summary = SubIssuesSummary { total: 2 };
+        let issues = [both, issue(2, &[], &[])];
+        let selection = select(&issues, "me", &[], |n| n == 1);
+        assert_eq!(selection.picked.unwrap().number, 2);
+        assert_eq!(selection.skipped_started, [1]);
+        assert!(selection.skipped_blocked.is_empty());
+        assert!(selection.skipped_tracking.is_empty());
+    }
+
+    #[test]
+    fn blocked_takes_precedence_over_tracking() {
+        let mut both = blocked(1, 1);
+        both.sub_issues_summary = SubIssuesSummary { total: 2 };
+        let issues = [both];
+        let selection = select(&issues, "me", &[], |_| false);
+        assert_eq!(selection.skipped_blocked, [1]);
+        assert!(selection.skipped_tracking.is_empty());
+    }
+
+    /// `list_children` that returns nothing — for leaf-only child sets.
+    fn no_children(_: u64) -> super::Result<Vec<IssueListing>> {
+        Ok(Vec::new())
+    }
+
+    #[test]
+    fn redirect_picks_best_ordered_child() {
+        // Two leaf children; the lower number wins.
+        let children = vec![issue(5, &[], &[]), issue(3, &[], &[])];
+        let n = pick_workable_leaf(1, children, "me", &[], &no_children, &|_| false).unwrap();
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn redirect_recurses_through_tracking_child() {
+        // #1 → tracking child #2 → leaf grandchild #7.
+        let top = vec![tracking(2, 1)];
+        let list = |n: u64| {
+            if n == 2 {
+                Ok(vec![issue(7, &[], &[])])
+            } else {
+                Ok(Vec::new())
+            }
+        };
+        let n = pick_workable_leaf(1, top, "me", &[], &list, &|_| false).unwrap();
+        assert_eq!(n, 7);
+    }
+
+    #[test]
+    fn redirect_prefers_a_started_child() {
+        // #3 sorts first, but #5 is already started, so it is resumed.
+        let children = vec![issue(3, &[], &[]), issue(5, &[], &[])];
+        let n = pick_workable_leaf(1, children, "me", &[], &no_children, &|x| x == 5).unwrap();
+        assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn redirect_resumes_a_started_child_even_if_blocked() {
+        // A started leaf is resumed regardless of its block — work is underway.
+        let children = vec![blocked(3, 1)];
+        let n = pick_workable_leaf(1, children, "me", &[], &no_children, &|x| x == 3).unwrap();
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn redirect_skips_blocked_fresh_children() {
+        let children = vec![blocked(3, 1), issue(5, &[], &[])];
+        let n = pick_workable_leaf(1, children, "me", &[], &no_children, &|_| false).unwrap();
+        assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn redirect_ignores_closed_children() {
+        // #3 is blocked and #5 is closed, so nothing is workable.
+        let children = vec![blocked(3, 1), closed(issue(5, &[], &[]))];
+        let result = pick_workable_leaf(1, children, "me", &[], &no_children, &|_| false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn redirect_errors_when_no_descendant_is_workable() {
+        let children = vec![blocked(3, 1), blocked(4, 2)];
+        let result = pick_workable_leaf(1, children, "me", &[], &no_children, &|_| false);
+        assert!(result.is_err());
     }
 }

@@ -5,7 +5,7 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 
 use crate::state::{self, IssueState};
-use crate::{config, git, github, prep, store};
+use crate::{config, git, github, next, prep, store};
 
 /// Run `work-on` as a launcher: no Claude session is present, so prepare the
 /// issue's worktree and replace this process with an interactive Claude session
@@ -21,7 +21,13 @@ pub fn run(issue_arg: &str, no_branch: bool) -> Result<()> {
     );
 
     let repo_ctx = github::config_repo()?;
-    let (owner, repo, number) = github::resolve_issue_ref(issue_arg, repo_ctx.as_ref())?;
+    let (owner, repo, requested) = github::resolve_issue_ref(issue_arg, repo_ctx.as_ref())?;
+    // A tracking issue (one with sub-issues) is never worked directly: redirect
+    // to a workable sub-issue so the session is anchored to the real work.
+    let number = next::resolve_workable(&owner, &repo, requested)?;
+    if number != requested {
+        println!("Issue #{requested} is a tracking issue; working sub-issue #{number} instead.");
+    }
     let mut issue_state = state::load(&owner, &repo, number)?;
 
     // The recorded mode wins over the flag, as in prep-and-plan.
@@ -107,7 +113,10 @@ pub fn run(issue_arg: &str, no_branch: bool) -> Result<()> {
                 "Issue #{number} has no worktree yet; creating it now so the Claude session \
                  is anchored there and can be resumed for later phases."
             );
-            let issue_data = github::fetch_issue(issue_arg, repo_ctx.as_ref())?;
+            // Fetch the issue we resolved to work on. After a tracking-issue
+            // redirect that is a sub-issue, not the `issue_arg` the user named,
+            // so fetch by the canonical URL of the resolved number.
+            let issue_data = github::fetch_issue(&issue_url, repo_ctx.as_ref())?;
             let (path, branch) =
                 prep::ensure_worktree(&issue_data, &owner, &repo, &mut issue_state)?;
             state::save(&owner, &repo, number, &issue_state)?;
