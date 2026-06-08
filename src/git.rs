@@ -270,12 +270,57 @@ pub fn remove_worktree(repo: &Path, path: &Path) -> Result<()> {
     git(repo, &["worktree", "remove", path]).map(|_| ())
 }
 
+/// The commit that *added* `relpath` on the current history, or `None` when the
+/// path was never added. When the path was added more than once (added, removed,
+/// re-added), the oldest such commit is returned.
+pub fn commit_that_added(dir: &Path, relpath: &str) -> Result<Option<String>> {
+    let out = git(
+        dir,
+        &["log", "--diff-filter=A", "--format=%H", "--", relpath],
+    )?;
+    Ok(out.lines().last().map(|line| line.trim().to_string()))
+}
+
+/// True if `range` (e.g. `A..HEAD`) contains any merge commit.
+pub fn range_has_merges(dir: &Path, range: &str) -> Result<bool> {
+    Ok(!git(dir, &["rev-list", "--merges", range])?
+        .trim()
+        .is_empty())
+}
+
+/// True if any commit in `range` touched `relpath`.
+pub fn path_touched_in_range(dir: &Path, range: &str, relpath: &str) -> Result<bool> {
+    Ok(!git(dir, &["rev-list", range, "--", relpath])?
+        .trim()
+        .is_empty())
+}
+
+/// Replay the commits after `upstream` onto `onto`, dropping `upstream` itself
+/// (`git rebase --onto <onto> <upstream>`). The caller is responsible for
+/// aborting on failure.
+pub fn rebase_onto(dir: &Path, onto: &str, upstream: &str) -> Result<()> {
+    git(dir, &["rebase", "--onto", onto, upstream]).map(|_| ())
+}
+
+/// Abort an in-progress rebase, best-effort (used to clean up after a failed
+/// [`rebase_onto`]).
+pub fn rebase_abort(dir: &Path) -> Result<()> {
+    git(dir, &["rebase", "--abort"]).map(|_| ())
+}
+
+/// Force-push `branch` to origin, refusing to clobber unseen remote work
+/// (`--force-with-lease`).
+pub fn force_push_with_lease(dir: &Path, branch: &str) -> Result<()> {
+    git(dir, &["push", "--force-with-lease", "origin", branch]).map(|_| ())
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::{
-        delete_local_branch, delete_remote_branch, fetch, has_untracked_files, is_ancestor,
-        is_tree_clean, list_local_branches, list_remote_branches, merge_ff_only,
-        parse_worktree_list, remove_worktree, rev_parse_ok,
+        commit_that_added, delete_local_branch, delete_remote_branch, fetch, force_push_with_lease,
+        has_untracked_files, is_ancestor, is_tree_clean, list_local_branches, list_remote_branches,
+        merge_ff_only, parse_worktree_list, path_touched_in_range, range_has_merges, rebase_onto,
+        remove_worktree, rev_parse_ok,
     };
     use std::path::{Path, PathBuf};
 
@@ -489,6 +534,92 @@ pub mod tests {
         std::fs::write(wt.join("file.txt"), "one\n").unwrap();
         remove_worktree(&root, &wt).unwrap();
         assert!(!wt.exists());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Commit `relpath` with `content` and `message` in `dir`.
+    fn commit_path(dir: &Path, relpath: &str, content: &str, message: &str) {
+        let path = dir.join(relpath);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+        run_git(dir, &["add", "--", relpath]);
+        run_git(dir, &["commit", "-m", message]);
+    }
+
+    #[test]
+    fn rebase_drops_the_plan_commit_keeping_later_work() {
+        let root = scratch("rebase-drop");
+        init_repo(&root);
+        // base → plan → two implementation commits, none of which touch the plan.
+        commit_path(&root, "plans/1-x.md", "plan\n", "Add plan for #1");
+        let plan = rev_parse(&root, "HEAD");
+        commit_path(&root, "src/a.rs", "a\n", "impl a");
+        commit_path(&root, "src/b.rs", "b\n", "impl b");
+
+        // The plan commit is correctly identified, and its history is linear.
+        assert_eq!(
+            commit_that_added(&root, "plans/1-x.md").unwrap().as_deref(),
+            Some(plan.as_str())
+        );
+        assert!(!range_has_merges(&root, &format!("{plan}^..HEAD")).unwrap());
+        assert!(!path_touched_in_range(&root, &format!("{plan}..HEAD"), "plans/1-x.md").unwrap());
+
+        // Dropping it removes the plan file but keeps the implementation work.
+        rebase_onto(&root, &format!("{plan}^"), &plan).unwrap();
+        assert!(!root.join("plans/1-x.md").exists());
+        assert!(root.join("src/a.rs").exists());
+        assert!(root.join("src/b.rs").exists());
+        assert!(commit_that_added(&root, "plans/1-x.md").unwrap().is_none());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn merge_and_later_modification_are_detected() {
+        let root = scratch("rebase-detect");
+        init_repo(&root);
+        commit_path(&root, "plans/1-x.md", "plan\n", "Add plan for #1");
+        let plan = rev_parse(&root, "HEAD");
+
+        // A side branch merged back in introduces a merge commit in the range.
+        run_git(&root, &["checkout", "-b", "side"]);
+        commit_path(&root, "src/s.rs", "s\n", "side work");
+        run_git(&root, &["checkout", "main"]);
+        commit_path(&root, "src/m.rs", "m\n", "main work");
+        run_git(&root, &["merge", "--no-ff", "-m", "merge side", "side"]);
+        assert!(range_has_merges(&root, &format!("{plan}^..HEAD")).unwrap());
+
+        // A later commit that edits the plan file is detected.
+        commit_path(&root, "plans/1-x.md", "plan v2\n", "tweak plan");
+        assert!(path_touched_in_range(&root, &format!("{plan}..HEAD"), "plans/1-x.md").unwrap());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn force_push_with_lease_updates_origin() {
+        let root = scratch("force-push");
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        run_git(&origin, &["init", "--bare", "-b", "main"]);
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        run_git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        commit_path(&repo, "plans/1-x.md", "plan\n", "Add plan for #1");
+        let plan = rev_parse(&repo, "HEAD");
+        commit_path(&repo, "src/a.rs", "a\n", "impl a");
+        run_git(&repo, &["push", "-u", "origin", "main"]);
+
+        // Rewrite history, then force-push: origin follows the rewritten tip.
+        rebase_onto(&repo, &format!("{plan}^"), &plan).unwrap();
+        force_push_with_lease(&repo, "main").unwrap();
+        run_git(&repo, &["fetch", "origin"]);
+        assert_eq!(rev_parse(&repo, "main"), rev_parse(&repo, "origin/main"));
 
         std::fs::remove_dir_all(&root).unwrap();
     }

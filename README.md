@@ -184,6 +184,14 @@ pr_instructions = "pull-request.md"
 # prompting behaviour). "auto" is recommended for unattended use — without
 # it, sessions quickly stall on permission prompts.
 permission_mode = "auto"
+# When true, ghwf rewrites the plan commit out of the branch's history once you
+# approve the implementation (mark the draft PR ready for review), then
+# force-pushes the branch — for repos that don't want Claude's plans committed
+# (optional; default false). It rebases out the single commit that added
+# `plans/<n>-<slug>.md`. Skipped with a warning when it can't be done safely
+# (dirty worktree, merge commits on the branch, the plan modified by a later
+# commit, a rejected push), and a no-op in --no-branch mode.
+delete_plan_on_approval = true
 ```
 
 ## Installing the Claude Code integration
