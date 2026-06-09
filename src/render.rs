@@ -131,7 +131,11 @@ pub fn question_instruction(number: u64) -> String {
         "If you need an answer from the user to proceed, never use an interactive \
          prompt (no AskUserQuestion, and don't ask in prose and stop): post the \
          question with `ghwf hand-off {number} --question` (body from stdin) — that \
-         flips the issue to \"needs you\" — then `ghwf wait {number}` for the reply."
+         flips the issue to \"needs you\" — then `ghwf wait {number}` for the reply. \
+         If the user replies to only part of what you raised, assume more comments \
+         may be coming: answer what arrived and wait again rather than treating the \
+         unanswered questions, options, or suggested defaults as settled — only an \
+         explicit phase approval does that."
     )
 }
 
@@ -178,6 +182,9 @@ pub fn pre_plan_body(number: u64) -> String {
          `ghwf create-issue-comment {number}`; if an answer is needed before you can \
          proceed, use `ghwf hand-off {number} --question` instead so the issue flips to \
          \"needs you\". Either way, never raise an interactive prompt (no AskUserQuestion). \
+         A reply that addresses only part of what you asked is not a sign the user is \
+         done — assume more may be coming, so respond and keep waiting rather than \
+         proceeding on the unanswered points. \
          When you have enough information, hand off \
          with `ghwf hand-off {number}` (body from stdin): a comment that summarises your \
          understanding and clearly states you are ready to write a plan. ghwf appends the \
@@ -744,10 +751,23 @@ mod tests {
     }
 
     #[test]
+    fn question_instruction_warns_against_treating_partial_replies_as_done() {
+        let out = super::question_instruction(7);
+        assert!(out.contains("part of what you raised"));
+        assert!(out.contains("more comments"));
+    }
+
+    #[test]
     fn pre_plan_body_steers_questions_off_interactive_prompts() {
         let body = super::pre_plan_body(7);
         assert!(body.contains("`ghwf hand-off 7 --question`"));
         assert!(body.contains("AskUserQuestion"));
+    }
+
+    #[test]
+    fn pre_plan_body_warns_against_treating_partial_replies_as_done() {
+        let body = super::pre_plan_body(7);
+        assert!(body.contains("part of what you asked"));
     }
 
     #[test]
