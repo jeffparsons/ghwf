@@ -349,6 +349,27 @@ the worktree that has the repo's default branch checked out, so the local
 worktree has no changes to tracked files, and any failure is just a warning —
 it never blocks the launch.
 
+### Choosing the model per issue
+
+An issue can pick the Claude model its session runs on with a single line in the
+issue body, on its own:
+
+```
+Model: opus
+```
+
+The key is matched case-insensitively and the value is passed straight through
+to `claude --model`, so both aliases (`fable`, `opus`, `sonnet`) and full model
+names (`claude-fable-5`) work. Omit the line to use Claude's default. The flag
+is session-scoped — it never changes your default for other sessions.
+
+The model is read from the body when the launcher starts the session, so editing
+the line takes effect on the next launch, not mid-session. If the body has more
+than one `Model:` line, or one with no value, ghwf can't tell which you meant: it
+refuses to start, comments the problem on the issue, and flips it to "needs you"
+so you can fix the body and relaunch. An invalid model name only Claude can
+reject surfaces when the session starts.
+
 ## The relaunch constraint
 
 A Claude Code session's working directory is fixed when `claude` launches; ghwf
