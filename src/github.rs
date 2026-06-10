@@ -247,6 +247,132 @@ pub fn branch_prs(owner: &str, repo: &str, branch: &str) -> Result<Vec<BranchPr>
     serde_json::from_str(&json).context("failed to parse PR list JSON from `gh`")
 }
 
+/// Whether a repo is private. Drives whether image attachments can be embedded
+/// inline (public, via a `?raw=true` blob link that GitHub's proxy will fetch)
+/// or only linked (private blob links are auth-gated, so the proxy can't render
+/// them).
+pub fn repo_is_private(owner: &str, repo: &str) -> Result<bool> {
+    let out = gh(&[
+        "repo",
+        "view",
+        &format!("{owner}/{repo}"),
+        "--json",
+        "isPrivate",
+        "--jq",
+        ".isPrivate",
+    ])?;
+    Ok(out.trim() == "true")
+}
+
+/// A single entry in a Git tree: a file blob at `path`.
+pub struct TreeEntry {
+    pub path: String,
+    pub sha: String,
+}
+
+/// Create a blob from base64-encoded bytes, returning its SHA.
+pub fn create_blob(owner: &str, repo: &str, content_base64: &str) -> Result<String> {
+    let endpoint = format!("repos/{owner}/{repo}/git/blobs");
+    let payload =
+        serde_json::json!({ "content": content_base64, "encoding": "base64" }).to_string();
+    let json = gh_api_stdin(&["--method", "POST", &endpoint, "--input", "-"], &payload)?;
+    parse_sha(&json).context("failed to read blob SHA from `gh api`")
+}
+
+/// The tip of a branch, as `(commit_sha, tree_sha)`, or `None` when the branch
+/// does not exist yet.
+pub fn get_branch_tip(owner: &str, repo: &str, branch: &str) -> Result<Option<(String, String)>> {
+    let endpoint = format!("repos/{owner}/{repo}/git/ref/heads/{branch}");
+    let (ok, stdout, stderr) = gh_capture(&["api", &endpoint])?;
+    if !ok {
+        // A missing ref is the expected "branch absent" case; anything else is a
+        // real error.
+        if stderr.contains("404") || stderr.contains("Not Found") {
+            return Ok(None);
+        }
+        bail!("`gh api {endpoint}` failed:\n{}", stderr.trim());
+    }
+    let commit_sha =
+        parse_object_sha(&stdout).context("failed to read ref object SHA from `gh api`")?;
+    let commit = format!("repos/{owner}/{repo}/git/commits/{commit_sha}");
+    let commit_json = gh_api(&[&commit])?;
+    let tree_sha = parse_tree_sha(&commit_json).context("failed to read commit tree SHA")?;
+    Ok(Some((commit_sha, tree_sha)))
+}
+
+/// Create a tree from `entries`, optionally based on `base_tree` (so unlisted
+/// paths from that tree are carried forward). Returns the new tree's SHA.
+pub fn create_tree(
+    owner: &str,
+    repo: &str,
+    base_tree: Option<&str>,
+    entries: &[TreeEntry],
+) -> Result<String> {
+    let tree: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "path": e.path,
+                "mode": "100644",
+                "type": "blob",
+                "sha": e.sha,
+            })
+        })
+        .collect();
+    let mut payload = serde_json::json!({ "tree": tree });
+    if let Some(base) = base_tree {
+        payload["base_tree"] = serde_json::Value::String(base.to_string());
+    }
+    let endpoint = format!("repos/{owner}/{repo}/git/trees");
+    let json = gh_api_stdin(
+        &["--method", "POST", &endpoint, "--input", "-"],
+        &payload.to_string(),
+    )?;
+    parse_sha(&json).context("failed to read tree SHA from `gh api`")
+}
+
+/// Create a commit with the given tree and parents, returning its SHA. An empty
+/// `parents` makes a root (parentless) commit.
+pub fn create_commit(
+    owner: &str,
+    repo: &str,
+    message: &str,
+    tree: &str,
+    parents: &[String],
+) -> Result<String> {
+    let endpoint = format!("repos/{owner}/{repo}/git/commits");
+    let payload =
+        serde_json::json!({ "message": message, "tree": tree, "parents": parents }).to_string();
+    let json = gh_api_stdin(&["--method", "POST", &endpoint, "--input", "-"], &payload)?;
+    parse_sha(&json).context("failed to read commit SHA from `gh api`")
+}
+
+/// Point a new branch at `sha`.
+pub fn create_ref(owner: &str, repo: &str, branch: &str, sha: &str) -> Result<()> {
+    let endpoint = format!("repos/{owner}/{repo}/git/refs");
+    let payload =
+        serde_json::json!({ "ref": format!("refs/heads/{branch}"), "sha": sha }).to_string();
+    gh_api_stdin(&["--method", "POST", &endpoint, "--input", "-"], &payload).map(|_| ())
+}
+
+/// Fast-forward an existing branch to `sha`. Returns `false` when GitHub rejects
+/// the update as non-fast-forward (a concurrent writer moved the tip), so the
+/// caller can rebuild and retry; other failures bail.
+pub fn update_ref(owner: &str, repo: &str, branch: &str, sha: &str) -> Result<bool> {
+    let endpoint = format!("repos/{owner}/{repo}/git/refs/heads/{branch}");
+    let payload = serde_json::json!({ "sha": sha, "force": false }).to_string();
+    let (ok, _stdout, stderr) =
+        gh_api_capture_stdin(&["--method", "PATCH", &endpoint, "--input", "-"], &payload)?;
+    if ok {
+        return Ok(true);
+    }
+    if stderr.contains("422") || stderr.contains("fast forward") || stderr.contains("fast-forward")
+    {
+        return Ok(false);
+    }
+    bail!("`gh api {endpoint}` failed:\n{}", stderr.trim());
+}
+
 /// Find an existing PR (any state) whose head is `branch`, returning its number.
 pub fn find_pr(owner: &str, repo: &str, branch: &str) -> Result<Option<u64>> {
     let out = gh(&[
@@ -840,6 +966,61 @@ fn gh_api_stdin(args: &[&str], input: &str) -> Result<String> {
     }
 
     String::from_utf8(output.stdout).context("`gh api` returned non-UTF-8 output")
+}
+
+/// Like [`gh_api_stdin`], but returns the exit outcome as data — `(success,
+/// stdout, stderr)` — instead of bailing on a non-zero exit, for callers that
+/// need to act on a specific failure (e.g. a non-fast-forward ref update).
+fn gh_api_capture_stdin(args: &[&str], input: &str) -> Result<(bool, String, String)> {
+    let mut child = Command::new("gh")
+        .arg("api")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("failed to open stdin for `gh`"))?
+        .write_all(input.as_bytes())
+        .context("failed to write request body to `gh`")?;
+
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for `gh` to finish")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    Ok((output.status.success(), stdout, stderr))
+}
+
+/// The top-level `.sha` of a `gh api` response (blob/tree/commit creation).
+fn parse_sha(json: &str) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    value["sha"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("response had no `sha` field"))
+}
+
+/// The `.object.sha` a ref response points at.
+fn parse_object_sha(json: &str) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    value["object"]["sha"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("ref response had no `object.sha` field"))
+}
+
+/// The `.tree.sha` of a commit response.
+fn parse_tree_sha(json: &str) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    value["tree"]["sha"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("commit response had no `tree.sha` field"))
 }
 
 #[cfg(test)]
