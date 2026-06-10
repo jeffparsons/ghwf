@@ -46,10 +46,12 @@ pub struct Config {
     #[serde(default)]
     pub only_assigned_to_me: bool,
     /// Label `ghwf create-issue` applies to a follow-up to mark it blocked by
-    /// the issue it was filed from. It's included in the create payload so the
-    /// guard is on the issue from the moment it exists (no window for a worker
-    /// to grab it unblocked), with the native `blocked_by` dependency set right
-    /// after as the GitHub-UI truth. Defaults to `blocked`.
+    /// the issue it was filed from. It's a transient creation-race guard:
+    /// included in the create payload so the guard is on the issue from the
+    /// moment it exists (no window for a worker to grab it unblocked), then
+    /// removed again once the native `blocked_by` dependency — the durable,
+    /// GitHub-UI-visible truth — is set right after. It's kept only if that
+    /// dependency call fails. Defaults to `blocked`.
     #[serde(default = "default_blocked_label")]
     pub blocked_label: String,
     /// Repos whose issues may be worked on even though the code, worktree, and
