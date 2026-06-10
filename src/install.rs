@@ -44,6 +44,12 @@ Run `ghwf work-on $ARGUMENTS` and follow the phase banner exactly:
   $ARGUMENTS`; when a phase's work is done, hand off with `ghwf hand-off
   $ARGUMENTS` (body from stdin) — ghwf appends the approval prompt itself,
   so never write one.
+- Don't read a partial reply as the user being finished: if a comment
+  addresses only some of what you raised, assume more may be coming. Unanswered
+  questions, options, and suggested defaults stay open — only an explicit phase
+  approval (an `/approve-*` directive or a 👍) settles them. Acknowledge what
+  arrived, then `ghwf wait $ARGUMENTS` again instead of pressing ahead on the
+  open points.
 - When you decide to defer work or discover something out of scope, file it
   with `ghwf create-issue --title "..."` (body from stdin) instead of dropping
   it; by default the new issue is marked blocked by the one you're working on.
