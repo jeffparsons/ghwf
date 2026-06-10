@@ -13,8 +13,8 @@ pub fn run(repo: &str, directory: Option<&Path>, reference: Option<&Path>) -> Re
         Some(dir) => dir.to_path_buf(),
         None => PathBuf::from(&name),
     };
-    clone_into(&container, &name, &url, reference)?;
-    report(&container, &name);
+    let default_worktree = clone_into(&container, &name, &url, reference)?;
+    report(&container, &name, default_worktree.as_deref());
     Ok(())
 }
 
@@ -46,8 +46,13 @@ fn shorthand_url(protocol: &str, owner: &str, repo: &str) -> String {
 
 /// Create the container directory and populate it, removing the container on
 /// failure when this run created it — a failed run leaves nothing
-/// half-built behind.
-fn clone_into(container: &Path, name: &str, url: &str, reference: Option<&Path>) -> Result<()> {
+/// half-built behind. Returns the default branch when its worktree was created.
+fn clone_into(
+    container: &Path,
+    name: &str,
+    url: &str,
+    reference: Option<&Path>,
+) -> Result<Option<String>> {
     let created = create_container(container)?;
     let result = populate(container, name, url, reference);
     if result.is_err() && created {
@@ -84,8 +89,13 @@ fn create_container(container: &Path) -> Result<bool> {
 
 /// Everything after URL resolution: clone the bare repo, make its remote
 /// behave like a normal clone's, and generate the config and worktrees
-/// directory.
-fn populate(container: &Path, name: &str, url: &str, reference: Option<&Path>) -> Result<()> {
+/// directory. Returns the default branch when its worktree was created.
+fn populate(
+    container: &Path,
+    name: &str,
+    url: &str,
+    reference: Option<&Path>,
+) -> Result<Option<String>> {
     let bare = container.join(format!("{name}.git"));
     git::clone_bare(url, &bare, reference)?;
     git::setup_conventional_remote(&bare)?;
@@ -93,7 +103,31 @@ fn populate(container: &Path, name: &str, url: &str, reference: Option<&Path>) -
         .context("failed to write ghwf.toml")?;
     std::fs::create_dir(container.join("worktrees"))
         .context("failed to create the worktrees directory")?;
-    Ok(())
+    Ok(create_default_worktree(container, &bare))
+}
+
+/// Best-effort: check out the default branch into `worktrees/<default>`, so a
+/// fresh clone has a ready place to view and update the default branch (and so
+/// `prep::update_default_worktree` has a checkout to keep current on later
+/// fetches). Returns the default branch on success, or `None` after warning —
+/// a failure here is not a clone failure, since the bare repo and config are
+/// already in place.
+fn create_default_worktree(container: &Path, bare: &Path) -> Option<String> {
+    match try_create_default_worktree(container, bare) {
+        Ok(default) => Some(default),
+        Err(err) => {
+            eprintln!("warning: failed to create the default-branch worktree: {err:#}");
+            None
+        }
+    }
+}
+
+/// The fallible mechanics of [`create_default_worktree`].
+fn try_create_default_worktree(container: &Path, bare: &Path) -> Result<String> {
+    let default = git::default_remote_branch(bare)?;
+    let worktree = container.join("worktrees").join(&default);
+    git::add_worktree_for_branch(bare, &worktree, &default)?;
+    Ok(default)
 }
 
 /// The generated `ghwf.toml`: essentials only. `ghwf config init` offers the
@@ -102,8 +136,9 @@ fn config_text(name: &str) -> String {
     format!("main_repo = \"{name}.git\"\nworktrees_dir = \"worktrees\"\n")
 }
 
-/// Describe the created layout and what to do next.
-fn report(container: &Path, name: &str) {
+/// Describe the created layout and what to do next. `default_worktree` is the
+/// default branch when its worktree was created under `worktrees/`.
+fn report(container: &Path, name: &str, default_worktree: Option<&str>) {
     println!(
         "Created ghwf's preferred layout in `{}`:",
         container.display()
@@ -111,6 +146,9 @@ fn report(container: &Path, name: &str) {
     println!("- `{name}.git` — the bare repo");
     println!("- `ghwf.toml` — the essentials (`main_repo`, `worktrees_dir`)");
     println!("- `worktrees/` — per-issue worktrees are created here");
+    if let Some(default) = default_worktree {
+        println!("  - `{default}/` — a checkout of the default branch, ready to use");
+    }
     println!();
     println!("Next steps:");
     println!("- `cd {}`", container.display());
@@ -200,7 +238,8 @@ mod tests {
 
         let container = root.join("project");
         std::fs::create_dir(&container).unwrap();
-        populate(&container, "project", origin.to_str().unwrap(), None).unwrap();
+        let default = populate(&container, "project", origin.to_str().unwrap(), None).unwrap();
+        assert_eq!(default.as_deref(), Some("main"));
 
         let bare = container.join("project.git");
         assert_eq!(
@@ -220,6 +259,22 @@ mod tests {
         assert_eq!(
             git_stdout(&bare, &["config", "remote.origin.fetch"]),
             "+refs/heads/*:refs/remotes/origin/*"
+        );
+        // The default branch is checked out into `worktrees/main`: a normal
+        // (non-bare) checkout that git associates with the `main` branch.
+        let default_worktree = container.join("worktrees").join("main");
+        assert!(default_worktree.join("file.txt").is_file());
+        assert_eq!(
+            git_stdout(&default_worktree, &["rev-parse", "--is-bare-repository"]),
+            "false"
+        );
+        assert_eq!(
+            crate::git::branch_worktree(&bare, "main")
+                .unwrap()
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            default_worktree.canonicalize().unwrap()
         );
         // The operation prep-and-plan actually performs works.
         let worktree = container.join("worktrees").join("issue_1");

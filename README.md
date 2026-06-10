@@ -203,11 +203,14 @@ repo/                  # container directory (override with a second argument)
 ├── repo.git/          # bare repo, remote configured like a normal clone's
 ├── ghwf.toml          # generated, essentials only
 └── worktrees/         # per-issue worktrees land here
+    └── main/          # checkout of the default branch, created by clone
 ```
 
 The bare repo keeps the container free of a working copy that would shadow
 the per-issue worktrees, while its remote is set up to behave exactly like a
-normal clone's (`origin/<default>` resolves and stays fresh on fetch).
+normal clone's (`origin/<default>` resolves and stays fresh on fetch). The
+default branch is checked out into `worktrees/<default>` so you have a ready
+place to inspect it; ghwf keeps that checkout fast-forwarded as it fetches.
 
 For big repos, `--reference <path>` borrows objects from an existing local
 clone instead of fetching them over the network. The new repo is dissociated
@@ -246,6 +249,10 @@ issue_repos = ["StileEducation/documentation", { repo = "StileEducation/wiki", b
 # Labels marking an issue as urgent, most urgent first (optional; used by
 # `ghwf next`).
 priority_labels = ["urgent", "soon"]
+# When true, `ghwf next` only considers issues already assigned to you, ignoring
+# unassigned ones (optional; default false). Suits teams that allocate work by
+# discussion or a manager rather than picking off the list.
+only_assigned_to_me = true
 # Label `ghwf create-issue` applies to a follow-up to mark it blocked by the
 # issue it was filed from (optional; defaults to `blocked`). It's set in the
 # create payload so the follow-up carries it from the moment it exists, with the

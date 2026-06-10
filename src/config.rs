@@ -40,6 +40,11 @@ pub struct Config {
     /// when the rewrite can't be done safely.
     #[serde(default)]
     pub delete_plan_on_approval: bool,
+    /// When true, `ghwf next` only considers issues already assigned to the
+    /// current user, ignoring unassigned ones. Suits teams that allocate work by
+    /// discussion or a manager rather than picking off the list. Default off.
+    #[serde(default)]
+    pub only_assigned_to_me: bool,
     /// Label `ghwf create-issue` applies to a follow-up to mark it blocked by
     /// the issue it was filed from. It's included in the create payload so the
     /// guard is on the issue from the moment it exists (no window for a worker
