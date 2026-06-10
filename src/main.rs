@@ -1513,13 +1513,33 @@ fn create_issue(
     let issue = github::create_issue(&owner, &repo, title, body, &label_refs)?;
 
     if let Some(blocker) = &blocker {
-        if let Err(err) = github::add_blocked_by(&owner, &repo, issue.number, blocker.id) {
-            eprintln!(
-                "warning: filed #{} but couldn't set its `blocked_by` dependency on \
-                 #{}: {err:#}\nthe `{blocked_label}` label is set, so a worker still \
-                 won't pick it up; add the dependency by hand for the GitHub UI.",
-                issue.number, blocker.number
-            );
+        match github::add_blocked_by(&owner, &repo, issue.number, blocker.id) {
+            Ok(()) => {
+                // The native dependency is now the GitHub-UI truth and is visible
+                // on its own, so the guard label has served its one purpose — peel
+                // it back off. Best-effort: a failure here just leaves a stale
+                // label, which a human can clear.
+                if let Some(guard_label) = guard_label {
+                    if let Err(err) =
+                        github::remove_issue_label(&owner, &repo, issue.number, guard_label)
+                    {
+                        eprintln!(
+                            "warning: filed #{} and set its `blocked_by` dependency, but \
+                             couldn't remove the temporary `{guard_label}` guard label: \
+                             {err:#}\nremove it by hand; the dependency is what matters.",
+                            issue.number
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: filed #{} but couldn't set its `blocked_by` dependency on \
+                     #{}: {err:#}\nthe `{blocked_label}` label is set, so a worker still \
+                     won't pick it up; add the dependency by hand for the GitHub UI.",
+                    issue.number, blocker.number
+                );
+            }
         }
     }
 

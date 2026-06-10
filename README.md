@@ -181,9 +181,11 @@ implement and review phases, so it can act on the PR without a permission prompt
   default it's marked blocked by the originating issue (the optional `[issue]`,
   else inferred like the other commands): the `blocked_label` is set atomically
   in the create payload so a worker can't grab the follow-up before it's marked,
-  and the native GitHub `blocked_by` dependency is set right after. `--no-block`
-  files a standalone issue; `--label` attaches extra labels. The new issue is
-  created unassigned and prints as JSON.
+  the native GitHub `blocked_by` dependency is set right after, and then the
+  temporary label is removed again — the dependency is the durable, UI-visible
+  truth (the label sticks around only if that dependency call fails).
+  `--no-block` files a standalone issue; `--label` attaches extra labels. The
+  new issue is created unassigned and prints as JSON.
 
 The PR commands each resolve the issue argument the same way the other commands
 do, and error clearly when the issue has no PR yet.
@@ -254,9 +256,10 @@ priority_labels = ["urgent", "soon"]
 # discussion or a manager rather than picking off the list.
 only_assigned_to_me = true
 # Label `ghwf create-issue` applies to a follow-up to mark it blocked by the
-# issue it was filed from (optional; defaults to `blocked`). It's set in the
-# create payload so the follow-up carries it from the moment it exists, with the
-# native GitHub `blocked_by` dependency set right after.
+# issue it was filed from (optional; defaults to `blocked`). A transient
+# creation-race guard: set in the create payload so the follow-up carries it
+# from the moment it exists, then removed again once the native GitHub
+# `blocked_by` dependency is set right after (kept only if that call fails).
 blocked_label = "blocked"
 # Markdown file of instructions for writing PR titles and bodies (optional;
 # defaults to `pull-request.md` next to this config). When the file exists,
