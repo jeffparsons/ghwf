@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use crate::github::{self, Conditional};
 use crate::models::{Comment, Issue, PullRequest, Reaction, ReviewComment, User};
-use crate::state::{self, PostedRef, ReactionWatch, WaitState};
+use crate::state::{self, OptionsWatch, PostedRef, ReactionWatch, WaitState};
 use crate::{render, store};
 
 /// Exit code when the timeout elapses with nothing new (exit 0 = activity
@@ -45,11 +45,12 @@ pub fn run(issue: &str, timeout_secs: u64) -> Result<()> {
     };
 
     let endpoints = poll_endpoints(&owner, &repo, number, pr_number, &wait_state);
-    // The reaction watches again, on their own: the events feed is
-    // structurally blind to reactions, so feed mode polls these directly
-    // every cycle rather than leaving them to the backstop sweep. They share
-    // ETag keys with their twins in `endpoints`.
-    let watch_endpoints = reaction_endpoints(&owner, &repo, &wait_state.reaction_watches);
+    // The reaction and options watches again, on their own: the events feed is
+    // structurally blind to a reaction or a checkbox edit on a hidden comment,
+    // so feed mode polls these directly every cycle rather than leaving them to
+    // the backstop sweep. They share ETag keys with their twins in `endpoints`.
+    let mut watch_endpoints = reaction_endpoints(&owner, &repo, &wait_state.reaction_watches);
+    watch_endpoints.extend(options_endpoints(&owner, &repo, &wait_state.options_watches));
     let feed_endpoint = format!("repos/{owner}/{repo}/events?per_page=100");
 
     match pr_number {
@@ -254,6 +255,9 @@ enum EndpointKind {
     /// The reactions on one thread's watched approval prompt; the key
     /// (`issue` / `pr`) selects the baseline in `WaitState::reaction_watches`.
     Reactions(&'static str),
+    /// The watched `ask` options comment on one thread; wakes when its submit
+    /// checkbox is ticked. The key (`issue` / `pr`) names the thread in reasons.
+    Options(&'static str),
 }
 
 /// The fixed set of endpoints one `wait` invocation polls. The PR endpoints
@@ -300,7 +304,33 @@ fn poll_endpoints(
         });
     }
     endpoints.extend(reaction_endpoints(owner, repo, &wait.reaction_watches));
+    endpoints.extend(options_endpoints(owner, repo, &wait.options_watches));
     endpoints
+}
+
+/// One endpoint per recorded options watch: the watched `ask` comment object,
+/// so its submit checkbox can be read. A checkbox tick edits a ghwf-authored
+/// (hidden) comment, which the digest filters and the events feed doesn't
+/// surface, so this is the only way a submission can wake a wait.
+fn options_endpoints(
+    owner: &str,
+    repo: &str,
+    watches: &BTreeMap<String, OptionsWatch>,
+) -> Vec<Endpoint> {
+    ["issue", "pr"]
+        .into_iter()
+        .filter_map(|thread| {
+            let watch = watches.get(thread)?;
+            Some(Endpoint {
+                key: match thread {
+                    "issue" => "options_issue",
+                    _ => "options_pr",
+                },
+                url: format!("repos/{owner}/{repo}/issues/comments/{}", watch.comment_id),
+                kind: EndpointKind::Options(thread),
+            })
+        })
+        .collect()
 }
 
 /// One endpoint per recorded reaction watch: the watched prompt comment's
@@ -429,6 +459,21 @@ fn evaluate_fresh(
                 reasons.push(format!(
                     "New 👍 reaction from {} on the approval prompt ({noun}).",
                     reaction.user.login
+                ));
+            }
+        }
+        EndpointKind::Options(thread) => {
+            let comment: Comment = serde_json::from_str(body)
+                .with_context(|| format!("failed to parse comment JSON from {}", endpoint.url))?;
+            let noun = match *thread {
+                "pr" => "PR thread",
+                _ => "issue thread",
+            };
+            // Only a ticked submit box is a wake; ticking an individual option
+            // edits the comment but leaves submit unticked, so it doesn't.
+            if render::parse_options_comment(&comment.body).submit == Some(true) {
+                reasons.push(format!(
+                    "Answers submitted to your options question ({noun})."
                 ));
             }
         }
@@ -900,6 +945,76 @@ mod tests {
     fn non_thumbs_up_reactions_do_not_wake() {
         let body = serde_json::json!([reaction_json(100, "heart"), reaction_json(101, "rocket")]);
         assert!(reaction_reasons(body, &[]).is_empty());
+    }
+
+    /// Run `evaluate_fresh` for an issue-thread options endpoint against a
+    /// comment with the given body, returning the wake reasons.
+    fn options_reasons(comment_body: &str) -> Vec<String> {
+        let endpoint = Endpoint {
+            key: "options_issue",
+            url: "repos/o/r/issues/comments/9".to_string(),
+            kind: EndpointKind::Options("issue"),
+        };
+        let wait = WaitState {
+            options_watches: [(
+                "issue".to_string(),
+                crate::state::OptionsWatch { comment_id: 9 },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let body = serde_json::json!({
+            "id": 9,
+            "user": { "login": "user" },
+            "body": comment_body,
+            "created_at": "2026-06-06T12:00:00Z",
+            "updated_at": "2026-06-06T12:05:00Z",
+            "html_url": "https://github.com/o/r/issues/1#issuecomment-9",
+            "author_association": "OWNER",
+        });
+        let mut reasons = Vec::new();
+        evaluate_fresh(
+            &endpoint,
+            &body.to_string(),
+            &wait,
+            Some("tok"),
+            &mut reasons,
+        )
+        .unwrap();
+        reasons
+    }
+
+    #[test]
+    fn ticked_submit_wakes() {
+        let body = crate::render::build_comment_body(
+            &crate::render::build_options_body("Pick", &["A".into(), "B".into()]),
+            Some("tok"),
+        )
+        .replace("- [ ] **Submit", "- [x] **Submit");
+        let reasons = options_reasons(&body);
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("Answers submitted"));
+        assert!(reasons[0].contains("issue thread"));
+    }
+
+    #[test]
+    fn unticked_submit_does_not_wake() {
+        let body = crate::render::build_comment_body(
+            &crate::render::build_options_body("Pick", &["A".into(), "B".into()]),
+            Some("tok"),
+        );
+        assert!(options_reasons(&body).is_empty());
+    }
+
+    #[test]
+    fn ticked_option_without_submit_does_not_wake() {
+        // A ticked option but the submit box still empty: not a submission.
+        let body = crate::render::build_comment_body(
+            &crate::render::build_options_body("Pick", &["A".into(), "B".into()]),
+            Some("tok"),
+        )
+        .replacen("- [ ] A", "- [x] A", 1);
+        assert!(options_reasons(&body).is_empty());
     }
 
     /// Run `evaluate_fresh` for the PR-object endpoint against a PR body in
