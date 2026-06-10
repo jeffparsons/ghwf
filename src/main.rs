@@ -258,7 +258,8 @@ enum ConfigCommands {
     /// missing, then optional extras.
     Init,
     /// Set up workflow status labels: create them in the GitHub repo and add
-    /// a `[labels]` section to `ghwf.toml`.
+    /// a `[labels]` section to `ghwf.toml`. Re-run once the section exists to
+    /// create any configured label still missing from the repo.
     Labels,
 }
 
