@@ -38,16 +38,43 @@ behaviour is byte-for-byte what it is today.
 Add to `Config`:
 
 ```rust
-/// Repos (each `"owner/repo"`) whose issues may be worked on even though the
-/// code, worktree, and PR live in `main_repo`. The configured repo is always
-/// allowed; this lists *additional* issue-only repos. Empty by default.
+/// Repos whose issues may be worked on even though the code, worktree, and PR
+/// live in `main_repo`. The configured repo is always allowed; this lists
+/// *additional* issue-only repos. Empty by default. Each entry is either a
+/// plain `"owner/repo"` string or a table with an optional `branch_prefix`.
 #[serde(default)]
-pub issue_repos: Vec<String>,
+pub issue_repos: Vec<IssueRepo>,
 ```
 
+`IssueRepo` accepts both forms via an untagged enum (string | table):
+
+```rust
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum IssueRepo {
+    /// `"owner/repo"` — prefix defaults to the repo name.
+    Plain(String),
+    /// `{ repo = "owner/repo", branch_prefix = "docs" }`. `branch_prefix`
+    /// omitted → repo name; `""` → no prefix (collision risk accepted).
+    Detailed { repo: String, branch_prefix: Option<String> },
+}
+```
+
+`IssueRepo` exposes:
+- `repo_ref() -> Result<RepoRef>` — parse/validate `"owner/repo"` (exactly one
+  `/`, non-empty halves); a malformed entry is a hard config error.
+- `branch_prefix() -> Option<&str>` carrying the *explicit* override only, so
+  branch naming (Step 4) can distinguish "unset → use repo name" from
+  `Some("")` → no prefix.
+
+A `Config::issue_repo_refs() -> Result<Vec<RepoRef>>` helper (for the allowlist)
+and a per-repo prefix lookup feed Steps 2 and 4.
+
 Tests (mirror the existing `priority_labels` pair):
-- `issue_repos` parses a list.
+- plain-string entries parse; the detailed table form parses with and without
+  `branch_prefix`; the two forms can be mixed in one list.
 - absent key → empty vec (old configs keep loading).
+- a malformed `"owner/repo"` entry errors.
 
 ## Step 2 — Resolution context: `IssueScope` (`src/github.rs`)
 
@@ -74,8 +101,8 @@ impl IssueScope {
 }
 
 /// Build the scope from a discovered `ghwf.toml`: primary = config_repo(),
-/// allowed = parsed `issue_repos`. Malformed `"owner/repo"` entries are a
-/// hard config error (fail fast rather than silently dropping an allowlist
+/// allowed = `Config::issue_repo_refs()`. Malformed `"owner/repo"` entries are
+/// a hard config error (fail fast rather than silently dropping an allowlist
 /// entry the user is relying on).
 pub fn issue_scope() -> Result<IssueScope>;
 ```
@@ -132,19 +159,27 @@ Update the PR-side helpers to take the code repo:
 Two same-numbered issues in different repos must not collide on
 `issue_<n>_<slug>` (one branch, one worktree dir = `worktrees_dir/<branch>`).
 Qualify the branch only for foreign-repo issues; leave main-repo issues exactly
-as today so existing worktrees are undisturbed:
+as today so existing worktrees are undisturbed. **The prefix is per-repo
+configurable** (the user's choice — option 1):
 
-- main-repo issue: `issue_<number>_<words>` (unchanged)
-- foreign-repo issue: `<sanerepo>_issue_<number>_<words>`, where `<sanerepo>`
-  is the issue repo name sanitised like a slug word (e.g. `documentation`).
+- main-repo issue: `issue_<number>_<words>` (never prefixed).
+- foreign-repo issue: `<prefix>_issue_<number>_<words>`, where `<prefix>` comes
+  from the matching `issue_repos` entry:
+  - entry has no `branch_prefix` (or is the plain string form) → prefix = the
+    issue repo's **name**, sanitised like a slug word (e.g. `documentation`);
+  - `branch_prefix = "docs"` → prefix = `docs` (also sanitised);
+  - `branch_prefix = ""` → **no prefix**, i.e. bare `issue_<n>_<words>` (the
+    user has opted into the collision risk for that repo).
 
-`branch_and_slug` gains the issue repo and code repo (or a precomputed
-`foreign: bool`); it returns the qualified branch but the **unqualified** slug
-(the plan filename `plans/<number>-<slug>.md` lives inside the per-branch
-worktree, so it can't collide across issues). Update both call sites in
+`branch_and_slug` gains the resolved prefix (an `Option<&str>`: `None` for
+main-repo / no-prefix, `Some(p)` otherwise). It returns the qualified branch but
+the **unqualified** slug (the plan filename `plans/<number>-<slug>.md` lives
+inside the per-branch worktree, so it can't collide across issues). The caller
+resolves the prefix from config before calling; update both call sites in
 `prep.rs` (`:32`, `:122`) so the branch used for the worktree and the branch
-used elsewhere agree. Owner is omitted from the qualifier (within one org the
-repo name disambiguates); revisit only if cross-owner collisions become real.
+used elsewhere agree. Owner is omitted from the default prefix (within one org
+the repo name disambiguates); a user who needs more can set `branch_prefix`
+explicitly.
 
 ## Step 5 — Label sync (`src/labels.rs`)
 
@@ -199,11 +234,15 @@ still keys correctly per thread.
   `!doc.contains_key("issue_repos")`), mirroring `priority_labels`: confirm,
   then read a comma-separated `owner/repo` list, validate each entry has exactly
   one `/` with non-empty halves, and write via a `set_issue_repos` helper
-  (toml-edit array). Add a parse/round-trip test like `parse_priority_labels`.
+  (toml-edit array of plain strings). The wizard writes only the plain-string
+  form; mention in the prompt/output that `branch_prefix` can be set by hand
+  (documented in the README). Add a parse/round-trip test like
+  `parse_priority_labels`.
 - **`README.md`**: add an annotated `issue_repos` block to the `ghwf.toml`
-  example (after `worktrees_dir`), and a short prose note in *Configuration*
-  explaining the issue-repo vs code-repo split and the auto-close limitation
-  below.
+  example (after `worktrees_dir`) showing **both** the plain-string and
+  `{ repo = …, branch_prefix = … }` forms and what `branch_prefix` / `""` do,
+  plus a short prose note in *Configuration* explaining the issue-repo vs
+  code-repo split and the auto-close limitation below.
 
 ## Known limitations (documented, not solved here)
 
@@ -219,13 +258,15 @@ still keys correctly per thread.
 
 ## Testing
 
-- `config.rs`: `issue_repos` parses; defaults empty.
+- `config.rs`: `issue_repos` parses both plain-string and table forms (mixed),
+  with/without `branch_prefix`; defaults empty; malformed entry errors.
 - `github.rs`: `IssueScope::is_allowed` (primary, allowed, case-insensitive,
   neither); `issue_endpoint` accepts an allowlisted URL, accepts the primary
   URL, resolves a bare number against primary, and rejects a non-allowlisted
-  URL with the new message; malformed `issue_repos` entry errors.
-- `state.rs`: `branch_and_slug` qualifies a foreign repo and leaves the main
-  repo unchanged.
+  URL with the new message.
+- `state.rs`: `branch_and_slug` — no prefix for the main repo; default
+  (repo-name) prefix; explicit `branch_prefix`; and `Some("")`/no-prefix
+  produces the bare `issue_<n>_<slug>` form.
 - `init.rs`: `issue_repos` parse/round-trip.
 - Keep all existing `labels.rs` tests green after the signature change.
 - `cargo test` + `cargo clippy` clean; manual smoke: `ghwf work-on <foreign
