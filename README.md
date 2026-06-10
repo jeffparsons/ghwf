@@ -80,10 +80,20 @@ from the repo's open issues, preferring, in order:
    `priority_labels` list — earlier in the list wins;
 3. the lowest issue number.
 
-PRs and issues assigned to someone else are never picked. Issues a ghwf
-session has already started are skipped too (ghwf can't tell whether another
-session is still working them); `next` lists the ones it passed over — resume
-those explicitly with `ghwf work-on <n>`.
+PRs and issues assigned to someone else are never picked. An issue with a
+**live session** — a launcher process is running it right now — is skipped and
+listed, so two workers never collide on one issue. But an issue that was started
+and then *stopped* (the session exited, or its launcher crashed, before the
+workflow concluded) is **resumed** rather than skipped: ghwf picks it up again
+and re-enters its worktree. Concluded issues are left alone. (You can still
+resume any stopped issue by hand with `ghwf work-on <n>`.)
+
+Liveness is tracked with a short-lived *lease* a launcher holds while it runs a
+session and refreshes on a heartbeat, kept in a sibling of the issue's state
+file. A crashed launcher's lease goes stale (its process is gone), so its issue
+becomes resumable automatically instead of staying locked — which matters most
+for worker pools, where a launch that errors for some transient reason must not
+take an issue out of circulation.
 
 `next` also respects GitHub's issue relationships, again listing what it passes
 over:
@@ -99,10 +109,13 @@ over:
   nested tracking issues, and resuming one already in progress when there is
   one).
 
-The pick is **claimed** before work starts: ghwf records the issue's state file
-atomically, reserving it against any other `next` run on the machine, and
+A fresh pick is **claimed** before work starts: ghwf records the issue's state
+file atomically, reserving it against any other `next` run on the machine, and
 assigns the issue to you on GitHub so the pickup is visible (e.g. from your
-phone). Two `next` runs can therefore never start the same issue.
+phone). A resumed pick is single-flighted instead by the session lease — the
+launcher that wins the lease runs it, and any other worker that selected the
+same stopped issue backs off. Either way two runs can never work one issue at
+once.
 
 ## A pool of single-use workers
 
@@ -130,6 +143,13 @@ indefinitely. To stop a `forever` worker, quit a session before its workflow
 concludes (the usual Ctrl-C-twice or `/exit`); ghwf reads that as you stepping in
 and stops the loop rather than picking the next issue. (`ghwf next --forever`
 remains as a hidden alias for `ghwf forever` during a transitional period.)
+
+A `forever` worker also rides out a launch that fails for a transient reason
+(say a network blip while fetching the issue or creating the worktree): it logs
+the failure, leaves the issue pickable rather than locking it, and moves on to
+the next pick instead of stopping. A bare reservation with nothing behind it is
+released; an issue that already has a worktree is simply resumed on a later
+round.
 
 This supervisor model is also why an ordinary `ghwf work-on`/`ghwf next` launch
 now keeps a thin ghwf process alive alongside Claude rather than replacing

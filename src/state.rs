@@ -2,6 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -628,12 +632,270 @@ pub fn save(owner: &str, repo: &str, number: u64, state: &IssueState) -> Result<
         .with_context(|| format!("failed to write issue state {}", path.display()))
 }
 
+/// Delete an issue's state file only when it represents a *bare claim* — a
+/// reservation with nothing durable behind it (no worktree, no recorded
+/// session) and not yet concluded. Used to undo a claim a launch never managed
+/// to act on, throwing the issue back to the pool as `Fresh` instead of leaving
+/// it locked. An issue carrying real progress, or a concluded one, is left
+/// untouched.
+pub fn release_if_unstarted(owner: &str, repo: &str, number: u64) -> Result<()> {
+    match load_if_exists(owner, repo, number)? {
+        Some(state) if is_unstarted(&state) => delete(owner, repo, number),
+        _ => Ok(()),
+    }
+}
+
+/// Whether a state file is a bare claim with no durable work behind it.
+fn is_unstarted(state: &IssueState) -> bool {
+    if state.is_concluded() {
+        return false;
+    }
+    // A deliberate "needs you" park (e.g. a `Model:` line the launcher refused
+    // to start on) is not a bare claim to reclaim, even with no worktree yet —
+    // discarding it would lose the signal and re-offer the issue as fresh.
+    if !matches!(state.attention, Attention::WaitingOnClaude) {
+        return false;
+    }
+    match &state.prep {
+        None => true,
+        Some(prep) => prep.worktree_path.is_none() && prep.worktree_session_id.is_none(),
+    }
+}
+
+/// How often a held lease's heartbeat is refreshed.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+/// A lease whose heartbeat is older than this is treated as stale even if its
+/// pid still resolves — the guard against a crashed launcher whose pid has been
+/// recycled by an unrelated process. Several heartbeat intervals, so a busy
+/// machine missing a few beats doesn't trigger a false reclaim.
+const LEASE_TTL: u64 = 120;
+
+/// A liveness record for the launcher process currently running an issue's
+/// session. Written to a sibling of the state file (`<n>.lease.json`) so it
+/// never races the in-session `work-on`'s rewrites of `<n>.json`, and so the
+/// directory walkers (which parse a numeric file stem) skip it: the stem
+/// `<n>.lease` is not a number.
+#[derive(Serialize, Deserialize)]
+pub struct SessionLease {
+    /// The launcher process id, probed with `kill(pid, 0)` for liveness.
+    pub pid: u32,
+    /// Epoch seconds of the last heartbeat; refreshed by the holding guard.
+    pub heartbeat: u64,
+}
+
+/// Whether an issue currently has a live launcher session.
+pub enum Liveness {
+    Live,
+    NotLive,
+}
+
+/// Epoch seconds now, or 0 if the clock is somehow before the epoch.
+fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Whether a lease is live: its process still exists and its heartbeat is
+/// recent. The pid check catches a crashed launcher immediately; the heartbeat
+/// bound catches the rare recycled-pid case after [`LEASE_TTL`].
+fn is_live(lease: &SessionLease, now: u64) -> bool {
+    process_alive(lease.pid) && now.saturating_sub(lease.heartbeat) <= LEASE_TTL
+}
+
+/// Whether a process with `pid` currently exists.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    // `kill(pid, 0)` probes without signalling: 0 means it exists and we may
+    // signal it; EPERM means it exists but isn't ours; ESRCH means gone.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Without a portable probe, fall back to heartbeat staleness alone.
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    true
+}
+
+/// Path to an issue's lease file, a sibling of its state file.
+fn lease_path(owner: &str, repo: &str, number: u64) -> Result<PathBuf> {
+    Ok(store::data_dir()?
+        .join("issues")
+        .join(owner)
+        .join(repo)
+        .join(format!("{number}.lease.json")))
+}
+
+/// Read a lease file, or `None` when it's absent or unparseable.
+fn load_lease(path: &Path) -> Option<SessionLease> {
+    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+}
+
+/// Whether an issue currently has a live session, for selection. An absent or
+/// stale lease reads as [`Liveness::NotLive`].
+pub fn lease_liveness(owner: &str, repo: &str, number: u64) -> Liveness {
+    let Ok(path) = lease_path(owner, repo, number) else {
+        return Liveness::NotLive;
+    };
+    match load_lease(&path) {
+        Some(lease) if is_live(&lease, now_epoch()) => Liveness::Live,
+        _ => Liveness::NotLive,
+    }
+}
+
+/// Exclusively create a lease file and write `lease` into it in one shot (the
+/// content lands within the `O_EXCL` create, so there's no empty window another
+/// acquirer could mistake for a stale lease). Returns `false` without touching
+/// the file when it already exists.
+fn create_lease_exclusive(path: &Path, lease: &SessionLease) -> Result<bool> {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => {
+            let json = serde_json::to_string(lease).context("failed to serialize session lease")?;
+            (&file)
+                .write_all(json.as_bytes())
+                .with_context(|| format!("failed to write session lease {}", path.display()))?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to create session lease {}", path.display()))
+        }
+    }
+}
+
+/// Acquire the session lease for an issue, returning a guard that heartbeats it
+/// and removes it on drop, or `None` when a live session already holds it.
+///
+/// Creates the lease exclusively; if one already exists, reclaims it only when
+/// it is not live (its process is gone, or its heartbeat has aged past
+/// [`LEASE_TTL`]). The exclusive create is the serialisation point, so two
+/// workers reclaiming the same stale lease can't both win — the loser sees the
+/// winner's fresh lease and backs off.
+pub fn acquire_lease(owner: &str, repo: &str, number: u64) -> Result<Option<LeaseGuard>> {
+    let path = lease_path(owner, repo, number)?;
+    let dir = path
+        .parent()
+        .expect("lease path always has a parent directory");
+    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    acquire_lease_at(path)
+}
+
+/// Acquire the lease at a concrete `path`. Split from [`acquire_lease`] so tests
+/// can drive a scratch path without a real data dir.
+fn acquire_lease_at(path: PathBuf) -> Result<Option<LeaseGuard>> {
+    let lease = SessionLease {
+        pid: std::process::id(),
+        heartbeat: now_epoch(),
+    };
+    if create_lease_exclusive(&path, &lease)? {
+        return Ok(Some(LeaseGuard::start(path)));
+    }
+    // A lease already exists: take it over only if it isn't live.
+    match load_lease(&path) {
+        Some(existing) if is_live(&existing, now_epoch()) => Ok(None),
+        _ => {
+            let _ = fs::remove_file(&path);
+            if create_lease_exclusive(&path, &lease)? {
+                Ok(Some(LeaseGuard::start(path)))
+            } else {
+                // Another worker won the reclaim race.
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Holds an issue's session lease for the life of a launcher process: a
+/// background thread refreshes the heartbeat, and dropping the guard stops it
+/// and removes the lease file. A launcher that exits via `std::process::exit`
+/// (which skips destructors) leaves the file behind, but with a now-dead pid,
+/// so the next acquirer reclaims it.
+pub struct LeaseGuard {
+    path: PathBuf,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl LeaseGuard {
+    /// Start a guard for an already-created lease at `path`, spawning the
+    /// heartbeat thread.
+    fn start(path: PathBuf) -> LeaseGuard {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let path = path.clone();
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || heartbeat_loop(&path, &stop))
+        };
+        LeaseGuard {
+            path,
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Refresh `path`'s heartbeat every [`HEARTBEAT_INTERVAL`] until asked to stop,
+/// waking each second so a drop is noticed promptly.
+fn heartbeat_loop(path: &Path, stop: &AtomicBool) {
+    loop {
+        for _ in 0..HEARTBEAT_INTERVAL.as_secs() {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let lease = SessionLease {
+            pid: std::process::id(),
+            heartbeat: now_epoch(),
+        };
+        if let Err(err) = write_lease(path, &lease) {
+            eprintln!(
+                "warning: failed to refresh session lease {}: {err:#}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Atomically overwrite a lease file via a temp file and rename, so a concurrent
+/// reader never sees a half-written lease.
+fn write_lease(path: &Path, lease: &SessionLease) -> Result<()> {
+    let json = serde_json::to_string(lease).context("failed to serialize session lease")?;
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    fs::write(&tmp, json.as_bytes())
+        .with_context(|| format!("failed to write session lease {}", tmp.display()))?;
+    fs::rename(&tmp, path)
+        .with_context(|| format!("failed to install session lease {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        branch_and_slug, find_issue_for_dir, issue_fingerprint, parse_directive,
-        parse_prompted_directive, pr_outcome, Attention, Directive, IssueState, OptionsWatch,
-        Phase, PostedRef, PrOutcome, PrepState, ReactionWatch, WaitState,
+        acquire_lease_at, branch_and_slug, find_issue_for_dir, is_live, is_unstarted,
+        issue_fingerprint, load_lease, parse_directive, parse_prompted_directive, pr_outcome,
+        process_alive, Attention, Directive, IssueState, OptionsWatch, Phase, PostedRef, PrOutcome,
+        PrepState, ReactionWatch, SessionLease, WaitState,
     };
     use crate::models::PullRequest;
     use std::path::{Path, PathBuf};
@@ -680,6 +942,9 @@ mod tests {
         write_state(&issues_root, "o", "r", 7, Some(&worktree));
         // Another issue without a worktree must not interfere.
         write_state(&issues_root, "o", "r", 8, None);
+        // A lease file sits beside the state files; its numeric prefix must not
+        // make the walker mistake it for a state file (its stem isn't a number).
+        std::fs::write(issues_root.join("o").join("r").join("7.lease.json"), "{}").unwrap();
 
         let expected = Some(("o".to_string(), "r".to_string(), 7));
         assert_eq!(
@@ -1046,5 +1311,149 @@ mod tests {
         // …and one that sanitises to nothing leaves no leading underscore.
         let (branch, _) = branch_and_slug(Some("!!!"), 5, "X");
         assert_eq!(branch, "issue_5_x");
+    }
+
+    /// A scratch lease path under a unique temp dir.
+    fn lease_scratch(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ghwf-lease-test-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("1.lease.json")
+    }
+
+    #[test]
+    fn process_alive_self_is_alive() {
+        assert!(process_alive(std::process::id()));
+    }
+
+    #[test]
+    fn is_live_true_for_self_with_fresh_heartbeat() {
+        let lease = SessionLease {
+            pid: std::process::id(),
+            heartbeat: 1_000,
+        };
+        // Heartbeat well within the TTL of `now`.
+        assert!(is_live(&lease, 1_010));
+    }
+
+    #[test]
+    fn is_live_false_when_heartbeat_is_stale() {
+        // Our own (alive) pid, but a heartbeat older than the TTL — the
+        // recycled-pid guard.
+        let lease = SessionLease {
+            pid: std::process::id(),
+            heartbeat: 1_000,
+        };
+        assert!(!is_live(&lease, 1_000 + super::LEASE_TTL + 1));
+    }
+
+    /// A positive pid (as `i32`) far beyond any real process, so `kill(pid, 0)`
+    /// reports it gone. Avoids 0 and negatives, which target process groups.
+    const DEAD_PID: u32 = 0x7FFF_FFFE;
+
+    #[test]
+    fn is_live_false_for_dead_pid() {
+        // Even with a fresh heartbeat, a gone process reads as not live.
+        let lease = SessionLease {
+            pid: DEAD_PID,
+            heartbeat: 1_000,
+        };
+        assert!(!process_alive(DEAD_PID));
+        assert!(!is_live(&lease, 1_000));
+    }
+
+    #[test]
+    fn acquire_lease_is_exclusive_then_reclaimable() {
+        let path = lease_scratch("exclusive");
+        let _ = std::fs::remove_file(&path);
+
+        // First acquirer wins and writes a live lease.
+        let guard = acquire_lease_at(path.clone()).unwrap();
+        assert!(guard.is_some());
+        assert!(path.is_file());
+        let lease = load_lease(&path).unwrap();
+        assert_eq!(lease.pid, std::process::id());
+
+        // A second acquirer is turned away while the first holds it.
+        assert!(acquire_lease_at(path.clone()).unwrap().is_none());
+
+        // Dropping the guard releases the lease file…
+        drop(guard);
+        assert!(!path.is_file());
+        // …so it can be acquired again.
+        assert!(acquire_lease_at(path.clone()).unwrap().is_some());
+
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn acquire_lease_reclaims_a_stale_lease() {
+        let path = lease_scratch("stale");
+        let _ = std::fs::remove_file(&path);
+        // Hand-write a stale lease (dead pid), as a crashed launcher would leave.
+        std::fs::write(
+            &path,
+            serde_json::to_string(&SessionLease {
+                pid: DEAD_PID,
+                heartbeat: 0,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        // It is reclaimed: the acquirer wins and overwrites it with its own.
+        let guard = acquire_lease_at(path.clone()).unwrap();
+        assert!(guard.is_some());
+        assert_eq!(load_lease(&path).unwrap().pid, std::process::id());
+
+        drop(guard);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn is_unstarted_only_for_a_bare_claim() {
+        // A default state file is a bare claim.
+        assert!(is_unstarted(&IssueState::default()));
+
+        // A prep with no worktree and no session is still bare.
+        let bare_prep = IssueState {
+            prep: Some(PrepState::default()),
+            ..Default::default()
+        };
+        assert!(is_unstarted(&bare_prep));
+
+        // A recorded worktree means real progress.
+        let with_worktree = IssueState {
+            prep: Some(PrepState {
+                worktree_path: Some(PathBuf::from("/tmp/wt")),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!is_unstarted(&with_worktree));
+
+        // A recorded session means real progress.
+        let with_session = IssueState {
+            prep: Some(PrepState {
+                worktree_session_id: Some("abc".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!is_unstarted(&with_session));
+
+        // A concluded issue is never "unstarted", whatever its prep.
+        let concluded = IssueState {
+            issue_closed: true,
+            ..Default::default()
+        };
+        assert!(!is_unstarted(&concluded));
+
+        // A bare claim parked for the user (a refusal) is kept, not reclaimed.
+        let parked = IssueState {
+            attention: Attention::WaitingOnUser,
+            ..Default::default()
+        };
+        assert!(!is_unstarted(&parked));
     }
 }
