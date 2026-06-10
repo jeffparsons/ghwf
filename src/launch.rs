@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use crate::state::{self, IssueState};
-use crate::{config, git, github, next, prep, store};
+use crate::{config, git, github, labels, next, prep, render, store};
 
 /// Prepare to launch as a launcher would: no Claude session is present, so make
 /// sure the issue's worktree exists and gather everything needed to spawn an
@@ -70,6 +70,43 @@ pub fn prepare(issue_arg: &str, no_branch: bool) -> Result<Launch> {
         }
     };
 
+    // Resolve the model from the issue body, best-effort. A standalone `Model:`
+    // line selects the model passed to `claude --model`; an empty value or more
+    // than one such line is a problem we refuse to start on. The fetch is
+    // best-effort so an offline launch (e.g. resuming an existing worktree
+    // without a network) degrades to Claude's default rather than failing. The
+    // fetched issue is reused when creating the worktree below, so a first
+    // launch fetches only once.
+    let (model, fetched_issue) = match github::fetch_issue(&issue_url, repo_ctx.as_ref()) {
+        Ok(issue) => match parse_model(issue.body.as_deref()) {
+            ModelSelection::Default => (None, Some(issue)),
+            ModelSelection::Selected(model) => (Some(model), Some(issue)),
+            ModelSelection::Problem(problem) => {
+                return refuse_to_start(
+                    &owner,
+                    &repo,
+                    &code_owner,
+                    &code_repo,
+                    number,
+                    &issue_url,
+                    repo_ctx.as_ref(),
+                    &mut issue_state,
+                    problem,
+                );
+            }
+        },
+        Err(err) => {
+            eprintln!(
+                "warning: couldn't fetch issue #{number} to resolve its model ({err:#}); \
+                 launching with Claude's default model."
+            );
+            (None, None)
+        }
+    };
+    if let Some(model) = model.as_deref() {
+        println!("Using model `{model}` for this session (from the issue's `Model:` line).");
+    }
+
     // --no-branch work has no worktree to anchor a session to: launch a fresh
     // Claude where we are.
     if use_no_branch {
@@ -93,6 +130,7 @@ pub fn prepare(issue_arg: &str, no_branch: bool) -> Result<Launch> {
             number,
             issue_url,
             permission_mode,
+            model,
             dir: None,
             resume: None,
         });
@@ -130,10 +168,15 @@ pub fn prepare(issue_arg: &str, no_branch: bool) -> Result<Launch> {
                 "Issue #{number} has no worktree yet; creating it now so the Claude session \
                  is anchored there and can be resumed for later phases."
             );
-            // Fetch the issue we resolved to work on. After a tracking-issue
-            // redirect that is a sub-issue, not the `issue_arg` the user named,
-            // so fetch by the canonical URL of the resolved number.
-            let issue_data = github::fetch_issue(&issue_url, repo_ctx.as_ref())?;
+            // Reuse the issue fetched for model resolution above; fall back to a
+            // fresh fetch only if that one failed (e.g. a transient error there
+            // that has since cleared). After a tracking-issue redirect this is a
+            // sub-issue, not the `issue_arg` the user named, so fetch by the
+            // canonical URL of the resolved number.
+            let issue_data = match fetched_issue {
+                Some(issue) => issue,
+                None => github::fetch_issue(&issue_url, repo_ctx.as_ref())?,
+            };
             // The worktree and branch live in the code repo.
             let (path, branch) =
                 prep::ensure_worktree(&issue_data, &code_owner, &code_repo, &mut issue_state)?;
@@ -169,6 +212,7 @@ pub fn prepare(issue_arg: &str, no_branch: bool) -> Result<Launch> {
         number,
         issue_url,
         permission_mode,
+        model,
         dir: Some(worktree),
         resume,
     })
@@ -180,6 +224,129 @@ fn mode_note(permission_mode: Option<&str>) -> String {
     match permission_mode {
         Some(mode) => format!(" with `--permission-mode {mode}`"),
         None => String::new(),
+    }
+}
+
+/// What a `Model:` line in an issue body selects.
+#[derive(Debug)]
+enum ModelSelection {
+    /// No `Model:` line — launch with Claude's default model.
+    Default,
+    /// Exactly one `Model:` line with a value, passed to `--model` verbatim.
+    Selected(String),
+    /// A `Model:` line problem the launcher refuses to start on.
+    Problem(ModelProblem),
+}
+
+/// A `Model:` line problem that makes the launcher refuse to start.
+#[derive(Debug)]
+enum ModelProblem {
+    /// A single `Model:` line with no value after the colon.
+    Empty,
+    /// More than one `Model:` line; carries them verbatim for the message.
+    Multiple(Vec<String>),
+}
+
+/// Resolve the model from an issue body: a standalone line whose trimmed text is
+/// `model:` (case-insensitive key) followed by a value, taken verbatim so both
+/// aliases (`opus`) and full names (`claude-fable-5`) work. Zero such lines
+/// selects the default; an empty value or more than one line is a problem.
+fn parse_model(body: Option<&str>) -> ModelSelection {
+    let Some(body) = body else {
+        return ModelSelection::Default;
+    };
+    // Every matching line (verbatim, trimmed) and the last value seen; the count
+    // decides between a clean selection and an ambiguity.
+    let mut matched_lines: Vec<String> = Vec::new();
+    let mut value = String::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = strip_model_prefix(trimmed) else {
+            continue;
+        };
+        matched_lines.push(trimmed.to_string());
+        value = rest.trim().to_string();
+    }
+    match matched_lines.len() {
+        0 => ModelSelection::Default,
+        1 if value.is_empty() => ModelSelection::Problem(ModelProblem::Empty),
+        1 => ModelSelection::Selected(value),
+        _ => ModelSelection::Problem(ModelProblem::Multiple(matched_lines)),
+    }
+}
+
+/// The text after the key when `line` is `model:`-prefixed (case-insensitive on
+/// the key, surrounding whitespace tolerated), else `None`. The whole
+/// already-trimmed line must be the key, so prose and markdown-decorated lines
+/// like `- Model: x` don't qualify.
+fn strip_model_prefix(line: &str) -> Option<&str> {
+    let (key, rest) = line.split_once(':')?;
+    key.trim().eq_ignore_ascii_case("model").then_some(rest)
+}
+
+/// Refuse to launch over an unusable `Model:` selection: post the problem to the
+/// issue thread, flip the issue to "needs you" so a phone-driven user sees it,
+/// and exit non-zero without starting Claude. The claim and worktree stay put,
+/// so fixing the body and relaunching (`ghwf work-on <n>`) retries cleanly.
+///
+/// Always returns `Err` (both problem arms `bail!`); the `Launch` Ok type is
+/// phantom, present only so callers can `return` it from [`prepare`].
+#[allow(clippy::too_many_arguments)]
+fn refuse_to_start(
+    owner: &str,
+    repo: &str,
+    code_owner: &str,
+    code_repo: &str,
+    number: u64,
+    issue_url: &str,
+    repo_ctx: Option<&github::RepoRef>,
+    issue_state: &mut IssueState,
+    problem: ModelProblem,
+) -> Result<Launch> {
+    let detail = match &problem {
+        ModelProblem::Empty => "Its `Model:` line has no value. Set it to a model name \
+             (e.g. `Model: opus`) or remove the line, then relaunch."
+            .to_string(),
+        ModelProblem::Multiple(lines) => {
+            let quoted = lines
+                .iter()
+                .map(|line| format!("> {line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "It has more than one `Model:` line; keep exactly one, then relaunch:\n\n{quoted}"
+            )
+        }
+    };
+    let body = render::build_status_comment_body(&format!(
+        "ghwf couldn't start a session for this issue because of its `Model:` line.\n\n{detail}"
+    ));
+    // Best-effort: a failed post must not mask the refusal below.
+    if let Err(err) = github::post_issue_comment(issue_url, &body, repo_ctx) {
+        eprintln!("warning: failed to post the model-selection problem to the issue: {err:#}");
+    }
+
+    // The ball is with the user now; mirror that onto the status labels.
+    issue_state.attention = state::Attention::WaitingOnUser;
+    let pr_number = issue_state.prep.as_ref().and_then(|p| p.pr_number);
+    labels::sync(
+        &(owner.to_string(), repo.to_string()),
+        &(code_owner.to_string(), code_repo.to_string()),
+        number,
+        pr_number,
+        issue_state,
+    );
+    state::save(owner, repo, number, issue_state)?;
+
+    match problem {
+        ModelProblem::Empty => bail!(
+            "issue #{number} has a `Model:` line with no value; \
+             set a model or remove the line, then relaunch."
+        ),
+        ModelProblem::Multiple(_) => bail!(
+            "issue #{number} has more than one `Model:` line; \
+             keep exactly one, then relaunch."
+        ),
     }
 }
 
@@ -277,6 +444,9 @@ pub struct Launch {
     /// Passed through verbatim as `--permission-mode` when set; claude rejects
     /// invalid modes itself.
     permission_mode: Option<String>,
+    /// Passed through verbatim as `--model` when set (resolved from the issue's
+    /// `Model:` line); claude rejects an invalid model itself.
+    model: Option<String>,
     /// The worktree to launch in, or `None` for `--no-branch` (launch in the
     /// current directory).
     dir: Option<PathBuf>,
@@ -327,6 +497,34 @@ pub fn supervise_once(launch: &Launch) -> Result<Outcome> {
     with_job_control_ignored(|| monitor(launch, &mut child))
 }
 
+/// The argument list for `claude`, in order: resume, permission mode, model,
+/// then the `/work-on` initial prompt. Each flag is included only when its value
+/// is `Some`, and each value is passed through verbatim (claude rejects an
+/// invalid mode or model itself). The prompt goes last so it is the positional
+/// argument claude treats as the first user message. Split out so the assembly
+/// is unit-testable.
+fn claude_args(
+    resume: Option<&str>,
+    permission_mode: Option<&str>,
+    model: Option<&str>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(id) = resume {
+        args.push("--resume".to_string());
+        args.push(id.to_string());
+    }
+    if let Some(mode) = permission_mode {
+        args.push("--permission-mode".to_string());
+        args.push(mode.to_string());
+    }
+    if let Some(model) = model {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    args.push("/work-on".to_string());
+    args
+}
+
 /// Build the interactive `claude` command for a launch.
 ///
 /// The session starts itself by passing `/work-on` as a positional initial
@@ -337,15 +535,11 @@ pub fn supervise_once(launch: &Launch) -> Result<Outcome> {
 fn build_command(launch: &Launch) -> Command {
     let mut cmd = Command::new("claude");
     cmd.env(store::ISSUE_ENV, &launch.issue_url);
-    if let Some(id) = &launch.resume {
-        cmd.args(["--resume", id]);
-    }
-    if let Some(mode) = &launch.permission_mode {
-        cmd.args(["--permission-mode", mode]);
-    }
-    // The initial prompt goes last, after any flags, so it is the positional
-    // argument claude treats as the first user message.
-    cmd.arg("/work-on");
+    cmd.args(claude_args(
+        launch.resume.as_deref(),
+        launch.permission_mode.as_deref(),
+        launch.model.as_deref(),
+    ));
     // Set the child's working directory rather than this process's, so the
     // supervisor's own cwd is untouched between sessions.
     if let Some(dir) = &launch.dir {
@@ -501,9 +695,106 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{munge, resumable_session, transcript_path};
+    use super::{
+        claude_args, munge, parse_model, resumable_session, transcript_path, ModelProblem,
+        ModelSelection,
+    };
     use crate::state::{IssueState, PrepState};
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn no_model_line_is_default() {
+        assert!(matches!(parse_model(None), ModelSelection::Default));
+        assert!(matches!(
+            parse_model(Some("Just a normal issue body.\nNo model here.")),
+            ModelSelection::Default
+        ));
+    }
+
+    #[test]
+    fn single_model_line_selects_the_value() {
+        // Alias, full name, case-insensitive key, and surrounding whitespace all
+        // resolve to the verbatim trimmed value.
+        for (body, want) in [
+            ("Model: opus", "opus"),
+            ("model: sonnet", "sonnet"),
+            ("MODEL: fable", "fable"),
+            (
+                "Fix the thing.\n\n  Model:  claude-fable-5  \n\nThanks.",
+                "claude-fable-5",
+            ),
+        ] {
+            match parse_model(Some(body)) {
+                ModelSelection::Selected(value) => assert_eq!(value, want, "body: {body:?}"),
+                other => panic!("expected Selected for {body:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn value_is_taken_verbatim_including_inner_colons() {
+        // Only the first colon splits key from value; the rest is passed through.
+        match parse_model(Some("Model: vendor:model-x")) {
+            ModelSelection::Selected(value) => assert_eq!(value, "vendor:model-x"),
+            other => panic!("expected Selected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_value_is_a_problem() {
+        assert!(matches!(
+            parse_model(Some("Model:")),
+            ModelSelection::Problem(ModelProblem::Empty)
+        ));
+        assert!(matches!(
+            parse_model(Some("Model:   ")),
+            ModelSelection::Problem(ModelProblem::Empty)
+        ));
+    }
+
+    #[test]
+    fn multiple_model_lines_are_a_problem() {
+        match parse_model(Some("Model: opus\nModel: sonnet")) {
+            ModelSelection::Problem(ModelProblem::Multiple(lines)) => {
+                assert_eq!(lines, ["Model: opus", "Model: sonnet"]);
+            }
+            other => panic!("expected Multiple, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decorated_lines_do_not_qualify() {
+        // The whole trimmed line must be the key, so list items and markdown
+        // emphasis around it don't false-positive as a selection.
+        assert!(matches!(
+            parse_model(Some("- Model: opus\n**Model:** sonnet")),
+            ModelSelection::Default
+        ));
+    }
+
+    #[test]
+    fn claude_args_includes_flags_only_when_set() {
+        // Nothing set: just the initial prompt.
+        assert_eq!(claude_args(None, None, None), ["/work-on"]);
+        // Model only.
+        assert_eq!(
+            claude_args(None, None, Some("opus")),
+            ["--model", "opus", "/work-on"]
+        );
+        // All three, in resume / permission-mode / model order, prompt last.
+        assert_eq!(
+            claude_args(Some("sess-1"), Some("auto"), Some("claude-fable-5")),
+            [
+                "--resume",
+                "sess-1",
+                "--permission-mode",
+                "auto",
+                "--model",
+                "claude-fable-5",
+                "/work-on"
+            ]
+        );
+    }
 
     #[test]
     fn munge_replaces_non_alphanumerics() {

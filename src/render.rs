@@ -578,6 +578,9 @@ fn phase_status_prose(phase: Phase, pr_url: Option<&str>) -> String {
                  awaiting human review."
                 .to_string(),
         },
+        Phase::Finished => "The workflow is **finished**: the PR was merged and the work \
+             is complete."
+            .to_string(),
     }
 }
 
@@ -607,7 +610,7 @@ pub fn hand_off_prompt(phase: Phase, no_branch: bool) -> Option<&'static str> {
              ready; review the change and close the issue (or merge it yourself) to \
              wrap up.",
         ),
-        (Phase::Review, _) => None,
+        (Phase::Review | Phase::Finished, _) => None,
     }
 }
 
@@ -615,7 +618,7 @@ pub fn hand_off_prompt(phase: Phase, no_branch: bool) -> Option<&'static str> {
 /// issue while planning, the PR once code is in motion. The other thread gets
 /// a one-line stub linking to it.
 pub fn status_primary_is_pr(phase: Phase) -> bool {
-    matches!(phase, Phase::Implement | Phase::Review)
+    matches!(phase, Phase::Implement | Phase::Review | Phase::Finished)
 }
 
 /// Render the one-line stub posted to the secondary conversation thread,

@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
 use crate::config::{self, LabelsConfig};
 use crate::github::{self, RepoRef};
@@ -146,6 +146,14 @@ const DEFAULTS: &[(&str, &str, &str, &str)] = &[
         "1d76db",
         "ghwf: awaiting human review",
     ),
+    // The terminal phase: a merged PR. Coloured GitHub's merged-purple to read
+    // as a concluded workflow.
+    (
+        "finished",
+        "ghwf:finished",
+        "8957e5",
+        "ghwf: workflow complete",
+    ),
     // [labels.attention]
     (
         "waiting-on-user",
@@ -169,20 +177,75 @@ const DEFAULTS: &[(&str, &str, &str, &str)] = &[
 
 /// How many of the [`DEFAULTS`] belong to the `[labels.phase]` table; the
 /// rest are `[labels.attention]`.
-const PHASE_DEFAULTS: usize = 4;
+const PHASE_DEFAULTS: usize = 5;
 
-/// `ghwf config labels`: create the default workflow labels in the GitHub
-/// repo and append the `[labels]` section to `ghwf.toml`. Rename afterwards
-/// by editing the file and the repo's labels together.
+/// `ghwf config labels`: on first run, create the default workflow labels in
+/// the GitHub repo and append the `[labels]` section to `ghwf.toml` (rename
+/// afterwards by editing the file and the repo's labels together). On a re-run
+/// — once the section exists — it leaves the file alone and just creates any
+/// configured label still missing from the repo.
 pub fn configure() -> Result<()> {
     let located = config::require()?;
-    if located.config.labels.is_some() {
-        bail!(
-            "{} already has a [labels] section; edit it by hand instead.",
-            located.file_path().display()
-        );
+    match &located.config.labels {
+        // First-time setup: create the default labels and append the section.
+        None => configure_at(&located),
+        // The section already exists, so leave the file alone — but still
+        // reconcile the repo(s), creating any configured label that doesn't
+        // exist yet. This is what lets a label added to the defaults after a
+        // repo was first set up (e.g. `ghwf:finished`) be created on a re-run,
+        // rather than the user having to add it by hand.
+        Some(labels) => reconcile(&located, labels),
     }
-    configure_at(&located)
+}
+
+/// Create any configured label that is missing from the repo(s), without
+/// touching `ghwf.toml`. Run by [`configure`] when a `[labels]` section is
+/// already present.
+fn reconcile(located: &config::Located, labels: &LabelsConfig) -> Result<()> {
+    // The configured (code) repo, plus every `issue_repos` repo — same set
+    // `configure_at` labels on first-time setup.
+    let mut repos = vec![github::repo_or_cwd()?];
+    repos.extend(located.config.issue_repo_refs()?);
+    let mut created = 0;
+    for (owner, repo) in &repos {
+        created += reconcile_repo(owner, repo, labels)?;
+    }
+    if created == 0 {
+        println!("All configured labels already exist; nothing to create.");
+    }
+    Ok(())
+}
+
+/// Create the configured labels missing from `owner/repo`, returning how many
+/// were created.
+fn reconcile_repo(owner: &str, repo: &str, labels: &LabelsConfig) -> Result<usize> {
+    let existing: BTreeSet<String> = github::list_repo_labels(owner, repo)?.into_iter().collect();
+    let to_create = labels_to_create(labels, &existing);
+    for &(name, color, description) in &to_create {
+        github::create_label(owner, repo, name, color, description)
+            .with_context(|| format!("failed to create label `{name}` in {owner}/{repo}"))?;
+        println!("Created label `{name}` in {owner}/{repo}.");
+    }
+    Ok(to_create.len())
+}
+
+/// The configured labels absent from `existing`, each paired with the colour
+/// and description from its [`DEFAULTS`] slot. The pairing is positional:
+/// [`LabelsConfig::all`] yields names in `DEFAULTS` order (a correspondence the
+/// `generated_section_parses_and_covers_every_state` test pins). A renamed
+/// label still gets created, carrying its slot's default colour — the closest
+/// we can do without the original metadata.
+fn labels_to_create<'a>(
+    labels: &'a LabelsConfig,
+    existing: &BTreeSet<String>,
+) -> Vec<(&'a str, &'static str, &'static str)> {
+    labels
+        .all()
+        .into_iter()
+        .zip(DEFAULTS)
+        .filter(|(name, _)| !existing.contains(*name))
+        .map(|(name, &(_, _, color, description))| (name, color, description))
+        .collect()
 }
 
 /// The body of [`configure`], for callers (the `config init` wizard) that
@@ -240,7 +303,9 @@ fn labels_section() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{desired_labels, labels_section, DEFAULTS, PHASE_DEFAULTS};
+    use std::collections::BTreeSet;
+
+    use super::{desired_labels, labels_section, labels_to_create, DEFAULTS, PHASE_DEFAULTS};
     use crate::config::Config;
     use crate::state::{Attention, Phase};
 
@@ -255,6 +320,7 @@ mod tests {
         // config parser, with every phase and attention state mapped.
         let labels = config_with_labels().labels.unwrap();
         assert_eq!(labels.for_phase(Phase::PrePlan), "ghwf:pre-plan");
+        assert_eq!(labels.for_phase(Phase::Finished), "ghwf:finished");
         assert_eq!(
             labels.for_attention(Attention::WaitingOnGhwf),
             "ghwf:preparing"
@@ -279,5 +345,32 @@ mod tests {
         let labels = config_with_labels().labels.unwrap();
         let desired = desired_labels(&labels, Phase::Review, None);
         assert_eq!(desired.into_iter().collect::<Vec<_>>(), ["ghwf:review"]);
+    }
+
+    #[test]
+    fn finished_phase_carries_only_the_finished_label() {
+        // A merged PR collapses to the single terminal label: no phase-of-origin
+        // record, and the attention label is already gone for a concluded run.
+        let labels = config_with_labels().labels.unwrap();
+        let desired = desired_labels(&labels, Phase::Finished, None);
+        assert_eq!(desired.into_iter().collect::<Vec<_>>(), ["ghwf:finished"]);
+    }
+
+    #[test]
+    fn reconcile_creates_only_missing_labels_with_default_metadata() {
+        // A re-run of `config labels` over a repo that already has every label
+        // but `ghwf:finished` creates exactly that one, with its slot's colour
+        // and description.
+        let labels = config_with_labels().labels.unwrap();
+        let mut existing: BTreeSet<String> =
+            labels.all().iter().map(|name| name.to_string()).collect();
+        existing.remove("ghwf:finished");
+        assert_eq!(
+            labels_to_create(&labels, &existing),
+            vec![("ghwf:finished", "8957e5", "ghwf: workflow complete")]
+        );
+        // Nothing to do once the repo already has them all.
+        let all: BTreeSet<String> = labels.all().iter().map(|name| name.to_string()).collect();
+        assert!(labels_to_create(&labels, &all).is_empty());
     }
 }

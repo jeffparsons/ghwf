@@ -26,9 +26,14 @@ prompts for an approval is equivalent to posting that command.
 
 Merging the PR completes the workflow automatically: `wait` wakes on the
 merge, `work-on` posts a final status update and tells Claude to stop the
-loop, and the session ends on its own. Closing the PR without merging halts
-the workflow the same way (with distinct wording, so Claude surfaces it);
-reopening the PR resumes it on the next `work-on`.
+loop, and the session ends on its own. A merged issue moves to a terminal
+**finished** state, so (when workflow labels are configured) its phase and
+attention labels come off and it carries a single `ghwf:finished` label —
+making it obvious at a glance that ghwf regards the work as done. Closing the
+PR without merging halts the workflow the same way (with distinct wording, so
+Claude surfaces it) but is not "finished": it keeps its phase label as a record
+of how far the work got, and reopening the PR resumes the workflow on the next
+`work-on`.
 
 A command that doesn't match the current phase (or the retired generic
 `/proceed`) is consumed without advancing anything, and `work-on` reports what
@@ -199,9 +204,11 @@ implement and review phases, so it can act on the PR without a permission prompt
   default it's marked blocked by the originating issue (the optional `[issue]`,
   else inferred like the other commands): the `blocked_label` is set atomically
   in the create payload so a worker can't grab the follow-up before it's marked,
-  and the native GitHub `blocked_by` dependency is set right after. `--no-block`
-  files a standalone issue; `--label` attaches extra labels. The new issue is
-  created unassigned and prints as JSON.
+  the native GitHub `blocked_by` dependency is set right after, and then the
+  temporary label is removed again — the dependency is the durable, UI-visible
+  truth (the label sticks around only if that dependency call fails).
+  `--no-block` files a standalone issue; `--label` attaches extra labels. The
+  new issue is created unassigned and prints as JSON.
 
 The PR commands each resolve the issue argument the same way the other commands
 do, and error clearly when the issue has no PR yet.
@@ -272,9 +279,10 @@ priority_labels = ["urgent", "soon"]
 # discussion or a manager rather than picking off the list.
 only_assigned_to_me = true
 # Label `ghwf create-issue` applies to a follow-up to mark it blocked by the
-# issue it was filed from (optional; defaults to `blocked`). It's set in the
-# create payload so the follow-up carries it from the moment it exists, with the
-# native GitHub `blocked_by` dependency set right after.
+# issue it was filed from (optional; defaults to `blocked`). A transient
+# creation-race guard: set in the create payload so the follow-up carries it
+# from the moment it exists, then removed again once the native GitHub
+# `blocked_by` dependency is set right after (kept only if that call fails).
 blocked_label = "blocked"
 # Markdown file of instructions for writing PR titles and bodies (optional;
 # defaults to `pull-request.md` next to this config). When the file exists,
@@ -366,6 +374,27 @@ the worktree that has the repo's default branch checked out, so the local
 `main` checkout implicitly stays fresh. The update only happens when that
 worktree has no changes to tracked files, and any failure is just a warning —
 it never blocks the launch.
+
+### Choosing the model per issue
+
+An issue can pick the Claude model its session runs on with a single line in the
+issue body, on its own:
+
+```
+Model: opus
+```
+
+The key is matched case-insensitively and the value is passed straight through
+to `claude --model`, so both aliases (`fable`, `opus`, `sonnet`) and full model
+names (`claude-fable-5`) work. Omit the line to use Claude's default. The flag
+is session-scoped — it never changes your default for other sessions.
+
+The model is read from the body when the launcher starts the session, so editing
+the line takes effect on the next launch, not mid-session. If the body has more
+than one `Model:` line, or one with no value, ghwf can't tell which you meant: it
+refuses to start, comments the problem on the issue, and flips it to "needs you"
+so you can fix the body and relaunch. An invalid model name only Claude can
+reject surfaces when the session starts.
 
 ## The relaunch constraint
 

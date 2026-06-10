@@ -153,6 +153,10 @@ pub enum Phase {
     PrepAndPlan,
     Implement,
     Review,
+    /// Terminal: the PR was merged, so the workflow is complete. Reached by the
+    /// merge itself, not by an approval — kept last so the derived `Ord` ranks
+    /// it above every working phase.
+    Finished,
 }
 
 impl Phase {
@@ -163,6 +167,7 @@ impl Phase {
             Phase::PrepAndPlan => Some(Phase::Implement),
             Phase::Implement => Some(Phase::Review),
             Phase::Review => None,
+            Phase::Finished => None,
         }
     }
 
@@ -173,6 +178,7 @@ impl Phase {
             Phase::PrepAndPlan => "prep-and-plan",
             Phase::Implement => "implement",
             Phase::Review => "review",
+            Phase::Finished => "finished",
         }
     }
 
@@ -185,6 +191,7 @@ impl Phase {
             Phase::PrepAndPlan => Some("/approve-plan"),
             Phase::Implement => None,
             Phase::Review => None,
+            Phase::Finished => None,
         }
     }
 }

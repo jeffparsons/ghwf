@@ -266,7 +266,8 @@ enum ConfigCommands {
     /// missing, then optional extras.
     Init,
     /// Set up workflow status labels: create them in the GitHub repo and add
-    /// a `[labels]` section to `ghwf.toml`.
+    /// a `[labels]` section to `ghwf.toml`. Re-run once the section exists to
+    /// create any configured label still missing from the repo.
     Labels,
 }
 
@@ -457,6 +458,15 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     // PR ready for review is what advances it.
     advance_on_pr_ready(&mut issue_state, pr_object.as_ref(), &mut outcome);
 
+    // A merged PR is terminal: the workflow has finished. Stamp the phase (after
+    // directive processing, so a merge never suppresses a transition this run
+    // wants to show) so the labels and status collapse to the single `finished`
+    // state. Closed-without-merge is not "finished" — it keeps its phase as a
+    // record of how far the work got.
+    if issue_state.pr_outcome == Some(state::PrOutcome::Merged) {
+        issue_state.phase = state::Phase::Finished;
+    }
+
     // The phase-specific banner body. Prep-and-plan does real work here (and
     // hard-errors if it needs a config that's missing); implement/review are light.
     // A concluded PR replaces the phase body wholesale: the workflow is over,
@@ -540,6 +550,11 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
                 &issue_state,
                 pr_instructions.as_deref(),
             ),
+            // `Finished` implies a merged PR, so `pr_outcome` is `Some` and the
+            // outer match took the `concluded_body` branch above.
+            state::Phase::Finished => {
+                unreachable!("finished phase implies a merged PR (pr_outcome is Some)")
+            }
         },
     };
 
@@ -1525,13 +1540,33 @@ fn create_issue(
     let issue = github::create_issue(&owner, &repo, title, body, &label_refs)?;
 
     if let Some(blocker) = &blocker {
-        if let Err(err) = github::add_blocked_by(&owner, &repo, issue.number, blocker.id) {
-            eprintln!(
-                "warning: filed #{} but couldn't set its `blocked_by` dependency on \
-                 #{}: {err:#}\nthe `{blocked_label}` label is set, so a worker still \
-                 won't pick it up; add the dependency by hand for the GitHub UI.",
-                issue.number, blocker.number
-            );
+        match github::add_blocked_by(&owner, &repo, issue.number, blocker.id) {
+            Ok(()) => {
+                // The native dependency is now the GitHub-UI truth and is visible
+                // on its own, so the guard label has served its one purpose — peel
+                // it back off. Best-effort: a failure here just leaves a stale
+                // label, which a human can clear.
+                if let Some(guard_label) = guard_label {
+                    if let Err(err) =
+                        github::remove_issue_label(&owner, &repo, issue.number, guard_label)
+                    {
+                        eprintln!(
+                            "warning: filed #{} and set its `blocked_by` dependency, but \
+                             couldn't remove the temporary `{guard_label}` guard label: \
+                             {err:#}\nremove it by hand; the dependency is what matters.",
+                            issue.number
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: filed #{} but couldn't set its `blocked_by` dependency on \
+                     #{}: {err:#}\nthe `{blocked_label}` label is set, so a worker still \
+                     won't pick it up; add the dependency by hand for the GitHub UI.",
+                    issue.number, blocker.number
+                );
+            }
         }
     }
 
