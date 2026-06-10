@@ -59,9 +59,9 @@ enum Commands {
     ///
     /// With `--wait`, block until an eligible issue appears rather than erroring
     /// when there is none — run one per terminal as a pool of single-use
-    /// workers that each grab and start the next issue to come along. With
-    /// `--forever`, keep going after each issue concludes, so one terminal works
-    /// the queue indefinitely.
+    /// workers that each grab and start the next issue to come along. To keep
+    /// going after each issue concludes, so one terminal works the queue
+    /// indefinitely, use `ghwf forever`.
     Next {
         /// Work without a dedicated branch/worktree/PR (just write the plan file).
         #[arg(long)]
@@ -74,12 +74,24 @@ enum Commands {
         /// Omit to wait indefinitely.
         #[arg(long, requires = "wait")]
         timeout: Option<u64>,
-        /// Keep working issues one after another: when a session's workflow
-        /// concludes, bring it down and claim the next eligible issue, waiting
-        /// when the queue is empty. Stops when you quit a session before its
-        /// workflow concludes. Implies waiting, so it conflicts with --timeout.
-        #[arg(long, conflicts_with = "timeout")]
+        /// Hidden transitional alias for `ghwf forever`: keep working issues one
+        /// after another. Implies waiting, so it conflicts with --timeout.
+        #[arg(long, hide = true, conflicts_with = "timeout")]
         forever: bool,
+    },
+    /// Work issues one after another, indefinitely: claim the next eligible
+    /// issue, run its session to conclusion, bring it down, and pick again —
+    /// parking the worker when the queue is empty.
+    ///
+    /// This is `ghwf next` in a self-renewing supervised loop: ghwf spawns
+    /// Claude as a child and, when the issue's workflow concludes, brings the
+    /// session down and claims the next eligible issue. Stops when you quit a
+    /// session before its workflow concludes — read as you stepping in and
+    /// wanting out.
+    Forever {
+        /// Work without a dedicated branch/worktree/PR (just write the plan file).
+        #[arg(long)]
+        no_branch: bool,
     },
     /// Clone a GitHub repo into ghwf's preferred layout: a container
     /// directory holding the bare repo (as `<name>.git`), a generated
@@ -291,6 +303,7 @@ fn main() -> Result<()> {
             };
             work_on(&number.to_string(), no_branch)
         }
+        Commands::Forever { no_branch } => next::run_forever(no_branch),
         Commands::Clone {
             repo,
             directory,
@@ -1892,11 +1905,21 @@ mod tests {
 
     #[test]
     fn next_forever_parses_and_conflicts_with_timeout() {
-        // `next --forever` parses on its own…
+        // `next --forever` still parses as a hidden transitional alias…
         assert!(Cli::try_parse_from(["ghwf", "next", "--forever"]).is_ok());
         // …but `--forever` is the opposite of a one-shot give-up, so pairing it
         // with `--timeout` is rejected.
         assert!(Cli::try_parse_from(["ghwf", "next", "--forever", "--timeout", "30"]).is_err());
+    }
+
+    #[test]
+    fn forever_subcommand_parses_without_wait_args() {
+        // `ghwf forever` parses on its own and with `--no-branch`…
+        assert!(Cli::try_parse_from(["ghwf", "forever"]).is_ok());
+        assert!(Cli::try_parse_from(["ghwf", "forever", "--no-branch"]).is_ok());
+        // …but it takes no `--wait`/`--timeout` (forever-mode already waits).
+        assert!(Cli::try_parse_from(["ghwf", "forever", "--wait"]).is_err());
+        assert!(Cli::try_parse_from(["ghwf", "forever", "--timeout", "30"]).is_err());
     }
 
     #[test]

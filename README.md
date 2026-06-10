@@ -121,15 +121,15 @@ after a while (exit code 2, like `wait`); omit it to wait indefinitely.
 `--no-branch` passes through as with plain `next`.
 
 A plain `ghwf next --wait` worker is single-use: it works one issue and then
-that terminal stays in the Claude session until you quit it. `ghwf next
---forever` makes the worker self-renewing instead. ghwf spawns Claude as a child
+that terminal stays in the Claude session until you quit it. `ghwf forever`
+makes the worker self-renewing instead. ghwf spawns Claude as a child
 and supervises it: when the issue's workflow concludes (its PR is merged or
 closed, or the issue is closed), ghwf brings the session down and claims the next
 eligible issue, waiting when the queue is empty — so one terminal works the queue
-indefinitely. To stop a `--forever` worker, quit a session before its workflow
+indefinitely. To stop a `forever` worker, quit a session before its workflow
 concludes (the usual Ctrl-C-twice or `/exit`); ghwf reads that as you stepping in
-and stops the loop rather than picking the next issue. (`--forever` implies
-waiting, so it can't be combined with `--timeout`.)
+and stops the loop rather than picking the next issue. (`ghwf next --forever`
+remains as a hidden alias for `ghwf forever` during a transitional period.)
 
 This supervisor model is also why an ordinary `ghwf work-on`/`ghwf next` launch
 now keeps a thin ghwf process alive alongside Claude rather than replacing

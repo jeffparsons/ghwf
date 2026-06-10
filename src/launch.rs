@@ -12,7 +12,7 @@ use crate::{config, git, github, labels, next, prep, render, store};
 /// sure the issue's worktree exists and gather everything needed to spawn an
 /// interactive Claude session anchored in it (resuming the worktree's previous
 /// session when possible). The returned [`Launch`] is handed to [`run`] (a
-/// single session) or the `--forever` supervisor.
+/// single session) or the `forever` supervisor.
 ///
 /// This is deliberately thin — phase advancement, banners, and the activity
 /// digest all happen on the `ghwf work-on` run *inside* the launched session.
@@ -432,7 +432,7 @@ fn munge(path: &Path) -> String {
 
 /// Everything needed to spawn an interactive Claude session for an issue. Built
 /// by [`prepare`]; consumed by [`run`] (a single session) and [`supervise_once`]
-/// (the `--forever` supervisor).
+/// (the `forever` supervisor).
 pub struct Launch {
     /// The issue's own repo owner and name — where its ghwf state is keyed
     /// (which may differ from the code repo holding the worktree/PR).

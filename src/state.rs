@@ -300,7 +300,7 @@ impl IssueState {
     /// Whether the workflow has concluded: the issue was closed, or its PR left
     /// the open state (merged or closed). Either way there is nothing left to
     /// wait for. The Stop hook uses this to let a session end, and the
-    /// `--forever` supervisor uses it to know when to bring a session down.
+    /// `forever` supervisor uses it to know when to bring a session down.
     pub fn is_concluded(&self) -> bool {
         self.issue_closed || self.pr_outcome.is_some()
     }
