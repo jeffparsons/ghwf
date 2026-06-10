@@ -26,9 +26,14 @@ prompts for an approval is equivalent to posting that command.
 
 Merging the PR completes the workflow automatically: `wait` wakes on the
 merge, `work-on` posts a final status update and tells Claude to stop the
-loop, and the session ends on its own. Closing the PR without merging halts
-the workflow the same way (with distinct wording, so Claude surfaces it);
-reopening the PR resumes it on the next `work-on`.
+loop, and the session ends on its own. A merged issue moves to a terminal
+**finished** state, so (when workflow labels are configured) its phase and
+attention labels come off and it carries a single `ghwf:finished` label —
+making it obvious at a glance that ghwf regards the work as done. Closing the
+PR without merging halts the workflow the same way (with distinct wording, so
+Claude surfaces it) but is not "finished": it keeps its phase label as a record
+of how far the work got, and reopening the PR resumes the workflow on the next
+`work-on`.
 
 A command that doesn't match the current phase (or the retired generic
 `/proceed`) is consumed without advancing anything, and `work-on` reports what
