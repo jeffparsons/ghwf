@@ -165,6 +165,16 @@ pub struct PhaseLabels {
     pub prep_and_plan: String,
     pub implement: String,
     pub review: String,
+    // Defaulted so a `[labels.phase]` table written before the `finished` phase
+    // existed keeps parsing; new setups write it explicitly.
+    #[serde(default = "default_finished_label")]
+    pub finished: String,
+}
+
+/// The conventional name for the terminal `finished` phase label, used when a
+/// pre-existing `[labels.phase]` table omits it.
+fn default_finished_label() -> String {
+    "ghwf:finished".to_string()
 }
 
 /// Label names for the `[labels.attention]` table.
@@ -184,6 +194,7 @@ impl LabelsConfig {
             Phase::PrepAndPlan => &self.phase.prep_and_plan,
             Phase::Implement => &self.phase.implement,
             Phase::Review => &self.phase.review,
+            Phase::Finished => &self.phase.finished,
         }
     }
 
@@ -198,12 +209,13 @@ impl LabelsConfig {
 
     /// Every configured label name. Only these are ever added or removed by
     /// the sync; the user's other labels are invisible to it.
-    pub fn all(&self) -> [&str; 7] {
+    pub fn all(&self) -> [&str; 8] {
         [
             &self.phase.pre_plan,
             &self.phase.prep_and_plan,
             &self.phase.implement,
             &self.phase.review,
+            &self.phase.finished,
             &self.attention.waiting_on_user,
             &self.attention.waiting_on_claude,
             &self.attention.waiting_on_ghwf,
@@ -382,6 +394,8 @@ mod tests {
         let labels = config.labels.unwrap();
         assert_eq!(labels.for_phase(Phase::PrePlan), "ghwf:pre-plan");
         assert_eq!(labels.for_phase(Phase::Review), "ghwf:review");
+        // Omitted from the table above: falls back to the serde default.
+        assert_eq!(labels.for_phase(Phase::Finished), "ghwf:finished");
         assert_eq!(
             labels.for_attention(Attention::WaitingOnUser),
             "ghwf:needs-you"
@@ -390,7 +404,7 @@ mod tests {
             labels.for_attention(Attention::WaitingOnGhwf),
             "ghwf:preparing"
         );
-        assert_eq!(labels.all().len(), 7);
+        assert_eq!(labels.all().len(), 8);
     }
 
     #[test]

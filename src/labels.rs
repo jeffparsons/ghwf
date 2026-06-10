@@ -146,6 +146,14 @@ const DEFAULTS: &[(&str, &str, &str, &str)] = &[
         "1d76db",
         "ghwf: awaiting human review",
     ),
+    // The terminal phase: a merged PR. Coloured GitHub's merged-purple to read
+    // as a concluded workflow.
+    (
+        "finished",
+        "ghwf:finished",
+        "8957e5",
+        "ghwf: workflow complete",
+    ),
     // [labels.attention]
     (
         "waiting-on-user",
@@ -169,7 +177,7 @@ const DEFAULTS: &[(&str, &str, &str, &str)] = &[
 
 /// How many of the [`DEFAULTS`] belong to the `[labels.phase]` table; the
 /// rest are `[labels.attention]`.
-const PHASE_DEFAULTS: usize = 4;
+const PHASE_DEFAULTS: usize = 5;
 
 /// `ghwf config labels`: create the default workflow labels in the GitHub
 /// repo and append the `[labels]` section to `ghwf.toml`. Rename afterwards
@@ -255,6 +263,7 @@ mod tests {
         // config parser, with every phase and attention state mapped.
         let labels = config_with_labels().labels.unwrap();
         assert_eq!(labels.for_phase(Phase::PrePlan), "ghwf:pre-plan");
+        assert_eq!(labels.for_phase(Phase::Finished), "ghwf:finished");
         assert_eq!(
             labels.for_attention(Attention::WaitingOnGhwf),
             "ghwf:preparing"
@@ -279,5 +288,14 @@ mod tests {
         let labels = config_with_labels().labels.unwrap();
         let desired = desired_labels(&labels, Phase::Review, None);
         assert_eq!(desired.into_iter().collect::<Vec<_>>(), ["ghwf:review"]);
+    }
+
+    #[test]
+    fn finished_phase_carries_only_the_finished_label() {
+        // A merged PR collapses to the single terminal label: no phase-of-origin
+        // record, and the attention label is already gone for a concluded run.
+        let labels = config_with_labels().labels.unwrap();
+        let desired = desired_labels(&labels, Phase::Finished, None);
+        assert_eq!(desired.into_iter().collect::<Vec<_>>(), ["ghwf:finished"]);
     }
 }
