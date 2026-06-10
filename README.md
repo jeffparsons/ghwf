@@ -232,6 +232,17 @@ manages:
 main_repo = "repo.git"
 # Directory under which ghwf creates per-issue worktrees.
 worktrees_dir = "worktrees"
+# Repos whose issues may be worked on even though the code, worktree, and PR
+# live in this repo (optional; the configured repo is always allowed). Useful
+# when issues are tracked in a separate repo from the code. Each entry is either
+# a plain "owner/repo" string, or a table with an optional `branch_prefix`. A
+# foreign-repo issue's branch is prefixed (to avoid colliding with a
+# same-numbered issue in the main repo): the prefix defaults to the repo name,
+# `branch_prefix = "docs"` overrides it, and `branch_prefix = ""` disables it.
+# Note: GitHub's `Closes #N` auto-close doesn't work across repos, so a foreign
+# issue won't auto-close when its PR merges (the PR still links it by URL); and
+# `ghwf next` only discovers issues in the configured repo.
+issue_repos = ["StileEducation/documentation", { repo = "StileEducation/wiki", branch_prefix = "wiki" }]
 # Labels marking an issue as urgent, most urgent first (optional; used by
 # `ghwf next`).
 priority_labels = ["urgent", "soon"]

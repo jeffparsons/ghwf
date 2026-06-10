@@ -21,7 +21,8 @@ pub fn run(
     state: &IssueState,
     pr_instructions: Option<&Path>,
 ) -> Result<String> {
-    let (_, slug) = state::branch_and_slug(number, &issue.title);
+    // Only the slug is needed here, which is independent of the branch prefix.
+    let (_, slug) = state::branch_and_slug(None, number, &issue.title);
     let plan_rel = format!("plans/{number}-{slug}.md");
 
     let Some(prep) = state.prep.as_ref() else {

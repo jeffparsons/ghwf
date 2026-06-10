@@ -146,6 +146,14 @@ pub fn repo_or_cwd() -> Result<RepoRef> {
     parse_remote_url(&url)
 }
 
+/// The repo where the worktree, branch, and PR for an issue live: the
+/// configured `main_repo` when a `ghwf.toml` is in effect, otherwise the issue's
+/// own repo (single-repo mode). When the issue lives in the configured repo the
+/// two coincide and this returns it either way.
+pub fn code_repo(issue_repo: &RepoRef) -> Result<RepoRef> {
+    Ok(config_repo()?.unwrap_or_else(|| issue_repo.clone()))
+}
+
 /// The `(owner, repo)` declared by a discovered `ghwf.toml`, derived from the
 /// configured repo's `origin` URL. `None` when there is no config.
 pub fn config_repo() -> Result<Option<RepoRef>> {
@@ -414,14 +422,8 @@ fn issue_create_payload(title: &str, body: &str, labels: &[&str]) -> String {
 /// Declare that issue `issue_number` is blocked by the issue with database id
 /// `blocker_id`. `blocker_id` is the REST database id (see [`Issue::id`]), not
 /// the blocker's issue number.
-pub fn add_blocked_by(
-    owner: &str,
-    repo: &str,
-    issue_number: u64,
-    blocker_id: u64,
-) -> Result<()> {
-    let endpoint =
-        format!("repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by");
+pub fn add_blocked_by(owner: &str, repo: &str, issue_number: u64, blocker_id: u64) -> Result<()> {
+    let endpoint = format!("repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by");
     let payload = serde_json::json!({ "issue_id": blocker_id }).to_string();
     gh_api_stdin(&["--method", "POST", &endpoint, "--input", "-"], &payload).map(|_| ())
 }
@@ -484,20 +486,55 @@ fn issue_endpoint(arg: &str, config_repo: Option<&RepoRef>) -> Result<String> {
     // Expect `/owner/repo/issues/number`.
     match segments.as_slice() {
         [owner, repo, "issues", number] if number.parse::<u64>().is_ok() => {
-            if let Some((cfg_owner, cfg_repo)) = config_repo {
-                // ghwf.toml is a hard boundary: refuse URLs for a different repo.
-                // TODO: allow an allowlist of alternative repos in ghwf.toml.
-                if !owner.eq_ignore_ascii_case(cfg_owner) || !repo.eq_ignore_ascii_case(cfg_repo) {
-                    bail!(
-                        "issue URL points at {owner}/{repo}, but ghwf.toml configures \
-                         {cfg_owner}/{cfg_repo}; ghwf only operates on the configured repo."
-                    );
-                }
-            }
-            Ok(format!("repos/{owner}/{repo}/issues/{number}"))
+            // The `issue_repos` allowlist only matters when a config is in
+            // effect (otherwise there's no boundary to relax); read it directly
+            // so it needn't be threaded through every issue-resolving call.
+            let allowed = match config_repo {
+                Some(_) => match config::find()? {
+                    Some(located) => located.config.issue_repo_refs()?,
+                    None => Vec::new(),
+                },
+                None => Vec::new(),
+            };
+            url_issue_endpoint(owner, repo, number, config_repo, &allowed)
         }
         _ => bail!("`{arg}` is not a github.com issue URL of the form owner/repo/issues/number"),
     }
+}
+
+/// Validate a parsed `owner/repo/issues/number` URL against the configured repo
+/// and the `issue_repos` allowlist, returning its `gh api` endpoint. Pure (no
+/// I/O): the caller supplies the allowlist.
+///
+/// `ghwf.toml` is a boundary: the configured repo is always allowed, and
+/// `allowed` lists additional repos whose issues may be worked on (the code,
+/// worktree, and PR still live in the configured repo). Anything else is refused
+/// with guidance pointing at the knob.
+fn url_issue_endpoint(
+    owner: &str,
+    repo: &str,
+    number: &str,
+    config_repo: Option<&RepoRef>,
+    allowed: &[RepoRef],
+) -> Result<String> {
+    if let Some((cfg_owner, cfg_repo)) = config_repo {
+        let is_configured =
+            owner.eq_ignore_ascii_case(cfg_owner) && repo.eq_ignore_ascii_case(cfg_repo);
+        let is_allowed = allowed
+            .iter()
+            .any(|(o, r)| o.eq_ignore_ascii_case(owner) && r.eq_ignore_ascii_case(repo));
+        if !is_configured && !is_allowed {
+            bail!(
+                "issue URL points at {owner}/{repo}, but ghwf.toml configures \
+                 {cfg_owner}/{cfg_repo}.\n\
+                 To work on issues from {owner}/{repo} while the code, worktree, and \
+                 PR stay in {cfg_owner}/{cfg_repo}, add it to `issue_repos` in \
+                 ghwf.toml:\n\n    \
+                 issue_repos = [\"{owner}/{repo}\"]"
+            );
+        }
+    }
+    Ok(format!("repos/{owner}/{repo}/issues/{number}"))
 }
 
 /// The user's preferred git protocol for new clones: `ssh` or `https` (the
@@ -809,8 +846,50 @@ fn gh_api_stdin(args: &[&str], input: &str) -> Result<String> {
 mod tests {
     use super::{
         encode_path_segment, issue_create_payload, parse_http_head, parse_remote_url,
-        pr_update_payload,
+        pr_update_payload, url_issue_endpoint, RepoRef,
     };
+
+    #[test]
+    fn url_endpoint_accepts_configured_repo() {
+        let cfg: RepoRef = ("Org".into(), "code".into());
+        assert_eq!(
+            url_issue_endpoint("Org", "code", "7", Some(&cfg), &[]).unwrap(),
+            "repos/Org/code/issues/7"
+        );
+        // Case-insensitive, matching gh's own behaviour.
+        assert_eq!(
+            url_issue_endpoint("org", "CODE", "7", Some(&cfg), &[]).unwrap(),
+            "repos/org/CODE/issues/7"
+        );
+    }
+
+    #[test]
+    fn url_endpoint_accepts_allowlisted_repo() {
+        let cfg: RepoRef = ("Org".into(), "code".into());
+        let allowed = [("Org".to_string(), "docs".to_string())];
+        assert_eq!(
+            url_issue_endpoint("Org", "docs", "3", Some(&cfg), &allowed).unwrap(),
+            "repos/Org/docs/issues/3"
+        );
+    }
+
+    #[test]
+    fn url_endpoint_rejects_unlisted_repo_with_guidance() {
+        let cfg: RepoRef = ("Org".into(), "code".into());
+        let err = url_issue_endpoint("Org", "docs", "3", Some(&cfg), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("issue_repos"));
+        assert!(err.contains("Org/docs"));
+    }
+
+    #[test]
+    fn url_endpoint_without_config_accepts_anything() {
+        assert_eq!(
+            url_issue_endpoint("Anyone", "anything", "9", None, &[]).unwrap(),
+            "repos/Anyone/anything/issues/9"
+        );
+    }
 
     #[test]
     fn issue_create_payload_carries_title_body_and_labels() {

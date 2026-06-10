@@ -3,17 +3,30 @@ use std::collections::BTreeSet;
 use anyhow::{bail, Context, Result};
 
 use crate::config::{self, LabelsConfig};
-use crate::github;
+use crate::github::{self, RepoRef};
 use crate::state::{Attention, IssueState, LabelSyncRecord, Phase};
 
 /// Mirror the workflow state onto GitHub labels on the issue and (when one
 /// exists) its PR. Entirely best-effort decoration: every failure is a stderr
 /// warning, never an error — the state file remains the source of truth.
 ///
+/// The issue and PR may live in different repos (an `issue_repos` foreign
+/// issue): `issue_repo` is where the issue lives, `code_repo` is where the PR
+/// lives. They coincide for the common single-repo case. The configured labels
+/// must exist in whichever repo a thread lives in; a missing label just warns
+/// (best-effort), so a foreign issue repo without the labels degrades to no
+/// issue labels rather than failing.
+///
 /// No-op when no `[labels]` section is configured, and when the last sync
 /// already applied the same inputs (recorded in `state.labels_synced`), so
 /// the steady-state loop adds zero API calls.
-pub fn sync(owner: &str, repo: &str, number: u64, pr_number: Option<u64>, state: &mut IssueState) {
+pub fn sync(
+    issue_repo: &RepoRef,
+    code_repo: &RepoRef,
+    number: u64,
+    pr_number: Option<u64>,
+    state: &mut IssueState,
+) {
     let cfg = match config::find() {
         Ok(Some(located)) => match located.config.labels {
             Some(cfg) => cfg,
@@ -38,9 +51,16 @@ pub fn sync(owner: &str, repo: &str, number: u64, pr_number: Option<u64>, state:
         return;
     }
 
+    // Each thread is labelled in its own repo: the issue in `issue_repo`, the PR
+    // (when one exists) in `code_repo`.
+    let mut threads = vec![(issue_repo, number)];
+    if let Some(pr) = pr_number {
+        threads.push((code_repo, pr));
+    }
+
     let mut all_ok = true;
-    for thread in std::iter::once(number).chain(pr_number) {
-        if let Err(err) = sync_thread(&cfg, owner, repo, thread, state.phase, attention) {
+    for (repo, thread) in threads {
+        if let Err(err) = sync_thread(&cfg, &repo.0, &repo.1, thread, state.phase, attention) {
             eprintln!("warning: failed to sync workflow labels on #{thread}: {err:#}");
             all_ok = false;
         }
@@ -169,18 +189,12 @@ pub fn configure() -> Result<()> {
 /// have already located the config and ruled out an existing `[labels]`
 /// section.
 pub fn configure_at(located: &config::Located) -> Result<()> {
-    let (owner, repo) = github::repo_or_cwd()?;
-    let existing: BTreeSet<String> = github::list_repo_labels(&owner, &repo)?
-        .into_iter()
-        .collect();
-    for &(_, name, color, description) in DEFAULTS {
-        if existing.contains(name) {
-            println!("Label `{name}` already exists in {owner}/{repo}; leaving it as is.");
-            continue;
-        }
-        github::create_label(&owner, &repo, name, color, description)
-            .with_context(|| format!("failed to create label `{name}` in {owner}/{repo}"))?;
-        println!("Created label `{name}` in {owner}/{repo}.");
+    // The configured (code) repo, plus every `issue_repos` repo — a foreign
+    // issue is labelled in its own repo, so the labels must exist there too.
+    let mut repos = vec![github::repo_or_cwd()?];
+    repos.extend(located.config.issue_repo_refs()?);
+    for (owner, repo) in &repos {
+        create_default_labels(owner, repo)?;
     }
 
     let path = located.file_path();
@@ -192,6 +206,22 @@ pub fn configure_at(located: &config::Located) -> Result<()> {
     text.push_str(&labels_section());
     std::fs::write(&path, &text).with_context(|| format!("failed to write {}", path.display()))?;
     println!("Added the [labels] section to {}.", path.display());
+    Ok(())
+}
+
+/// Create the [`DEFAULTS`] labels in `owner/repo`, skipping any that already
+/// exist. Used for the configured repo and every `issue_repos` repo.
+fn create_default_labels(owner: &str, repo: &str) -> Result<()> {
+    let existing: BTreeSet<String> = github::list_repo_labels(owner, repo)?.into_iter().collect();
+    for &(_, name, color, description) in DEFAULTS {
+        if existing.contains(name) {
+            println!("Label `{name}` already exists in {owner}/{repo}; leaving it as is.");
+            continue;
+        }
+        github::create_label(owner, repo, name, color, description)
+            .with_context(|| format!("failed to create label `{name}` in {owner}/{repo}"))?;
+        println!("Created label `{name}` in {owner}/{repo}.");
+    }
     Ok(())
 }
 

@@ -13,9 +13,22 @@ use crate::{store, worktree};
 /// Returns `(branch, slug)` where `branch` uses underscores (`issue_<n>_<slug>`,
 /// per the org convention) and `slug` is the kebab-case form for the plan
 /// filename (`plans/<n>-<slug>.md`).
-pub fn branch_and_slug(number: u64, title: &str) -> (String, String) {
+///
+/// `prefix` qualifies the branch for issues that live in a *foreign* repo, so
+/// two same-numbered issues in different repos don't collide on one branch (and
+/// thus one worktree dir). `None` — the common case, a main-repo issue — leaves
+/// the branch unqualified; `Some(p)` prepends a sanitised `p`. The slug is never
+/// prefixed: the plan file lives inside the per-branch worktree, so it can't
+/// collide across issues.
+pub fn branch_and_slug(prefix: Option<&str>, number: u64, title: &str) -> (String, String) {
     let words = slug_words(title);
-    let branch = format!("issue_{number}_{}", words.join("_"));
+    let core = format!("issue_{number}_{}", words.join("_"));
+    let branch = match prefix.map(slug_words) {
+        // A prefix that sanitises to nothing (e.g. all punctuation) is dropped
+        // rather than producing a leading underscore.
+        Some(parts) if !parts.is_empty() => format!("{}_{core}", parts.join("_")),
+        _ => core,
+    };
     let slug = words.join("-");
     (branch, slug)
 }
@@ -966,15 +979,35 @@ mod tests {
 
     #[test]
     fn naming_basic() {
-        let (branch, slug) = branch_and_slug(1, "Basic workflow");
+        // A main-repo issue (no prefix) keeps the bare scheme.
+        let (branch, slug) = branch_and_slug(None, 1, "Basic workflow");
         assert_eq!(branch, "issue_1_basic_workflow");
         assert_eq!(slug, "basic-workflow");
     }
 
     #[test]
     fn naming_strips_punctuation() {
-        let (branch, slug) = branch_and_slug(42, "Fix: the `foo`/bar bug!");
+        let (branch, slug) = branch_and_slug(None, 42, "Fix: the `foo`/bar bug!");
         assert_eq!(branch, "issue_42_fix_the_foo_bar_bug");
         assert_eq!(slug, "fix-the-foo-bar-bug");
+    }
+
+    #[test]
+    fn naming_prefixes_foreign_repo() {
+        // A foreign-repo issue is qualified so it can't collide with a
+        // same-numbered main-repo issue; the slug stays unprefixed.
+        let (branch, slug) = branch_and_slug(Some("documentation"), 42, "Basic workflow");
+        assert_eq!(branch, "documentation_issue_42_basic_workflow");
+        assert_eq!(slug, "basic-workflow");
+    }
+
+    #[test]
+    fn naming_sanitises_and_drops_empty_prefix() {
+        // A prefix is sanitised like a slug word…
+        let (branch, _) = branch_and_slug(Some("My Docs!"), 5, "X");
+        assert_eq!(branch, "my_docs_issue_5_x");
+        // …and one that sanitises to nothing leaves no leading underscore.
+        let (branch, _) = branch_and_slug(Some("!!!"), 5, "X");
+        assert_eq!(branch, "issue_5_x");
     }
 }

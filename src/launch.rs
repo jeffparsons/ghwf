@@ -22,8 +22,13 @@ pub fn run(issue_arg: &str, no_branch: bool) -> Result<()> {
 
     let repo_ctx = github::config_repo()?;
     let (owner, repo, requested) = github::resolve_issue_ref(issue_arg, repo_ctx.as_ref())?;
+    // The code repo (where the worktree, branch, and PR live) — the configured
+    // repo, or the issue's own repo when there's no config. It may differ from
+    // the issue's repo for a foreign `issue_repos` issue.
+    let (code_owner, code_repo) = github::code_repo(&(owner.clone(), repo.clone()))?;
     // A tracking issue (one with sub-issues) is never worked directly: redirect
     // to a workable sub-issue so the session is anchored to the real work.
+    // Sub-issues live in the issue's own repo.
     let number = next::resolve_workable(&owner, &repo, requested)?;
     if number != requested {
         println!("Issue #{requested} is a tracking issue; working sub-issue #{number} instead.");
@@ -104,8 +109,9 @@ pub fn run(issue_arg: &str, no_branch: bool) -> Result<()> {
             );
             // The worktree-creation path fetches as a side effect; this path
             // wouldn't otherwise touch the network, so take the opportunity
-            // to keep the local default-branch checkout fresh.
-            refresh_main_repo(&owner, &repo);
+            // to keep the local default-branch checkout fresh. The default
+            // branch is the code repo's, where the worktree lives.
+            refresh_main_repo(&code_owner, &code_repo);
             path
         }
         None => {
@@ -117,8 +123,9 @@ pub fn run(issue_arg: &str, no_branch: bool) -> Result<()> {
             // redirect that is a sub-issue, not the `issue_arg` the user named,
             // so fetch by the canonical URL of the resolved number.
             let issue_data = github::fetch_issue(&issue_url, repo_ctx.as_ref())?;
+            // The worktree and branch live in the code repo.
             let (path, branch) =
-                prep::ensure_worktree(&issue_data, &owner, &repo, &mut issue_state)?;
+                prep::ensure_worktree(&issue_data, &code_owner, &code_repo, &mut issue_state)?;
             state::save(&owner, &repo, number, &issue_state)?;
             println!(
                 "Created worktree `{}` on branch `{branch}`.",
