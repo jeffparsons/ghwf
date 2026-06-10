@@ -229,6 +229,20 @@ pub fn run() -> Result<()> {
         doc_changed = true;
     }
 
+    if !doc.contains_key("only_assigned_to_me")
+        && prompt(
+            Confirm::new(
+                "Only consider issues already assigned to you? \
+                 (ignores unassigned issues when picking work)",
+            )
+            .with_default(false)
+            .prompt(),
+        )?
+    {
+        set_only_assigned_to_me(&mut doc);
+        doc_changed = true;
+    }
+
     if !doc.contains_key("blocked_label")
         && prompt(
             Confirm::new(
@@ -491,6 +505,19 @@ fn set_delete_plan_on_approval(doc: &mut DocumentMut) {
     );
 }
 
+/// Write the `only_assigned_to_me` key (only ever set to `true` — the wizard
+/// offers it only when absent, and the default is `false`).
+fn set_only_assigned_to_me(doc: &mut DocumentMut) {
+    insert_with_comment(
+        doc,
+        "only_assigned_to_me",
+        toml_edit::value(true),
+        "When true, `ghwf next` only considers issues already assigned to you,\n\
+         ignoring unassigned ones. Suits teams that allocate work by discussion\n\
+         or a manager rather than picking off the list.",
+    );
+}
+
 /// Write the `blocked_label` key.
 fn set_blocked_label(doc: &mut DocumentMut, label: &str) {
     insert_with_comment(
@@ -532,7 +559,7 @@ fn append_line(path: &Path, line: &str) -> Result<()> {
 mod tests {
     use super::{
         parse_priority_labels, set_blocked_label, set_delete_plan_on_approval, set_essentials,
-        set_permission_mode, set_priority_labels, PR_STUB,
+        set_only_assigned_to_me, set_permission_mode, set_priority_labels, PR_STUB,
     };
     use crate::config::Config;
     use std::path::PathBuf;
@@ -612,6 +639,15 @@ pre-plan = \"a\"
         set_delete_plan_on_approval(&mut doc);
         let config: Config = toml::from_str(&doc.to_string()).unwrap();
         assert!(config.delete_plan_on_approval);
+    }
+
+    #[test]
+    fn only_assigned_to_me_round_trips() {
+        let mut doc = DocumentMut::new();
+        set_essentials(&mut doc, None, "worktrees");
+        set_only_assigned_to_me(&mut doc);
+        let config: Config = toml::from_str(&doc.to_string()).unwrap();
+        assert!(config.only_assigned_to_me);
     }
 
     #[test]
