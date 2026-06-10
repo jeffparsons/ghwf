@@ -11,6 +11,12 @@ const SESSION_MARKER_PREFIX: &str = "<!-- ghwf:v1 session=";
 const MARKER_SUFFIX: &str = " -->";
 /// The complete marker embedded in ghwf-authored status comments.
 const STATUS_MARKER: &str = "<!-- ghwf:v1 status -->";
+/// Opening of the hidden stable id marker on each option line of an `ask`
+/// comment. Deliberately outside the `ghwf:v1` family: these markers sit
+/// mid-body, and `strip_ghwf_marker` truncates at the first `ghwf:v1` marker.
+const OPT_MARKER_PREFIX: &str = "<!-- ghwf-opt:";
+/// The hidden marker on the final submit checkbox of an `ask` comment.
+const SUBMIT_MARKER: &str = "<!-- ghwf-submit -->";
 
 /// The hidden metadata marker found in a ghwf-posted comment.
 pub enum Marker {
@@ -39,6 +45,18 @@ pub struct ReviewCommentView<'a> {
     pub location: String,
     /// True if this comment was seen before but its content has since changed.
     pub updated: bool,
+}
+
+/// An `ask` question the user has just answered, prepared for the digest.
+pub struct OptionSubmission {
+    /// "issue thread" / "PR thread", naming where the question lives.
+    pub thread_noun: &'static str,
+    /// The question comment's URL.
+    pub url: String,
+    /// The labels of the ticked options.
+    pub selected: Vec<String>,
+    /// The labels of the un-ticked options.
+    pub unselected: Vec<String>,
 }
 
 /// Render a single comment (e.g. one just created) as pretty-printed JSON.
@@ -124,6 +142,95 @@ pub fn strip_ghwf_marker(body: &str) -> String {
     }
 }
 
+/// One option parsed out of an `ask` comment: its visible label and whether
+/// the user has ticked it. The hidden `ghwf-opt` id marker anchors the line as
+/// a ghwf-managed option (so a `- [ ]` inside a label can't be mistaken for
+/// one); ghwf maps a tick back by label, so the id value itself isn't kept.
+pub struct ParsedOption {
+    pub label: String,
+    pub checked: bool,
+}
+
+/// The state of an `ask` comment: its options and its submit checkbox. `submit`
+/// is `None` when the comment carries no submit marker — either it isn't an
+/// `ask` comment at all, or it has already been rewritten on submission.
+pub struct ParsedOptions {
+    pub options: Vec<ParsedOption>,
+    pub submit: Option<bool>,
+}
+
+/// Assemble the inner body of an `ask` comment: the question, a multi-select
+/// task list with a hidden stable id on each option, and a final submit
+/// checkbox. [`build_comment_body`] wraps this with the attribution header and
+/// session marker before it is posted.
+pub fn build_options_body(question: &str, options: &[String]) -> String {
+    let mut body = format!("{}\n", question.trim());
+    for (i, label) in options.iter().enumerate() {
+        let id = format!("opt{}", i + 1);
+        body.push_str(&format!(
+            "\n- [ ] {} {OPT_MARKER_PREFIX}{id}{MARKER_SUFFIX}",
+            label.trim()
+        ));
+    }
+    body.push_str(&format!("\n\n- [ ] **Submit my answers** {SUBMIT_MARKER}"));
+    body
+}
+
+/// Parse a markdown task-list line into its checked state and the text after
+/// the checkbox. `None` if the line isn't a `- [ ]` / `- [x]` item.
+fn parse_task_line(line: &str) -> Option<(bool, &str)> {
+    let rest = line.trim_start().strip_prefix("- [")?;
+    let mut chars = rest.chars();
+    let checked = match chars.next()? {
+        ' ' => false,
+        'x' | 'X' => true,
+        _ => return None,
+    };
+    let rest = chars.as_str().strip_prefix("] ")?;
+    Some((checked, rest))
+}
+
+/// Read the options and submit state out of an `ask` comment body. Option lines
+/// are task-list items carrying an [`OPT_MARKER_PREFIX`] id; the submit line is
+/// the task-list item carrying [`SUBMIT_MARKER`]. Other lines (the question,
+/// the attribution header, the session marker) are ignored.
+pub fn parse_options_comment(body: &str) -> ParsedOptions {
+    let mut options = Vec::new();
+    let mut submit = None;
+    for line in body.lines() {
+        let Some((checked, rest)) = parse_task_line(line) else {
+            continue;
+        };
+        if rest.contains(SUBMIT_MARKER) {
+            submit = Some(checked);
+        } else if let Some(start) = rest.find(OPT_MARKER_PREFIX) {
+            options.push(ParsedOption {
+                label: rest[..start].trim().to_string(),
+                checked,
+            });
+        }
+    }
+    ParsedOptions { options, submit }
+}
+
+/// Rewrite an `ask` comment on submission: replace the submit checkbox line
+/// with a plain (non-checkbox) confirmation line, leaving the option lines
+/// (with the user's ticks) and the session marker untouched. Dropping the
+/// `- [ ]` means the box can no longer be toggled, and [`parse_options_comment`]
+/// then reports `submit: None`, so the comment is never re-watched or
+/// re-surfaced.
+pub fn rewrite_submitted_body(body: &str, when: &str) -> String {
+    body.lines()
+        .map(|line| match parse_task_line(line) {
+            Some((_, rest)) if rest.contains(SUBMIT_MARKER) => {
+                format!("_Answers submitted at {when}._")
+            }
+            _ => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// One-line reminder, shared across phase banners, to route a question that
 /// blocks progress to the thread rather than an interactive prompt.
 pub fn question_instruction(number: u64) -> String {
@@ -131,7 +238,11 @@ pub fn question_instruction(number: u64) -> String {
         "If you need an answer from the user to proceed, never use an interactive \
          prompt (no AskUserQuestion, and don't ask in prose and stop): post the \
          question with `ghwf hand-off {number} --question` (body from stdin) — that \
-         flips the issue to \"needs you\" — then `ghwf wait {number}` for the reply."
+         flips the issue to \"needs you\" — then `ghwf wait {number}` for the reply. \
+         When the answer is a choice among discrete options, use `ghwf ask {number} \
+         --option \"…\" --option \"…\"` (question on stdin) instead: ghwf renders the \
+         options as checkboxes, appends a submit box, and wakes you only once it's \
+         ticked. Offer an \"other / none of these\" option where it fits."
     )
 }
 
@@ -177,7 +288,9 @@ pub fn pre_plan_body(number: u64) -> String {
          Discuss on the issue itself. Post questions and clarifications as comments with \
          `ghwf create-issue-comment {number}`; if an answer is needed before you can \
          proceed, use `ghwf hand-off {number} --question` instead so the issue flips to \
-         \"needs you\". Either way, never raise an interactive prompt (no AskUserQuestion). \
+         \"needs you\" (or, for a choice among discrete options, `ghwf ask {number} \
+         --option \"…\" --option \"…\"`, which presents them as checkboxes). Either way, \
+         never raise an interactive prompt (no AskUserQuestion). \
          When you have enough information, hand off \
          with `ghwf hand-off {number}` (body from stdin): a comment that summarises your \
          understanding and clearly states you are ready to write a plan. ghwf appends the \
@@ -528,8 +641,14 @@ pub fn render_work_on(
     pr_number: Option<u64>,
     new_pr: &[CommentView],
     new_review: &[ReviewCommentView],
+    submissions: &[OptionSubmission],
 ) -> String {
-    if !body_changed && new_issue.is_empty() && new_pr.is_empty() && new_review.is_empty() {
+    if !body_changed
+        && new_issue.is_empty()
+        && new_pr.is_empty()
+        && new_review.is_empty()
+        && submissions.is_empty()
+    {
         let threads = match pr_number {
             Some(pr) => format!("issue #{} \"{}\" or PR #{pr}", issue.number, issue.title),
             None => format!("issue #{} \"{}\"", issue.number, issue.title),
@@ -568,6 +687,7 @@ pub fn render_work_on(
         if prior_section {
             out.push_str("\n<hr>\n");
         }
+        prior_section = true;
         out.push_str("\nNew inline review comments since you last ran `ghwf work-on`:\n");
         for (i, view) in new_review.iter().enumerate() {
             if i > 0 {
@@ -581,6 +701,38 @@ pub fn render_work_on(
             out.push_str(&blockquote(&view.body));
             out.push('\n');
         }
+    }
+
+    if !submissions.is_empty() {
+        if prior_section {
+            out.push_str("\n<hr>\n");
+        }
+        out.push_str("\nThe user submitted answers to your options question(s):\n");
+        for (i, sub) in submissions.iter().enumerate() {
+            if i > 0 {
+                out.push_str("\n<hr>\n");
+            }
+            out.push_str(&format!("\nOn the {} ({}):\n\n", sub.thread_noun, sub.url));
+            if sub.selected.is_empty() {
+                out.push_str("- Selected: *(none)*\n");
+            } else {
+                out.push_str("- Selected:\n");
+                for label in &sub.selected {
+                    out.push_str(&format!("  - {label}\n"));
+                }
+            }
+            if !sub.unselected.is_empty() {
+                out.push_str("- Not selected:\n");
+                for label in &sub.unselected {
+                    out.push_str(&format!("  - {label}\n"));
+                }
+            }
+        }
+        out.push_str(
+            "\nIf the selection looks contradictory, or an \"other / none of these\" \
+             option was picked, treat the question as responded but not resolved and \
+             continue the conversation rather than assuming it's settled.\n",
+        );
     }
 
     out.trim_end().to_string()
@@ -639,8 +791,8 @@ mod tests {
         build_comment_body, build_status_comment_body, conflict_notice, extract_marker,
         hand_off_prompt, hidden_from_digest, pr_overview, render_phase_banner,
         render_status_comment, render_status_stub, render_work_on, status_primary_is_pr,
-        strip_ghwf_marker, CommentView, DirectiveNote, Marker, NoteKind, ReviewCommentView,
-        Transition, Trigger,
+        strip_ghwf_marker, CommentView, DirectiveNote, Marker, NoteKind, OptionSubmission,
+        ReviewCommentView, Transition, Trigger,
     };
     use crate::models::{Comment, Head, Issue, PullRequest, ReviewComment, User};
     use crate::state::{Directive, Phase, PrOutcome};
@@ -1120,20 +1272,28 @@ mod tests {
 
     #[test]
     fn no_activity_requires_all_inputs_empty() {
-        let out = render_work_on(&issue(), false, &[], None, &[], &[]);
+        let out = render_work_on(&issue(), false, &[], None, &[], &[], &[]);
         assert!(out.starts_with("No new activity on issue #9 \"A PR\" since"));
     }
 
     #[test]
     fn no_activity_names_both_threads_with_pr() {
-        let out = render_work_on(&issue(), false, &[], Some(20), &[], &[]);
+        let out = render_work_on(&issue(), false, &[], Some(20), &[], &[], &[]);
         assert!(out.starts_with("No new activity on issue #9 \"A PR\" or PR #20 since"));
     }
 
     #[test]
     fn review_comments_alone_are_activity() {
         let review = review_comment();
-        let out = render_work_on(&issue(), false, &[], Some(20), &[], &[review_view(&review)]);
+        let out = render_work_on(
+            &issue(),
+            false,
+            &[],
+            Some(20),
+            &[],
+            &[review_view(&review)],
+            &[],
+        );
         assert!(out.contains("New inline review comments since you last ran `ghwf work-on`:"));
         assert!(out.contains("**reviewer** at 2026-01-02T00:00:00Z said on `src/main.rs:42`:"));
         assert!(out.contains("> rename this"));
@@ -1151,6 +1311,7 @@ mod tests {
             Some(20),
             &[comment_view(&pr_comment)],
             &[review_view(&review)],
+            &[],
         );
         let issue_at = out
             .find("New comments on the issue thread since")
@@ -1169,7 +1330,7 @@ mod tests {
 
     #[test]
     fn body_section_is_always_the_issues() {
-        let out = render_work_on(&issue(), true, &[], Some(20), &[], &[]);
+        let out = render_work_on(&issue(), true, &[], Some(20), &[], &[], &[]);
         assert!(out.contains("Issue body by author:"));
         assert!(out.contains("> body"));
     }
@@ -1179,7 +1340,96 @@ mod tests {
         let review = review_comment();
         let mut view = review_view(&review);
         view.updated = true;
-        let out = render_work_on(&issue(), false, &[], Some(20), &[], &[view]);
+        let out = render_work_on(&issue(), false, &[], Some(20), &[], &[view], &[]);
         assert!(out.contains("said on `src/main.rs:42` (updated):"));
+    }
+
+    #[test]
+    fn build_options_body_numbers_ids_and_appends_submit() {
+        let body = super::build_options_body("Which?", &["First".into(), "Second".into()]);
+        assert!(body.starts_with("Which?\n"));
+        assert!(body.contains("- [ ] First <!-- ghwf-opt:opt1 -->"));
+        assert!(body.contains("- [ ] Second <!-- ghwf-opt:opt2 -->"));
+        assert!(body.contains("- [ ] **Submit my answers** <!-- ghwf-submit -->"));
+    }
+
+    #[test]
+    fn parse_options_round_trips_with_mixed_ticks() {
+        // A wrapped, partly-ticked comment: `[x]`/`[X]`, leading whitespace, a
+        // label containing its own `- [ ]`, and a trailing session marker.
+        let body = "**Claude says:**\n<hr>\n\nPick:\n\n\
+             - [x] Alpha <!-- ghwf-opt:opt1 -->\n\
+             - [ ] Beta <!-- ghwf-opt:opt2 -->\n\
+             - [X] Keep a `- [ ]` literal <!-- ghwf-opt:opt3 -->\n\n\
+             - [ ] **Submit my answers** <!-- ghwf-submit -->\n\n\
+             <!-- ghwf:v1 session=tok -->";
+        let parsed = super::parse_options_comment(body);
+        assert_eq!(parsed.submit, Some(false));
+        let labels: Vec<_> = parsed
+            .options
+            .iter()
+            .map(|o| (o.label.as_str(), o.checked))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                ("Alpha", true),
+                ("Beta", false),
+                ("Keep a `- [ ]` literal", true),
+            ]
+        );
+    }
+
+    #[test]
+    fn rewrite_submitted_drops_only_the_submit_checkbox() {
+        let posted = build_comment_body(
+            &super::build_options_body("Pick", &["A".into(), "B".into()]),
+            Some("tok"),
+        );
+        // Simulate the user ticking option A and the submit box.
+        let ticked = posted
+            .replacen("- [ ] A", "- [x] A", 1)
+            .replace("- [ ] **Submit", "- [x] **Submit");
+        let rewritten = super::rewrite_submitted_body(&ticked, "2026-06-10T00:05:00Z");
+        // Submit checkbox gone, replaced by the confirmation line.
+        assert!(rewritten.contains("_Answers submitted at 2026-06-10T00:05:00Z._"));
+        assert!(!rewritten.contains("ghwf-submit"));
+        // Option ticks and the session marker survive.
+        assert!(rewritten.contains("- [x] A <!-- ghwf-opt:opt1 -->"));
+        assert!(rewritten.contains("<!-- ghwf:v1 session=tok -->"));
+        // A rewritten comment reports no submit box, so it's never re-consumed.
+        assert_eq!(super::parse_options_comment(&rewritten).submit, None);
+    }
+
+    #[test]
+    fn option_markers_do_not_disturb_session_marker_handling() {
+        let posted = build_comment_body(
+            &super::build_options_body("Pick", &["A".into()]),
+            Some("tok"),
+        );
+        // The inline ghwf-opt / ghwf-submit markers don't trip the ghwf:v1
+        // session-marker machinery.
+        assert!(matches!(extract_marker(&posted), Some(super::Marker::Session(t)) if t == "tok"));
+        let stripped = strip_ghwf_marker(&posted);
+        assert!(stripped.contains("- [ ] A <!-- ghwf-opt:opt1 -->"));
+        assert!(!stripped.contains("ghwf:v1"));
+    }
+
+    #[test]
+    fn submissions_render_selected_and_unselected() {
+        let sub = OptionSubmission {
+            thread_noun: "issue thread",
+            url: "https://github.com/o/r/issues/1#issuecomment-9".to_string(),
+            selected: vec!["Alpha".to_string()],
+            unselected: vec!["Beta".to_string()],
+        };
+        let out = render_work_on(&issue(), false, &[], None, &[], &[], &[sub]);
+        assert!(out.contains("The user submitted answers to your options question(s):"));
+        assert!(
+            out.contains("On the issue thread (https://github.com/o/r/issues/1#issuecomment-9):")
+        );
+        assert!(out.contains("- Selected:\n  - Alpha"));
+        assert!(out.contains("- Not selected:\n  - Beta"));
+        assert!(out.contains("responded but not resolved"));
     }
 }

@@ -36,6 +36,10 @@ Run `ghwf work-on $ARGUMENTS` and follow the phase banner exactly:
   don't ask in prose and stop). If you need an answer to proceed, post the
   question with `ghwf hand-off $ARGUMENTS --question` (body from stdin) — that
   flips the issue to "needs you" — then `ghwf wait $ARGUMENTS` for the reply.
+  When the answer is a choice among discrete options, use `ghwf ask $ARGUMENTS
+  --option "..." --option "..."` (question on stdin) instead: ghwf renders the
+  options as checkboxes, appends a submit box, and wakes you only once the user
+  ticks it. Offer an "other / none of these" option where it fits.
 - Post questions and clarifications with `ghwf create-issue-comment
   $ARGUMENTS`; when a phase's work is done, hand off with `ghwf hand-off
   $ARGUMENTS` (body from stdin) — ghwf appends the approval prompt itself,
@@ -230,6 +234,8 @@ mod tests {
         // blocking question (see issue #43).
         assert!(SKILL_CONTENT.contains("--question"));
         assert!(SKILL_CONTENT.contains("AskUserQuestion"));
+        // …and toward `ask` for a choice among discrete options (see #60).
+        assert!(SKILL_CONTENT.contains("ghwf ask"));
     }
 
     #[test]

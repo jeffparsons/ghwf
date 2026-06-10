@@ -128,6 +128,24 @@ enum Commands {
         #[arg(long)]
         question: bool,
     },
+    /// Present the user with a menu of options as a GitHub checklist (the
+    /// question is read from stdin), and flip the workflow to waiting-on-user.
+    ///
+    /// ghwf renders each `--option` as a task-list checkbox with a hidden
+    /// stable id, appends a final "Submit my answers" checkbox, and wakes the
+    /// workflow only once that box is ticked. Use this instead of `hand-off
+    /// --question` when the answer is a choice among discrete options.
+    /// Multi-select: the user may tick any number. Consider including an "other
+    /// / none of these" option for answers your menu doesn't anticipate —
+    /// ticking it signals the question was responded to but not resolved.
+    Ask {
+        /// An issue number (resolved against the current repo) or a full GitHub
+        /// issue URL. When omitted, inferred as `work-on` does.
+        issue: Option<String>,
+        /// An option to offer, repeatable; presented in the order given.
+        #[arg(long = "option")]
+        options: Vec<String>,
+    },
     /// File a follow-up issue, reading its body from stdin.
     ///
     /// Use this for deferrals and discoveries while planning or implementing —
@@ -274,6 +292,7 @@ fn main() -> Result<()> {
             no_block,
         } => create_issue(&title, issue, &labels, no_block),
         Commands::HandOff { issue, question } => hand_off(&resolve_issue_arg(issue)?, question),
+        Commands::Ask { issue, options } => ask(&resolve_issue_arg(issue)?, &options),
         Commands::Config { command } => match command {
             ConfigCommands::Init => init::run(),
             ConfigCommands::Labels => labels::configure(),
@@ -707,6 +726,40 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         wait_state.reaction_watches.insert("pr".to_string(), watch);
     }
 
+    // Surface and consume any `ask` answers the user has just submitted, and
+    // keep watching any still-open question per thread. A submission ticks the
+    // submit box on a ghwf-authored (hidden) options comment; rewriting that
+    // box to a confirmation marks it consumed, so it neither re-surfaces nor is
+    // re-watched on later runs.
+    let mut submissions = Vec::new();
+    let (issue_subs, issue_options_watch) =
+        scan_options(&issue_comments, &my_token, "issue thread");
+    submissions.extend(issue_subs);
+    if let Some(watch) = issue_options_watch {
+        wait_state
+            .options_watches
+            .insert("issue".to_string(), watch);
+    }
+    if let Some(comments) = pr_comments.as_deref() {
+        let (pr_subs, pr_options_watch) = scan_options(comments, &my_token, "PR thread");
+        submissions.extend(pr_subs);
+        if let Some(watch) = pr_options_watch {
+            wait_state.options_watches.insert("pr".to_string(), watch);
+        }
+    }
+    for sub in &submissions {
+        if let Err(err) =
+            github::update_issue_comment(&owner, &repo, sub.comment_id, &sub.rewritten_body)
+        {
+            eprintln!(
+                "warning: recorded the submitted answers, but couldn't mark the \
+                 question comment as submitted: {err:#}"
+            );
+        }
+    }
+    let submission_views: Vec<render::OptionSubmission> =
+        submissions.into_iter().map(|s| s.view).collect();
+
     let record = seen::load(&session_id, &owner, &repo, number)?;
 
     let body_hash = store::content_hash(issue_data.body.as_deref().unwrap_or(""));
@@ -747,6 +800,7 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         || !new_issue.is_empty()
         || !new_pr.is_empty()
         || !new_review.is_empty()
+        || !submission_views.is_empty()
         // A standing conflict keeps the ball with Claude until it's resolved.
         || conflict_base.is_some();
     if activity {
@@ -785,7 +839,8 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
             &new_issue,
             pr_number,
             &new_pr,
-            &new_review
+            &new_review,
+            &submission_views
         )
     );
 
@@ -863,6 +918,64 @@ fn collect_new_comments<'a>(
         }
     }
     new
+}
+
+/// An `ask` answer the user has just submitted, ready to surface (`view`) and
+/// to consume (`comment_id` + `rewritten_body`, used to mark the comment done).
+struct PendingSubmission {
+    comment_id: u64,
+    rewritten_body: String,
+    view: render::OptionSubmission,
+}
+
+/// Scan one thread's comments for this session's `ask` options comments.
+/// Returns the answers whose submit box is now ticked — each with the rewritten
+/// body that marks it consumed — and the latest still-open question on the
+/// thread, to keep watching.
+fn scan_options(
+    comments: &[models::Comment],
+    my_token: &str,
+    thread_noun: &'static str,
+) -> (Vec<PendingSubmission>, Option<state::OptionsWatch>) {
+    let mut submissions = Vec::new();
+    let mut outstanding: Option<&models::Comment> = None;
+    for comment in comments {
+        // Only this session's own (hidden) comments carry the `ask` markers;
+        // status comments and user prose can't be options comments.
+        if !render::hidden_from_digest(&comment.body, Some(my_token)) {
+            continue;
+        }
+        let parsed = render::parse_options_comment(&comment.body);
+        match parsed.submit {
+            Some(true) => {
+                let (selected, unselected): (Vec<_>, Vec<_>) =
+                    parsed.options.into_iter().partition(|o| o.checked);
+                submissions.push(PendingSubmission {
+                    comment_id: comment.id,
+                    rewritten_body: render::rewrite_submitted_body(
+                        &comment.body,
+                        &comment.updated_at,
+                    ),
+                    view: render::OptionSubmission {
+                        thread_noun,
+                        url: comment.html_url.clone(),
+                        selected: selected.into_iter().map(|o| o.label).collect(),
+                        unselected: unselected.into_iter().map(|o| o.label).collect(),
+                    },
+                });
+            }
+            // The latest outstanding question is the one still worth watching.
+            Some(false) => {
+                outstanding = match outstanding {
+                    Some(prev) if prev.created_at >= comment.created_at => Some(prev),
+                    _ => Some(comment),
+                };
+            }
+            None => {}
+        }
+    }
+    let watch = outstanding.map(|c| state::OptionsWatch { comment_id: c.id });
+    (submissions, watch)
 }
 
 /// The reaction watch for one thread: its latest ghwf-authored approval
@@ -1510,6 +1623,107 @@ fn hand_off(issue: &str, question: bool) -> Result<()> {
     Ok(())
 }
 
+/// Post an `ask` options comment (the question from stdin, each `--option` a
+/// checkbox) and flip the workflow to waiting-on-user, like a blocking
+/// question. ghwf owns the formatting — hidden per-option ids and the appended
+/// submit checkbox — and arms an options watch so `wait` wakes only once the
+/// submit box is ticked. The phase never advances, so no approval prompt or
+/// 👍 watch is involved.
+fn ask(issue: &str, options: &[String]) -> Result<()> {
+    let mut question = String::new();
+    std::io::stdin()
+        .read_to_string(&mut question)
+        .map_err(anyhow::Error::from)?;
+    if question.trim().is_empty() {
+        bail!("no question body provided on stdin");
+    }
+    if options.iter().all(|o| o.trim().is_empty()) {
+        bail!("at least one --option is required");
+    }
+    let options: Vec<String> = options
+        .iter()
+        .map(|o| o.trim().to_string())
+        .filter(|o| !o.is_empty())
+        .collect();
+
+    let repo_ctx = github::config_repo()?;
+    let (owner, repo, thread_number) = github::resolve_issue_ref(issue, repo_ctx.as_ref())?;
+    let Some((number, mut issue_state)) = state::find_workflow_issue(&owner, &repo, thread_number)?
+    else {
+        bail!(
+            "no workflow state recorded for issue #{thread_number}; run \
+             `ghwf work-on {thread_number}` first."
+        );
+    };
+    if issue_state.pr_outcome.is_some() {
+        bail!(
+            "the workflow for issue #{number} has concluded (its PR was merged or \
+             closed); there is nothing to ask about."
+        );
+    }
+
+    // Tag the comment with the authoring session when running under Claude Code.
+    let token = match std::env::var(store::SESSION_ID_ENV) {
+        Ok(session_id) if !session_id.is_empty() => Some(store::session_token(&session_id)?),
+        _ => None,
+    };
+    let full_body = render::build_comment_body(
+        &render::build_options_body(&question, &options),
+        token.as_deref(),
+    );
+
+    // Full comment on the phase's primary thread; when a PR exists, the other
+    // thread gets a one-line stub linking to it, best-effort.
+    let pr_number = issue_state.prep.as_ref().and_then(|p| p.pr_number);
+    let primary_is_pr = pr_number.is_some() && render::status_primary_is_pr(issue_state.phase);
+    let primary = if primary_is_pr {
+        pr_number.expect("primary_is_pr requires a PR")
+    } else {
+        number
+    };
+    let comment = github::post_issue_comment(&primary.to_string(), &full_body, repo_ctx.as_ref())?;
+    if let Some(pr) = pr_number {
+        let (secondary, secondary_noun, primary_noun) = if primary_is_pr {
+            (number, "issue", "PR")
+        } else {
+            (pr, "PR", "issue")
+        };
+        let stub = render::build_status_comment_body(&format!(
+            "Question posted on the {primary_noun}: {}",
+            comment.html_url
+        ));
+        if let Err(err) =
+            github::post_issue_comment(&secondary.to_string(), &stub, repo_ctx.as_ref())
+        {
+            eprintln!("warning: failed to post the question stub to the {secondary_noun}: {err:#}");
+        }
+    }
+
+    // The ball is with the user now. Remember the post for feed-lag
+    // self-calibration, and watch its submit box so `wait` wakes on submission.
+    issue_state.attention = state::Attention::WaitingOnUser;
+    issue_state.last_posted = Some(state::PostedRef {
+        id: comment.id,
+        created_at: comment.created_at.clone(),
+    });
+    if let Some(wait) = issue_state.wait.as_mut() {
+        let thread = if primary_is_pr { "pr" } else { "issue" };
+        wait.options_watches.insert(
+            thread.to_string(),
+            state::OptionsWatch {
+                comment_id: comment.id,
+            },
+        );
+        // The watch endpoint's URL changed with it; drop the stale ETag.
+        wait.etags.remove(&format!("options_{thread}"));
+    }
+    labels::sync(&owner, &repo, number, pr_number, &mut issue_state);
+    state::save(&owner, &repo, number, &issue_state)?;
+
+    println!("{}", render::comment_json(&comment)?);
+    Ok(())
+}
+
 /// Record a ghwf-authored comment as the workflow issue's `last_posted`. The
 /// thread argument may name the issue itself or its PR; the PR case maps back
 /// to the issue whose prep state records that PR number.
@@ -2014,5 +2228,53 @@ mod tests {
         assert!(watch.plus_one_ids.is_empty());
         // No prompts at all: nothing to watch.
         assert!(latest_prompt_watch(&comments[3..], None, &[]).is_none());
+    }
+
+    #[test]
+    fn scan_options_surfaces_submission_and_arms_no_watch() {
+        use crate::render::{build_comment_body, build_options_body};
+        let body = build_comment_body(
+            &build_options_body("Pick", &["A".into(), "B".into()]),
+            Some("tok"),
+        )
+        .replacen("- [ ] A", "- [x] A", 1)
+        .replace("- [ ] **Submit", "- [x] **Submit");
+        let comments = vec![comment(9, &body, "2026-06-06T12:00:00Z")];
+        let (subs, watch) = super::scan_options(&comments, "tok", "issue thread");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].comment_id, 9);
+        assert_eq!(subs[0].view.selected, vec!["A".to_string()]);
+        assert_eq!(subs[0].view.unselected, vec!["B".to_string()]);
+        assert!(subs[0].rewritten_body.contains("_Answers submitted at"));
+        // A submitted comment isn't re-watched.
+        assert!(watch.is_none());
+    }
+
+    #[test]
+    fn scan_options_watches_latest_outstanding() {
+        use crate::render::{build_comment_body, build_options_body};
+        let body = |q: &str| build_comment_body(&build_options_body(q, &["A".into()]), Some("tok"));
+        let comments = vec![
+            comment(9, &body("Old"), "2026-06-06T12:00:00Z"),
+            comment(10, &body("New"), "2026-06-06T13:00:00Z"),
+        ];
+        let (subs, watch) = super::scan_options(&comments, "tok", "issue thread");
+        assert!(subs.is_empty());
+        assert_eq!(watch.unwrap().comment_id, 10);
+    }
+
+    #[test]
+    fn scan_options_ignores_foreign_comments() {
+        use crate::render::{build_comment_body, build_options_body};
+        // Another session's options comment and a plain user comment: neither
+        // is ours to act on.
+        let other = build_comment_body(&build_options_body("Pick", &["A".into()]), Some("other"));
+        let comments = vec![
+            comment(9, &other, "2026-06-06T12:00:00Z"),
+            comment(10, "just talking", "2026-06-06T12:30:00Z"),
+        ];
+        let (subs, watch) = super::scan_options(&comments, "tok", "issue thread");
+        assert!(subs.is_empty());
+        assert!(watch.is_none());
     }
 }

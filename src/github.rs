@@ -86,6 +86,16 @@ pub fn post_issue_comment(
     serde_json::from_str(&json).context("failed to parse created-comment JSON from `gh api`")
 }
 
+/// Edit an existing conversation comment's body. Issue and PR conversation
+/// comments share the issue-comments id namespace, so one endpoint form serves
+/// both threads; the body is sent as JSON on stdin, mirroring
+/// [`post_issue_comment`].
+pub fn update_issue_comment(owner: &str, repo: &str, comment_id: u64, body: &str) -> Result<()> {
+    let endpoint = format!("repos/{owner}/{repo}/issues/comments/{comment_id}");
+    let payload = serde_json::json!({ "body": body }).to_string();
+    gh_api_stdin(&["--method", "PATCH", &endpoint, "--input", "-"], &payload).map(|_| ())
+}
+
 /// All open issues of a repo, following pagination. The REST listing includes
 /// PRs and carries assignees/labels; see [`IssueListing`].
 pub fn list_open_issues(owner: &str, repo: &str) -> Result<Vec<IssueListing>> {

@@ -320,6 +320,12 @@ pub struct WaitState {
     // a 👍 on an older prompt is still honoured on the next `work-on`.
     #[serde(default)]
     pub reaction_watches: BTreeMap<String, ReactionWatch>,
+    // Thread key (`issue` / `pr`) -> the outstanding `ask` options comment
+    // whose submit checkbox `wait` polls. Recorded only while that box is
+    // unticked, so any ticked submit on the watched comment wakes; `work-on`
+    // re-derives it from the comments each run. Latest outstanding per thread.
+    #[serde(default)]
+    pub options_watches: BTreeMap<String, OptionsWatch>,
     // Whether the PR was a draft when the baseline was recorded. A flip in
     // either direction wakes the wait: ready-for-review advances the
     // implement phase. Absent when no PR exists (or for old state files).
@@ -333,6 +339,15 @@ pub struct WaitState {
 pub struct ReactionWatch {
     pub comment_id: u64,
     pub plus_one_ids: BTreeSet<u64>,
+}
+
+/// A ghwf-posted `ask` options comment whose submit checkbox `wait` polls.
+/// Recorded only while the box is unticked (an outstanding question), so any
+/// ticked submit on the comment is a wake. No baseline beyond the id is needed:
+/// the submit box can only be ticked once before `work-on` rewrites it away.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct OptionsWatch {
+    pub comment_id: u64,
 }
 
 /// The fingerprint recorded in `WaitState::issue_fingerprint`.
@@ -587,8 +602,8 @@ pub fn save(owner: &str, repo: &str, number: u64, state: &IssueState) -> Result<
 mod tests {
     use super::{
         branch_and_slug, find_issue_for_dir, issue_fingerprint, parse_directive,
-        parse_prompted_directive, pr_outcome, Attention, Directive, IssueState, Phase, PostedRef,
-        PrOutcome, PrepState, ReactionWatch, WaitState,
+        parse_prompted_directive, pr_outcome, Attention, Directive, IssueState, OptionsWatch,
+        Phase, PostedRef, PrOutcome, PrepState, ReactionWatch, WaitState,
     };
     use crate::models::PullRequest;
     use std::path::{Path, PathBuf};
@@ -778,6 +793,7 @@ mod tests {
                     },
                 )]
                 .into(),
+                options_watches: [("issue".to_string(), OptionsWatch { comment_id: 11 })].into(),
                 pr_draft: Some(true),
             }),
             last_posted: Some(PostedRef {

@@ -43,6 +43,17 @@ end-of-phase hand-off — carries no approval prompt and stays in the current
 phase, so a 👍 won't advance anything. (`ghwf create-issue-comment` remains the
 non-blocking way to post a note or status that needs no reply.)
 
+When the answer is a choice among discrete options, Claude uses
+`ghwf ask <issue> --option "..." --option "..."` (the question on stdin) instead
+of prose. ghwf renders each option as a GitHub checkbox tagged with a hidden id,
+appends a final "Submit my answers" checkbox, and flips the issue to "needs
+you". You tick whatever applies — it's multi-select — and only ticking the
+submit box wakes Claude; ghwf then reads back your selections and rewrites the
+submit line to `_Answers submitted at …_` so it can't fire twice. You're never
+trapped by the menu: a plain prose reply wakes Claude too (signalling the
+question was answered but not fully resolved), and Claude is encouraged to
+include an "other / none of these" option for exactly that.
+
 Pass `--no-branch` to skip the branch/worktree/PR entirely and just write the plan
 file — handy for trivial tasks or when you're already on a feature branch. The
 mode is recorded in the issue's state on first use (including by the
