@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::github::Conditional;
 use crate::models::IssueListing;
-use crate::{config, github, state, wait};
+use crate::{config, github, launch, state, wait};
 
 /// Direct polling starts here…
 const BACKOFF_FLOOR: Duration = Duration::from_secs(5);
@@ -159,6 +159,35 @@ pub fn wait_for_pick(timeout_secs: Option<u64>) -> Result<u64> {
         timeout_secs.expect("a reached deadline implies a timeout was set")
     );
     std::process::exit(wait::EXIT_TIMEOUT);
+}
+
+/// Work issues one after another as a supervised pool worker (`next --forever`):
+/// claim the next eligible issue, run its Claude session to conclusion, bring it
+/// down, and pick again — indefinitely.
+///
+/// Each round waits (with no timeout) for an eligible issue, so an empty queue
+/// parks the worker rather than ending it. The loop stops only when the user
+/// quits a session before its workflow concludes — read as "the user has stepped
+/// in and wants out" (re-run the command to resume). While a session runs the
+/// supervisor ignores terminal Ctrl-C (Claude handles its own); between sessions
+/// (waiting for a pick) Ctrl-C stops the worker as usual.
+pub fn run_forever(no_branch: bool) -> Result<()> {
+    loop {
+        let number = wait_for_pick(None)?;
+        let launch = launch::prepare(&number.to_string(), no_branch)?;
+        match launch::supervise_once(&launch)? {
+            launch::Outcome::Completed => {
+                println!("Issue #{number} concluded; looking for the next one.");
+            }
+            launch::Outcome::UserQuit => {
+                println!(
+                    "The session for issue #{number} ended before its workflow concluded, \
+                     so the --forever worker is stopping. Re-run `ghwf next --forever` to resume."
+                );
+                return Ok(());
+            }
+        }
+    }
 }
 
 /// The "already started" predicate for a repo: an issue is started when it has

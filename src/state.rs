@@ -289,6 +289,16 @@ pub struct IssueState {
     pub last_posted: Option<PostedRef>,
 }
 
+impl IssueState {
+    /// Whether the workflow has concluded: the issue was closed, or its PR left
+    /// the open state (merged or closed). Either way there is nothing left to
+    /// wait for. The Stop hook uses this to let a session end, and the
+    /// `--forever` supervisor uses it to know when to bring a session down.
+    pub fn is_concluded(&self) -> bool {
+        self.issue_closed || self.pr_outcome.is_some()
+    }
+}
+
 /// A reference to a comment ghwf posted, for feed-lag self-calibration.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PostedRef {
@@ -766,6 +776,26 @@ mod tests {
             Some(PrOutcome::Closed)
         );
         assert_eq!(pr_outcome(&pull_request("open", false)), None);
+    }
+
+    #[test]
+    fn is_concluded_tracks_issue_close_and_pr_outcome() {
+        let open = IssueState::default();
+        assert!(!open.is_concluded());
+
+        let closed_issue = IssueState {
+            issue_closed: true,
+            ..Default::default()
+        };
+        assert!(closed_issue.is_concluded());
+
+        for outcome in [PrOutcome::Merged, PrOutcome::Closed] {
+            let concluded_pr = IssueState {
+                pr_outcome: Some(outcome),
+                ..Default::default()
+            };
+            assert!(concluded_pr.is_concluded());
+        }
     }
 
     #[test]

@@ -68,13 +68,9 @@ pub fn run() -> Result<()> {
 
 /// Whether to block the stop for the bound issue.
 fn should_block(state: &IssueState) -> bool {
-    // The workflow is finished: nothing left to wait for.
-    if state.issue_closed {
-        return false;
-    }
-    // The PR was merged (workflow complete) or closed without merging
-    // (workflow halted): either way the loop is over.
-    if state.pr_outcome.is_some() {
+    // The workflow is finished (issue closed, or PR merged/closed): nothing
+    // left to wait for.
+    if state.is_concluded() {
         return false;
     }
     // Nudged repeatedly with nothing new arriving: stop fighting.

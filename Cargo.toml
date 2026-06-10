@@ -15,3 +15,8 @@ getrandom = "0.3"
 toml = "0.8"
 inquire = "0.9.4"
 toml_edit = "0.22"
+
+# The supervisor's signal handling (ignoring SIGINT while a session runs, and
+# the shutdown gesture for `next --forever`) is Unix-only.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
