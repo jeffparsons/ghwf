@@ -161,7 +161,7 @@ pub fn wait_for_pick(timeout_secs: Option<u64>) -> Result<u64> {
     std::process::exit(wait::EXIT_TIMEOUT);
 }
 
-/// Work issues one after another as a supervised pool worker (`next --forever`):
+/// Work issues one after another as a supervised pool worker (`ghwf forever`):
 /// claim the next eligible issue, run its Claude session to conclusion, bring it
 /// down, and pick again — indefinitely.
 ///
@@ -182,7 +182,7 @@ pub fn run_forever(no_branch: bool) -> Result<()> {
             launch::Outcome::UserQuit => {
                 println!(
                     "The session for issue #{number} ended before its workflow concluded, \
-                     so the --forever worker is stopping. Re-run `ghwf next --forever` to resume."
+                     so the forever worker is stopping. Re-run `ghwf forever` to resume."
                 );
                 return Ok(());
             }
