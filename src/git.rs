@@ -130,6 +130,13 @@ pub fn add_worktree(repo: &Path, path: &Path, branch: &str, start: &str) -> Resu
     git(repo, &["worktree", "add", "-b", branch, path, start]).map(|_| ())
 }
 
+/// Create a worktree at `path` checked out on the existing local `branch`
+/// (unlike [`add_worktree`], which creates a new branch with `-b`).
+pub fn add_worktree_for_branch(repo: &Path, path: &Path, branch: &str) -> Result<()> {
+    let path = path.to_str().context("worktree path is not valid UTF-8")?;
+    git(repo, &["worktree", "add", path, branch]).map(|_| ())
+}
+
 /// Path of the worktree (main or linked) that has `branch` checked out, if
 /// any. Git allows at most one worktree per branch.
 pub fn branch_worktree(repo: &Path, branch: &str) -> Result<Option<PathBuf>> {
@@ -360,11 +367,11 @@ pub fn force_push_with_lease(dir: &Path, branch: &str) -> Result<()> {
 #[cfg(test)]
 pub mod tests {
     use super::{
-        commit_that_added, default_remote_branch, delete_local_branch, delete_remote_branch, fetch,
-        force_push_with_lease, has_untracked_files, is_ancestor, is_tree_clean,
-        list_local_branches, list_remote_branches, merge_ff_only, parse_worktree_list,
-        path_touched_in_range, range_has_merges, rebase_onto, remove_worktree, rev_parse_ok,
-        would_conflict,
+        add_worktree_for_branch, branch_worktree, commit_that_added, default_remote_branch,
+        delete_local_branch, delete_remote_branch, fetch, force_push_with_lease,
+        has_untracked_files, is_ancestor, is_tree_clean, list_local_branches, list_remote_branches,
+        merge_ff_only, parse_worktree_list, path_touched_in_range, range_has_merges, rebase_onto,
+        remove_worktree, rev_parse_ok, would_conflict,
     };
     use std::path::{Path, PathBuf};
 
@@ -557,6 +564,38 @@ pub mod tests {
 
         std::fs::write(root.join("new.txt"), "x\n").unwrap();
         assert!(has_untracked_files(&root).unwrap());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn add_worktree_for_branch_checks_out_existing_branch() {
+        let root = scratch("add-existing");
+        let origin = root.join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        init_repo(&origin);
+        // A bare repo with a local `main` branch but no checkout of it — the
+        // shape `ghwf clone` produces.
+        run_git(
+            &root,
+            &[
+                "clone",
+                "--bare",
+                "--single-branch",
+                origin.to_str().unwrap(),
+                "bare",
+            ],
+        );
+        let bare = root.join("bare");
+
+        // Check out the existing `main` branch into a worktree — no new branch.
+        let wt = root.join("wt");
+        add_worktree_for_branch(&bare, &wt, "main").unwrap();
+        assert!(wt.join("file.txt").is_file());
+        assert_eq!(list_local_branches(&bare).unwrap(), ["main"]);
+        // git reports the worktree's absolute (possibly canonicalized) path.
+        let reported = branch_worktree(&bare, "main").unwrap().unwrap();
+        assert_eq!(reported.canonicalize().unwrap(), wt.canonicalize().unwrap());
 
         std::fs::remove_dir_all(&root).unwrap();
     }

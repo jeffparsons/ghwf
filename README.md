@@ -203,11 +203,14 @@ repo/                  # container directory (override with a second argument)
 ├── repo.git/          # bare repo, remote configured like a normal clone's
 ├── ghwf.toml          # generated, essentials only
 └── worktrees/         # per-issue worktrees land here
+    └── main/          # checkout of the default branch, created by clone
 ```
 
 The bare repo keeps the container free of a working copy that would shadow
 the per-issue worktrees, while its remote is set up to behave exactly like a
-normal clone's (`origin/<default>` resolves and stays fresh on fetch).
+normal clone's (`origin/<default>` resolves and stays fresh on fetch). The
+default branch is checked out into `worktrees/<default>` so you have a ready
+place to inspect it; ghwf keeps that checkout fast-forwarded as it fetches.
 
 For big repos, `--reference <path>` borrows objects from an existing local
 clone instead of fetching them over the network. The new repo is dissociated
