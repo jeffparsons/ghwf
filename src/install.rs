@@ -43,7 +43,9 @@ Run `ghwf work-on $ARGUMENTS` and follow the phase banner exactly:
 - Post questions and clarifications with `ghwf create-issue-comment
   $ARGUMENTS`; when a phase's work is done, hand off with `ghwf hand-off
   $ARGUMENTS` (body from stdin) — ghwf appends the approval prompt itself,
-  so never write one.
+  so never write one. Both accept `--attach <path>` (repeatable) to attach a
+  local file (e.g. a screenshot or log); it's committed to the repo's
+  `ghwf-attachments` branch and linked from the comment.
 - Don't read a partial reply as the user being finished: if a comment
   addresses only some of what you raised, assume more may be coming. Unanswered
   questions, options, and suggested defaults stay open — only an explicit phase

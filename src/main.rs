@@ -1,3 +1,4 @@
+mod attach;
 mod clone;
 mod collect_garbage;
 mod config;
@@ -129,6 +130,11 @@ enum Commands {
         /// An issue number (resolved against the current repo) or a full GitHub
         /// issue URL. When omitted, inferred as `work-on` does.
         issue: Option<String>,
+        /// Attach a local file (repeatable). Each file is committed to the
+        /// repo's `ghwf-attachments` branch and linked from the comment (images
+        /// embed inline on public repos; on private repos they link).
+        #[arg(long = "attach")]
+        attach: Vec<PathBuf>,
     },
     /// Post Claude's hand-off comment, reading the body from stdin, and flip
     /// the workflow to waiting-on-user.
@@ -147,6 +153,11 @@ enum Commands {
         /// interactive prompt whenever you need an answer from the user.
         #[arg(long)]
         question: bool,
+        /// Attach a local file (repeatable). Each file is committed to the
+        /// repo's `ghwf-attachments` branch and linked from the comment (images
+        /// embed inline on public repos; on private repos they link).
+        #[arg(long = "attach")]
+        attach: Vec<PathBuf>,
     },
     /// Present the user with a menu of options as a GitHub checklist (the
     /// question is read from stdin), and flip the workflow to waiting-on-user.
@@ -310,14 +321,20 @@ fn main() -> Result<()> {
             reference,
         } => clone::run(&repo, directory.as_deref(), reference.as_deref()),
         Commands::CollectGarbage { dry_run } => collect_garbage::run(dry_run),
-        Commands::CreateIssueComment { issue } => create_issue_comment(&resolve_issue_arg(issue)?),
+        Commands::CreateIssueComment { issue, attach } => {
+            create_issue_comment(&resolve_issue_arg(issue)?, &attach)
+        }
         Commands::CreateIssue {
             title,
             issue,
             labels,
             no_block,
         } => create_issue(&title, issue, &labels, no_block),
-        Commands::HandOff { issue, question } => hand_off(&resolve_issue_arg(issue)?, question),
+        Commands::HandOff {
+            issue,
+            question,
+            attach,
+        } => hand_off(&resolve_issue_arg(issue)?, question, &attach),
         Commands::Ask { issue, options } => ask(&resolve_issue_arg(issue)?, &options),
         Commands::Config { command } => match command {
             ConfigCommands::Init => init::run(),
@@ -1445,7 +1462,23 @@ fn reply_review_comment(issue: &str, id: u64) -> Result<()> {
     Ok(())
 }
 
-fn create_issue_comment(issue: &str) -> Result<()> {
+/// Upload `attach` into `(owner, repo)` and append the resulting markdown
+/// trailer to `user_body`. With no attachments the body is returned unchanged.
+fn append_attachments(
+    owner: &str,
+    repo: &str,
+    issue: u64,
+    user_body: &str,
+    attach: &[PathBuf],
+) -> Result<String> {
+    let trimmed = user_body.trim();
+    match attach::upload(owner, repo, issue, attach)? {
+        Some(trailer) => Ok(format!("{trimmed}\n\n{trailer}")),
+        None => Ok(trimmed.to_string()),
+    }
+}
+
+fn create_issue_comment(issue: &str, attach: &[PathBuf]) -> Result<()> {
     let mut user_body = String::new();
     std::io::stdin()
         .read_to_string(&mut user_body)
@@ -1461,6 +1494,10 @@ fn create_issue_comment(issue: &str) -> Result<()> {
     };
 
     let repo_ctx = github::config_repo()?;
+    // Upload any attachments into the issue's own repo (where the comment lives)
+    // before posting, so a failed upload never leaves broken links.
+    let (owner, repo, number) = github::resolve_issue_ref(issue, repo_ctx.as_ref())?;
+    let user_body = append_attachments(&owner, &repo, number, &user_body, attach)?;
     let body = render::build_comment_body(&user_body, token.as_deref());
     let comment = github::post_issue_comment(issue, &body, repo_ctx.as_ref())?;
 
@@ -1613,7 +1650,7 @@ fn assemble_labels(blocked: Option<&str>, extra: &[String]) -> Vec<String> {
 /// end-of-phase hand-off: the body is posted as-is (no advance prompt) and no
 /// 👍-advances-the-phase watch is armed, but attention still flips to the user
 /// so the needs-you label is applied while Claude waits for an answer.
-fn hand_off(issue: &str, question: bool) -> Result<()> {
+fn hand_off(issue: &str, question: bool, attach: &[PathBuf]) -> Result<()> {
     let mut user_body = String::new();
     std::io::stdin()
         .read_to_string(&mut user_body)
@@ -1652,21 +1689,6 @@ fn hand_off(issue: &str, question: bool) -> Result<()> {
         );
     }
 
-    // Tag the comment with the authoring session when running under Claude Code.
-    let token = match std::env::var(store::SESSION_ID_ENV) {
-        Ok(session_id) if !session_id.is_empty() => Some(store::session_token(&session_id)?),
-        _ => None,
-    };
-    // A question is posted as-is; an end-of-phase hand-off gets the advance
-    // prompt appended so the comment is its own 👍 target.
-    let full_body = match prompt {
-        Some(prompt) if !question => render::build_comment_body(
-            &format!("{}\n\n{prompt}", user_body.trim()),
-            token.as_deref(),
-        ),
-        _ => render::build_comment_body(user_body.trim(), token.as_deref()),
-    };
-
     // Full comment on the phase's primary thread; when a PR exists, the other
     // thread gets a one-line stub linking to it, best-effort. The issue thread
     // is addressed by its full URL (so a foreign `issue_repos` issue resolves to
@@ -1680,6 +1702,31 @@ fn hand_off(issue: &str, question: bool) -> Result<()> {
     } else {
         issue_subject.clone()
     };
+
+    // Upload attachments into the repo hosting the primary thread (the code repo
+    // when that thread is the PR, else the issue's repo) before posting, so a
+    // failed upload never leaves broken links.
+    let (att_owner, att_repo) = if primary_is_pr {
+        github::code_repo(&(owner.clone(), repo.clone()))?
+    } else {
+        (owner.clone(), repo.clone())
+    };
+    let user_body = append_attachments(&att_owner, &att_repo, number, &user_body, attach)?;
+
+    // Tag the comment with the authoring session when running under Claude Code.
+    let token = match std::env::var(store::SESSION_ID_ENV) {
+        Ok(session_id) if !session_id.is_empty() => Some(store::session_token(&session_id)?),
+        _ => None,
+    };
+    // A question is posted as-is; an end-of-phase hand-off gets the advance
+    // prompt appended so the comment is its own 👍 target.
+    let full_body = match prompt {
+        Some(prompt) if !question => {
+            render::build_comment_body(&format!("{user_body}\n\n{prompt}"), token.as_deref())
+        }
+        _ => render::build_comment_body(&user_body, token.as_deref()),
+    };
+
     let comment = github::post_issue_comment(&primary_subject, &full_body, repo_ctx.as_ref())?;
     if let Some(pr) = pr_number {
         let (secondary_subject, secondary_noun, primary_noun) = if primary_is_pr {
