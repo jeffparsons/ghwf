@@ -19,15 +19,15 @@ const MAX_CONSECUTIVE_FAILURES: u32 = 30;
 /// Pick the next issue to work on, claim it, print the pick and its rationale,
 /// and return its number for the caller to hand to `work-on`.
 ///
-/// Eligible issues are the repo's open issues, excluding PRs, issues assigned
-/// to someone other than the user, issues that already have recorded ghwf state
-/// (some session has already started them — `next` can't tell whether that
-/// session is still live, so it never picks them; `ghwf work-on <n>` resumes
-/// them explicitly), issues currently blocked by an open dependency, and
-/// tracking issues (those with sub-issues — their sub-issues are picked
-/// instead). When `only_assigned_to_me` is configured, unassigned issues are
-/// excluded too. Claiming the winner atomically reserves it against concurrent
-/// `next`/`next --wait` runs, and assigns it on GitHub.
+/// Eligible issues are the repo's open issues, excluding PRs and issues assigned
+/// to someone other than the user. An issue with a *live* session is skipped (a
+/// worker is on it); one that was started and then stopped is *resumed* rather
+/// than skipped; a concluded one is left alone. A *fresh* issue that is blocked
+/// by an open dependency, or is a tracking issue (its sub-issues are picked
+/// instead), is also skipped. When `only_assigned_to_me` is configured,
+/// unassigned issues are excluded too. Claiming a fresh winner atomically
+/// reserves it against concurrent `next`/`next --wait` runs (a resumed winner is
+/// reserved by the launcher's session lease instead), and assigns it on GitHub.
 pub fn pick() -> Result<u64> {
     let (priority_labels, only_assigned_to_me) = match config::find()? {
         Some(located) => (
@@ -45,7 +45,8 @@ pub fn pick() -> Result<u64> {
         &me,
         &priority_labels,
         only_assigned_to_me,
-        started_fn(&owner, &repo),
+        |_| false,
+        status_fn(&owner, &repo),
         |n| state::claim(&owner, &repo, n),
     )?;
 
@@ -53,7 +54,7 @@ pub fn pick() -> Result<u64> {
         Some(number) => Ok(number),
         None => bail!(
             "no eligible open issues in {owner}/{repo}: every open issue is a PR, is assigned \
-             to someone else, or is already started (resume those with `ghwf work-on <n>`)."
+             to someone else, already has a live session, or is complete."
         ),
     }
 }
@@ -68,6 +69,13 @@ pub fn pick() -> Result<u64> {
 /// endpoint is polled per cycle, so even at the cap a worker costs ~60 req/hr —
 /// no events-feed idle mode is needed.
 pub fn wait_for_pick(timeout_secs: Option<u64>) -> Result<u64> {
+    wait_for_pick_excluding(timeout_secs, &BTreeSet::new())
+}
+
+/// [`wait_for_pick`], but with a set of issue numbers the caller has already
+/// given up on this run (a `forever` worker's launch failures), excluded from
+/// selection so they can't be re-picked in a loop.
+fn wait_for_pick_excluding(timeout_secs: Option<u64>, skip: &BTreeSet<u64>) -> Result<u64> {
     let (priority_labels, only_assigned_to_me) = match config::find()? {
         Some(located) => (
             located.config.priority_labels,
@@ -112,7 +120,8 @@ pub fn wait_for_pick(timeout_secs: Option<u64>) -> Result<u64> {
                     &me,
                     &priority_labels,
                     only_assigned_to_me,
-                    started_fn(&owner, &repo),
+                    |n| skip.contains(&n),
+                    status_fn(&owner, &repo),
                     |n| state::claim(&owner, &repo, n),
                 )?;
                 if let Some(number) =
@@ -171,10 +180,39 @@ pub fn wait_for_pick(timeout_secs: Option<u64>) -> Result<u64> {
 /// in and wants out" (re-run the command to resume). While a session runs the
 /// supervisor ignores terminal Ctrl-C (Claude handles its own); between sessions
 /// (waiting for a pick) Ctrl-C stops the worker as usual.
+///
+/// A transient launch failure never stops the worker or locks the issue: it is
+/// logged, a bare claim with nothing behind it is released back to the pool, and
+/// the loop picks again. A pick another worker has leased in the meantime is
+/// skipped the same way.
 pub fn run_forever(no_branch: bool) -> Result<()> {
+    // The issue repo selection works against, resolved once so a launch failure
+    // can release the matching claim.
+    let (owner, repo) = github::repo_or_cwd()?;
+    // Issues this worker has failed to launch this run, excluded from further
+    // picks so a deterministic failure (e.g. an unusable `Model:` line) can't
+    // loop. They're left for a fresh worker (or a manual `ghwf work-on`).
+    let mut skip: BTreeSet<u64> = BTreeSet::new();
     loop {
-        let number = wait_for_pick(None)?;
-        let launch = launch::prepare(&number.to_string(), no_branch)?;
+        let number = wait_for_pick_excluding(None, &skip)?;
+        let launch = match launch::prepare(&number.to_string(), no_branch) {
+            Ok(Some(launch)) => launch,
+            // A live session already holds it (leased between selection and now).
+            Ok(None) => continue,
+            Err(err) => {
+                eprintln!("warning: couldn't start #{number}, leaving it for the pool: {err:#}");
+                // Don't re-pick it this run.
+                skip.insert(number);
+                // Undo a bare claim so the issue stays pickable by a fresh
+                // worker; an issue with real progress (or one parked for you) is
+                // kept and resumed later. Any lease was released as `prepare`
+                // unwound.
+                if let Err(err) = state::release_if_unstarted(&owner, &repo, number) {
+                    eprintln!("warning: failed to release #{number}'s claim: {err:#}");
+                }
+                continue;
+            }
+        };
         match launch::supervise_once(&launch)? {
             launch::Outcome::Completed => {
                 println!("Issue #{number} concluded; looking for the next one.");
@@ -190,52 +228,92 @@ pub fn run_forever(no_branch: bool) -> Result<()> {
     }
 }
 
-/// The "already started" predicate for a repo: an issue is started when it has
-/// any recorded state. A state file that exists but fails to parse still counts
-/// — only its details are unreadable, not the fact that some session began it.
-fn started_fn<'a>(owner: &'a str, repo: &'a str) -> impl Fn(u64) -> bool + 'a {
-    move |number: u64| {
-        state::load_if_exists(owner, repo, number)
-            .map(|s| s.is_some())
-            .unwrap_or(true)
+/// The status classifier for a repo, reading each issue's recorded state and
+/// session lease.
+fn status_fn<'a>(owner: &'a str, repo: &'a str) -> impl Fn(u64) -> IssueStatus + 'a {
+    move |number: u64| issue_status(owner, repo, number)
+}
+
+/// Classify an issue for selection from its recorded state and lease: no state
+/// is `Fresh`; concluded state is `Done`; otherwise a live lease is `Live` and
+/// no live lease is `Resumable`. A state file that exists but fails to parse is
+/// treated as `Live` — the conservative choice, never barging into something we
+/// can't read.
+fn issue_status(owner: &str, repo: &str, number: u64) -> IssueStatus {
+    match state::load_if_exists(owner, repo, number) {
+        Ok(None) => IssueStatus::Fresh,
+        Ok(Some(state)) => {
+            if state.is_concluded() {
+                IssueStatus::Done
+            } else {
+                match state::lease_liveness(owner, repo, number) {
+                    state::Liveness::Live => IssueStatus::Live,
+                    state::Liveness::NotLive => IssueStatus::Resumable,
+                }
+            }
+        }
+        Err(_) => IssueStatus::Live,
     }
 }
 
-/// Select the best eligible issue and claim it, re-selecting when a claim is
-/// lost to a concurrent worker. Returns the `Selection` whose `picked` issue
-/// was successfully claimed, or one with `picked: None` when nothing remains.
+/// Whether an issue's work is already underway (started and not concluded), for
+/// the tracking-issue redirect's "prefer a started child" rule.
+fn is_underway(owner: &str, repo: &str, number: u64) -> bool {
+    matches!(
+        issue_status(owner, repo, number),
+        IssueStatus::Resumable | IssueStatus::Live
+    )
+}
+
+/// Select the best workable issue and, for a fresh one, claim it — re-selecting
+/// when a claim is lost to a concurrent worker. Returns the `Selection` whose
+/// `picked` issue is ours to launch, or one with `picked: None` when nothing
+/// remains.
 ///
-/// `claim` returns `true` when this caller won the issue and `false` when
-/// another session already holds it; a lost race excludes that issue and runs
-/// selection again. Both predicates are injected so the loop is testable
-/// without a filesystem or network.
+/// A `Fresh` pick is claimed via `claim` (`true` when this caller won it,
+/// `false` when another session already holds it; a lost race excludes that
+/// issue and selects again). A `Resumable` pick is returned without claiming:
+/// its single-flight is the launcher acquiring the session lease, so a race
+/// there is resolved when the launcher backs off. `excluded` drops issues the
+/// caller has already given up on this run (a worker's launch failures), so a
+/// deterministic failure can't be re-picked in a loop. `excluded`, `status`,
+/// and `claim` are injected so the loop is testable without a filesystem or
+/// network.
 fn claim_pick<'a>(
     issues: &'a [IssueListing],
     me: &str,
     priority_labels: &[String],
     only_assigned_to_me: bool,
-    already_started: impl Fn(u64) -> bool,
+    excluded: impl Fn(u64) -> bool,
+    status: impl Fn(u64) -> IssueStatus,
     mut claim: impl FnMut(u64) -> Result<bool>,
 ) -> Result<Selection<'a>> {
     // Issues lost to other workers this call, excluded from re-selection on top
-    // of those `already_started` already reports.
+    // of those the caller already excludes.
     let mut lost: BTreeSet<u64> = BTreeSet::new();
     loop {
-        let selection = select(issues, me, priority_labels, only_assigned_to_me, |n| {
-            already_started(n) || lost.contains(&n)
-        });
+        let selection = select(
+            issues,
+            me,
+            priority_labels,
+            only_assigned_to_me,
+            |n| lost.contains(&n) || excluded(n),
+            &status,
+        );
         let Some(picked) = selection.picked else {
             return Ok(selection);
         };
-        if claim(picked.number)? {
+        // Only fresh picks are claimed here; a resumable one is single-flighted
+        // by the launcher's lease.
+        if selection.picked_status != Some(IssueStatus::Fresh) || claim(picked.number)? {
             return Ok(selection);
         }
         lost.insert(picked.number);
     }
 }
 
-/// Report a claimed selection: print the skipped-started lines, assign the
-/// picked issue to `me` on GitHub (best-effort — the claim already guarantees
+/// Report a claimed selection: print the skipped lines, assign the picked issue
+/// to `me` on GitHub (best-effort — the claim or lease already guarantees
 /// exclusivity, so a failure is only a lost visibility cue), print the pick and
 /// its rationale, and return the picked number. Returns `None` when nothing was
 /// picked.
@@ -246,8 +324,8 @@ fn announce_pick(
     owner: &str,
     repo: &str,
 ) -> Option<u64> {
-    for number in &selection.skipped_started {
-        println!("Skipping #{number} — already started; resume it with `ghwf work-on {number}`.");
+    for number in &selection.skipped_live {
+        println!("Skipping #{number} — a session is currently running it.");
     }
     for number in &selection.skipped_blocked {
         println!("Skipping #{number} — blocked by an open issue.");
@@ -267,8 +345,14 @@ fn announce_pick(
             );
         }
     }
+    // A resumable pick is in-progress work being re-entered, not a new start.
+    let verb = if selection.picked_status == Some(IssueStatus::Resumable) {
+        "Resuming"
+    } else {
+        "Picked"
+    };
     println!(
-        "Picked #{} \"{}\" — {}.",
+        "{verb} #{} \"{}\" — {}.",
         issue.number,
         issue.title,
         rationale(issue, me, priority_labels)
@@ -276,23 +360,43 @@ fn announce_pick(
     Some(issue.number)
 }
 
-/// The outcome of [`select`]: the winning issue, if any, and the issues passed
-/// over for a reportable reason (each in listing order).
+/// An issue's status for selection, derived from its recorded state and session
+/// lease. `Fresh` and `Resumable` are both workable (one starts, the other
+/// resumes); `Live` and `Done` are not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IssueStatus {
+    /// No recorded state — start it.
+    Fresh,
+    /// Recorded state, not concluded, no live session — resume it.
+    Resumable,
+    /// A live session is running it — a worker is on it.
+    Live,
+    /// Recorded state, concluded — nothing left to do.
+    Done,
+}
+
+/// The outcome of [`select`]: the winning issue, if any, its status (so callers
+/// know whether the pick is a start or a resume), and the issues passed over for
+/// a reportable reason (each in listing order).
 struct Selection<'a> {
     picked: Option<&'a IssueListing>,
-    skipped_started: Vec<u64>,
+    picked_status: Option<IssueStatus>,
+    skipped_live: Vec<u64>,
     skipped_blocked: Vec<u64>,
     skipped_tracking: Vec<u64>,
 }
 
-/// Choose the most important eligible issue.
+/// Choose the most important workable issue.
 ///
 /// Sort key, ascending — first wins: issues assigned to `me` before
 /// unassigned ones, then the best (earliest-in-list) priority label, then the
-/// lowest issue number. PRs and issues assigned to someone else are excluded
-/// outright; otherwise-eligible issues that are already started, currently
-/// blocked, or tracking issues (have sub-issues) are skipped and reported. When
-/// an issue qualifies for several skips, the precedence is started → blocked →
+/// lowest issue number. PRs, issues assigned to someone else, and issues
+/// excluded by the caller (lost to a concurrent worker this call) are dropped
+/// outright. Of the rest, `Live` issues are skipped and reported, `Done` ones
+/// skipped silently, and `Resumable` ones are workable regardless of block or
+/// tracking state (their work is already underway). A `Fresh` issue that is
+/// currently blocked or a tracking issue (has sub-issues) is skipped and
+/// reported instead; when it qualifies for both, the precedence is blocked →
 /// tracking.
 ///
 /// When `only_assigned_to_me` is set, unassigned issues are excluded too (so the
@@ -303,9 +407,10 @@ fn select<'a>(
     me: &str,
     priority_labels: &[String],
     only_assigned_to_me: bool,
-    already_started: impl Fn(u64) -> bool,
+    excluded: impl Fn(u64) -> bool,
+    status: impl Fn(u64) -> IssueStatus,
 ) -> Selection<'a> {
-    let mut skipped_started = Vec::new();
+    let mut skipped_live = Vec::new();
     let mut skipped_blocked = Vec::new();
     let mut skipped_tracking = Vec::new();
     let mut candidates: Vec<&IssueListing> = Vec::new();
@@ -320,9 +425,24 @@ fn select<'a>(
         } else if !issue.assignees.is_empty() && !assigned_to(issue, me) {
             continue;
         }
-        if already_started(issue.number) {
-            skipped_started.push(issue.number);
+        if excluded(issue.number) {
             continue;
+        }
+        match status(issue.number) {
+            // A worker is on it; note it so it's reported.
+            IssueStatus::Live => {
+                skipped_live.push(issue.number);
+                continue;
+            }
+            // Concluded — nothing to do, and not worth a line.
+            IssueStatus::Done => continue,
+            // Work is underway: resume it whatever its block/tracking state.
+            IssueStatus::Resumable => {
+                candidates.push(issue);
+                continue;
+            }
+            // A fresh issue still has to clear the freshness gates below.
+            IssueStatus::Fresh => {}
         }
         if issue.is_blocked() {
             skipped_blocked.push(issue.number);
@@ -335,9 +455,11 @@ fn select<'a>(
         candidates.push(issue);
     }
     candidates.sort_by_key(|issue| sort_key(issue, me, priority_labels));
+    let picked = candidates.first().copied();
     Selection {
-        picked: candidates.first().copied(),
-        skipped_started,
+        picked,
+        picked_status: picked.map(|issue| status(issue.number)),
+        skipped_live,
         skipped_blocked,
         skipped_tracking,
     }
@@ -436,26 +558,26 @@ pub fn resolve_workable(owner: &str, repo: &str, number: u64) -> Result<u64> {
         &me,
         &priority_labels,
         &|n| github::list_sub_issues(owner, repo, n),
-        &started_fn(owner, repo),
+        &|n| is_underway(owner, repo, n),
     )
 }
 
 /// Choose a workable descendant leaf of tracking issue `parent`, whose direct
 /// `children` have already been fetched. Recurses into tracking children via
-/// `list_children`; `already_started` reports whether a leaf has recorded ghwf
-/// state. Both are injected so the traversal is testable without the network or
-/// a filesystem.
+/// `list_children`; `underway` reports whether a leaf's work has already begun
+/// (started and not concluded). Both are injected so the traversal is testable
+/// without the network or a filesystem.
 ///
-/// Preference order: an already-started leaf (resumed — even if now blocked,
-/// since work is underway) before the best fresh, non-blocked one. Errors when
-/// no descendant is workable.
+/// Preference order: an underway leaf (resumed — even if now blocked, since work
+/// is underway) before the best fresh, non-blocked one. Errors when no
+/// descendant is workable.
 fn pick_workable_leaf(
     parent: u64,
     children: Vec<IssueListing>,
     me: &str,
     priority_labels: &[String],
     list_children: &impl Fn(u64) -> Result<Vec<IssueListing>>,
-    already_started: &impl Fn(u64) -> bool,
+    underway: &impl Fn(u64) -> bool,
 ) -> Result<u64> {
     // Guard against a malformed cycle in the sub-issue graph, and dedupe a leaf
     // reachable via more than one parent.
@@ -468,7 +590,7 @@ fn pick_workable_leaf(
 
     if let Some(best) = leaves
         .iter()
-        .filter(|leaf| already_started(leaf.number))
+        .filter(|leaf| underway(leaf.number))
         .min_by_key(|leaf| sort_key(leaf, me, priority_labels))
     {
         return Ok(best.number);
@@ -517,7 +639,7 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeSet;
 
-    use super::{claim_pick, pick_workable_leaf, select, Selection};
+    use super::{claim_pick, pick_workable_leaf, select, IssueStatus, Selection};
     use crate::models::{IssueDependenciesSummary, IssueListing, Label, SubIssuesSummary, User};
 
     /// An open issue with the given assignees and labels, not blocked and not a
@@ -579,9 +701,16 @@ mod tests {
         names.iter().map(|n| n.to_string()).collect()
     }
 
-    /// Run `select` with nothing already started.
+    /// Run `select` with every issue fresh and nothing excluded.
     fn pick<'a>(issues: &'a [IssueListing], me: &str, priority_labels: &[String]) -> Selection<'a> {
-        select(issues, me, priority_labels, false, |_| false)
+        select(
+            issues,
+            me,
+            priority_labels,
+            false,
+            |_| false,
+            |_| IssueStatus::Fresh,
+        )
     }
 
     #[test]
@@ -660,7 +789,14 @@ mod tests {
         // With the option on, an unassigned issue is ignored even when it would
         // otherwise outrank the assigned one; the assigned-to-me issue wins.
         let issues = [issue(1, &[], &["urgent"]), issue(2, &["me"], &[])];
-        let selection = select(&issues, "me", &labels(&["urgent"]), true, |_| false);
+        let selection = select(
+            &issues,
+            "me",
+            &labels(&["urgent"]),
+            true,
+            |_| false,
+            |_| IssueStatus::Fresh,
+        );
         assert_eq!(selection.picked.unwrap().number, 2);
     }
 
@@ -669,9 +805,16 @@ mod tests {
         // An unassigned-only pool yields nothing, and the dropped issue isn't
         // reported as a skip (it's not noteworthy when the option is on).
         let issues = [issue(1, &[], &["urgent"])];
-        let selection = select(&issues, "me", &labels(&["urgent"]), true, |_| false);
+        let selection = select(
+            &issues,
+            "me",
+            &labels(&["urgent"]),
+            true,
+            |_| false,
+            |_| IssueStatus::Fresh,
+        );
         assert!(selection.picked.is_none());
-        assert!(selection.skipped_started.is_empty());
+        assert!(selection.skipped_live.is_empty());
         assert!(selection.skipped_blocked.is_empty());
         assert!(selection.skipped_tracking.is_empty());
     }
@@ -681,7 +824,7 @@ mod tests {
         // Guard the default: with the option off, an unassigned issue is still
         // picked (today's behaviour) rather than being filtered out.
         let issues = [issue(1, &[], &[])];
-        let selection = select(&issues, "me", &[], false, |_| false);
+        let selection = select(&issues, "me", &[], false, |_| false, |_| IssueStatus::Fresh);
         assert_eq!(selection.picked.unwrap().number, 1);
     }
 
@@ -693,16 +836,74 @@ mod tests {
     }
 
     #[test]
-    fn started_issues_are_skipped_and_reported() {
+    fn live_issues_are_skipped_and_reported() {
         let issues = [
             issue(1, &["me"], &[]),
             // Excluded outright, so not reported as skipped.
             issue(2, &["other"], &[]),
             issue(3, &[], &[]),
         ];
-        let selection = select(&issues, "me", &[], false, |n| n == 1);
+        let selection = select(
+            &issues,
+            "me",
+            &[],
+            false,
+            |_| false,
+            |n| {
+                if n == 1 {
+                    IssueStatus::Live
+                } else {
+                    IssueStatus::Fresh
+                }
+            },
+        );
         assert_eq!(selection.picked.unwrap().number, 3);
-        assert_eq!(selection.skipped_started, [1]);
+        assert_eq!(selection.skipped_live, [1]);
+    }
+
+    #[test]
+    fn resumable_issue_is_selected_as_a_resume() {
+        // A resumable issue (work underway, no live session) is a candidate, and
+        // a winning resumable pick is flagged so it's announced as a resume.
+        let issues = [issue(1, &[], &[])];
+        let selection = select(
+            &issues,
+            "me",
+            &[],
+            false,
+            |_| false,
+            |_| IssueStatus::Resumable,
+        );
+        assert_eq!(selection.picked.unwrap().number, 1);
+        assert_eq!(selection.picked_status, Some(IssueStatus::Resumable));
+    }
+
+    #[test]
+    fn resumable_issue_is_workable_even_when_blocked() {
+        // A resumable issue is resumed regardless of a block — its work is
+        // already underway — unlike a fresh one, which a block would skip.
+        let issues = [blocked(1, 1)];
+        let selection = select(
+            &issues,
+            "me",
+            &[],
+            false,
+            |_| false,
+            |_| IssueStatus::Resumable,
+        );
+        assert_eq!(selection.picked.unwrap().number, 1);
+        assert!(selection.skipped_blocked.is_empty());
+    }
+
+    #[test]
+    fn done_issue_is_skipped_silently() {
+        // A concluded issue is neither picked nor reported in any skip bucket.
+        let issues = [issue(1, &[], &[])];
+        let selection = select(&issues, "me", &[], false, |_| false, |_| IssueStatus::Done);
+        assert!(selection.picked.is_none());
+        assert!(selection.skipped_live.is_empty());
+        assert!(selection.skipped_blocked.is_empty());
+        assert!(selection.skipped_tracking.is_empty());
     }
 
     #[test]
@@ -721,11 +922,11 @@ mod tests {
         let issues = [pr(1), issue(2, &["other"], &[])];
         let selection = pick(&issues, "me", &[]);
         assert!(selection.picked.is_none());
-        assert!(selection.skipped_started.is_empty());
+        assert!(selection.skipped_live.is_empty());
     }
 
-    /// Run `claim_pick` with nothing pre-started, claiming the numbers in
-    /// `won` and losing every other. Records the claim attempts in order.
+    /// Run `claim_pick` with every issue fresh, claiming the numbers in `won`
+    /// and losing every other. Records the claim attempts in order.
     fn claim_with<'a>(
         issues: &'a [IssueListing],
         won: &[u64],
@@ -738,6 +939,7 @@ mod tests {
             &[],
             false,
             |_| false,
+            |_| IssueStatus::Fresh,
             |n| {
                 attempts.borrow_mut().push(n);
                 Ok(won.contains(&n))
@@ -777,6 +979,52 @@ mod tests {
     }
 
     #[test]
+    fn claim_pick_does_not_claim_a_resumable_pick() {
+        // A resumable winner is returned without claiming — its single-flight is
+        // the launcher's lease, not the state-file claim.
+        let issues = [issue(3, &[], &[])];
+        let attempts = RefCell::new(Vec::new());
+        let selection = claim_pick(
+            &issues,
+            "me",
+            &[],
+            false,
+            |_| false,
+            |_| IssueStatus::Resumable,
+            |n| {
+                attempts.borrow_mut().push(n);
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(selection.picked.unwrap().number, 3);
+        assert!(attempts.borrow().is_empty());
+    }
+
+    #[test]
+    fn claim_pick_skips_caller_excluded_issues() {
+        // #3 sorts first but the caller has given up on it this run, so #5 is
+        // claimed instead and #3 is never attempted.
+        let issues = [issue(3, &[], &[]), issue(5, &[], &[])];
+        let attempts = RefCell::new(Vec::new());
+        let selection = claim_pick(
+            &issues,
+            "me",
+            &[],
+            false,
+            |n| n == 3,
+            |_| IssueStatus::Fresh,
+            |n| {
+                attempts.borrow_mut().push(n);
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(selection.picked.unwrap().number, 5);
+        assert_eq!(*attempts.borrow(), [5]);
+    }
+
+    #[test]
     fn blocked_issue_is_skipped_and_reported() {
         // #1 would sort first but is blocked, so #2 wins.
         let issues = [blocked(1, 1), issue(2, &[], &[])];
@@ -804,14 +1052,27 @@ mod tests {
     }
 
     #[test]
-    fn started_takes_precedence_over_blocked_and_tracking() {
-        // An issue that is started, blocked, and tracking is reported as started.
+    fn live_takes_precedence_over_blocked_and_tracking() {
+        // An issue that is live, blocked, and tracking is reported as live only.
         let mut both = blocked(1, 1);
         both.sub_issues_summary = SubIssuesSummary { total: 2 };
         let issues = [both, issue(2, &[], &[])];
-        let selection = select(&issues, "me", &[], false, |n| n == 1);
+        let selection = select(
+            &issues,
+            "me",
+            &[],
+            false,
+            |_| false,
+            |n| {
+                if n == 1 {
+                    IssueStatus::Live
+                } else {
+                    IssueStatus::Fresh
+                }
+            },
+        );
         assert_eq!(selection.picked.unwrap().number, 2);
-        assert_eq!(selection.skipped_started, [1]);
+        assert_eq!(selection.skipped_live, [1]);
         assert!(selection.skipped_blocked.is_empty());
         assert!(selection.skipped_tracking.is_empty());
     }
@@ -821,7 +1082,7 @@ mod tests {
         let mut both = blocked(1, 1);
         both.sub_issues_summary = SubIssuesSummary { total: 2 };
         let issues = [both];
-        let selection = select(&issues, "me", &[], false, |_| false);
+        let selection = select(&issues, "me", &[], false, |_| false, |_| IssueStatus::Fresh);
         assert_eq!(selection.skipped_blocked, [1]);
         assert!(selection.skipped_tracking.is_empty());
     }

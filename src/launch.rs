@@ -16,7 +16,10 @@ use crate::{config, git, github, labels, next, prep, render, store};
 ///
 /// This is deliberately thin — phase advancement, banners, and the activity
 /// digest all happen on the `ghwf work-on` run *inside* the launched session.
-pub fn prepare(issue_arg: &str, no_branch: bool) -> Result<Launch> {
+///
+/// Returns `Ok(None)` when a live session already holds the issue (its lease is
+/// held by another launcher): there is nothing to do, and the caller moves on.
+pub fn prepare(issue_arg: &str, no_branch: bool) -> Result<Option<Launch>> {
     println!(
         "No Claude session detected ({} is unset), so ghwf is acting as a launcher:\n\
          it will make sure the issue's worktree exists, then start Claude in it.",
@@ -37,6 +40,19 @@ pub fn prepare(issue_arg: &str, no_branch: bool) -> Result<Launch> {
         println!("Issue #{requested} is a tracking issue; working sub-issue #{number} instead.");
     }
     let mut issue_state = state::load(&owner, &repo, number)?;
+
+    // Acquire the session lease before doing any launch work, so a second
+    // launcher (e.g. another pool worker that selected this same resumable
+    // issue) backs off rather than racing us into the worktree. Held for the
+    // whole session via the returned `Launch`; released when that drops, or here
+    // if any step below fails.
+    let lease = match state::acquire_lease(&owner, &repo, number)? {
+        Some(lease) => lease,
+        None => {
+            println!("Issue #{number} is already being worked by a live session; nothing to do.");
+            return Ok(None);
+        }
+    };
 
     // The recorded mode wins over the flag, as in prep-and-plan.
     let use_no_branch = match issue_state.prep.as_ref().map(|p| p.no_branch) {
@@ -124,7 +140,7 @@ pub fn prepare(issue_arg: &str, no_branch: bool) -> Result<Launch> {
             });
             state::save(&owner, &repo, number, &issue_state)?;
         }
-        return Ok(Launch {
+        return Ok(Some(Launch {
             owner,
             repo,
             number,
@@ -133,7 +149,8 @@ pub fn prepare(issue_arg: &str, no_branch: bool) -> Result<Launch> {
             model,
             dir: None,
             resume: None,
-        });
+            lease,
+        }));
     }
 
     // Find or create the worktree. The launcher creates it immediately — even
@@ -206,7 +223,7 @@ pub fn prepare(issue_arg: &str, no_branch: bool) -> Result<Launch> {
             );
         }
     }
-    Ok(Launch {
+    Ok(Some(Launch {
         owner,
         repo,
         number,
@@ -215,7 +232,8 @@ pub fn prepare(issue_arg: &str, no_branch: bool) -> Result<Launch> {
         model,
         dir: Some(worktree),
         resume,
-    })
+        lease,
+    }))
 }
 
 /// Note appended to launch messages when a permission mode is configured, so
@@ -289,8 +307,8 @@ fn strip_model_prefix(line: &str) -> Option<&str> {
 /// and exit non-zero without starting Claude. The claim and worktree stay put,
 /// so fixing the body and relaunching (`ghwf work-on <n>`) retries cleanly.
 ///
-/// Always returns `Err` (both problem arms `bail!`); the `Launch` Ok type is
-/// phantom, present only so callers can `return` it from [`prepare`].
+/// Always returns `Err` (both problem arms `bail!`); the `Option<Launch>` Ok
+/// type is phantom, present only so callers can `return` it from [`prepare`].
 #[allow(clippy::too_many_arguments)]
 fn refuse_to_start(
     owner: &str,
@@ -302,7 +320,7 @@ fn refuse_to_start(
     repo_ctx: Option<&github::RepoRef>,
     issue_state: &mut IssueState,
     problem: ModelProblem,
-) -> Result<Launch> {
+) -> Result<Option<Launch>> {
     let detail = match &problem {
         ModelProblem::Empty => "Its `Model:` line has no value. Set it to a model name \
              (e.g. `Model: opus`) or remove the line, then relaunch."
@@ -452,6 +470,10 @@ pub struct Launch {
     dir: Option<PathBuf>,
     /// A previous session to `--resume`, when one is still resumable.
     resume: Option<String>,
+    /// The session lease, held for the life of the launch so other launchers
+    /// see this issue as live; dropping the `Launch` releases it.
+    #[allow(dead_code)]
+    lease: state::LeaseGuard,
 }
 
 /// How a supervised session ended.
@@ -481,10 +503,14 @@ const SHUTDOWN_STEP: Duration = Duration::from_secs(5);
 /// session. From the user's point of view this is identical to the old exec:
 /// quitting Claude returns them to the shell that ran ghwf.
 pub fn run(issue_arg: &str, no_branch: bool) -> Result<()> {
-    let launch = prepare(issue_arg, no_branch)?;
+    let Some(launch) = prepare(issue_arg, no_branch)? else {
+        return Ok(());
+    };
     let mut child = spawn(&launch)?;
     let status = with_job_control_ignored(|| child.wait())
         .context("failed waiting for the `claude` session")?;
+    // `std::process::exit` skips destructors, so release the lease explicitly.
+    drop(launch);
     std::process::exit(status.code().unwrap_or(1));
 }
 
