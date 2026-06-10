@@ -25,12 +25,16 @@ const MAX_CONSECUTIVE_FAILURES: u32 = 30;
 /// session is still live, so it never picks them; `ghwf work-on <n>` resumes
 /// them explicitly), issues currently blocked by an open dependency, and
 /// tracking issues (those with sub-issues — their sub-issues are picked
-/// instead). Claiming the winner atomically reserves it against concurrent
+/// instead). When `only_assigned_to_me` is configured, unassigned issues are
+/// excluded too. Claiming the winner atomically reserves it against concurrent
 /// `next`/`next --wait` runs, and assigns it on GitHub.
 pub fn pick() -> Result<u64> {
-    let priority_labels = match config::find()? {
-        Some(located) => located.config.priority_labels,
-        None => Vec::new(),
+    let (priority_labels, only_assigned_to_me) = match config::find()? {
+        Some(located) => (
+            located.config.priority_labels,
+            located.config.only_assigned_to_me,
+        ),
+        None => (Vec::new(), false),
     };
     let (owner, repo) = github::repo_or_cwd()?;
     let me = github::authenticated_user()?;
@@ -40,6 +44,7 @@ pub fn pick() -> Result<u64> {
         &issues,
         &me,
         &priority_labels,
+        only_assigned_to_me,
         started_fn(&owner, &repo),
         |n| state::claim(&owner, &repo, n),
     )?;
@@ -63,9 +68,12 @@ pub fn pick() -> Result<u64> {
 /// endpoint is polled per cycle, so even at the cap a worker costs ~60 req/hr —
 /// no events-feed idle mode is needed.
 pub fn wait_for_pick(timeout_secs: Option<u64>) -> Result<u64> {
-    let priority_labels = match config::find()? {
-        Some(located) => located.config.priority_labels,
-        None => Vec::new(),
+    let (priority_labels, only_assigned_to_me) = match config::find()? {
+        Some(located) => (
+            located.config.priority_labels,
+            located.config.only_assigned_to_me,
+        ),
+        None => (Vec::new(), false),
     };
     let (owner, repo) = github::repo_or_cwd()?;
     let me = github::authenticated_user()?;
@@ -103,6 +111,7 @@ pub fn wait_for_pick(timeout_secs: Option<u64>) -> Result<u64> {
                     &issues,
                     &me,
                     &priority_labels,
+                    only_assigned_to_me,
                     started_fn(&owner, &repo),
                     |n| state::claim(&owner, &repo, n),
                 )?;
@@ -175,6 +184,7 @@ fn claim_pick<'a>(
     issues: &'a [IssueListing],
     me: &str,
     priority_labels: &[String],
+    only_assigned_to_me: bool,
     already_started: impl Fn(u64) -> bool,
     mut claim: impl FnMut(u64) -> Result<bool>,
 ) -> Result<Selection<'a>> {
@@ -182,7 +192,7 @@ fn claim_pick<'a>(
     // of those `already_started` already reports.
     let mut lost: BTreeSet<u64> = BTreeSet::new();
     loop {
-        let selection = select(issues, me, priority_labels, |n| {
+        let selection = select(issues, me, priority_labels, only_assigned_to_me, |n| {
             already_started(n) || lost.contains(&n)
         });
         let Some(picked) = selection.picked else {
@@ -255,10 +265,15 @@ struct Selection<'a> {
 /// blocked, or tracking issues (have sub-issues) are skipped and reported. When
 /// an issue qualifies for several skips, the precedence is started → blocked →
 /// tracking.
+///
+/// When `only_assigned_to_me` is set, unassigned issues are excluded too (so the
+/// pool is exactly the issues assigned to `me`); like issues assigned to someone
+/// else, they're dropped silently rather than reported.
 fn select<'a>(
     issues: &'a [IssueListing],
     me: &str,
     priority_labels: &[String],
+    only_assigned_to_me: bool,
     already_started: impl Fn(u64) -> bool,
 ) -> Selection<'a> {
     let mut skipped_started = Vec::new();
@@ -269,7 +284,11 @@ fn select<'a>(
         if issue.pull_request.is_some() {
             continue;
         }
-        if !issue.assignees.is_empty() && !assigned_to(issue, me) {
+        if only_assigned_to_me {
+            if !assigned_to(issue, me) {
+                continue;
+            }
+        } else if !issue.assignees.is_empty() && !assigned_to(issue, me) {
             continue;
         }
         if already_started(issue.number) {
@@ -533,7 +552,7 @@ mod tests {
 
     /// Run `select` with nothing already started.
     fn pick<'a>(issues: &'a [IssueListing], me: &str, priority_labels: &[String]) -> Selection<'a> {
-        select(issues, me, priority_labels, |_| false)
+        select(issues, me, priority_labels, false, |_| false)
     }
 
     #[test]
@@ -608,6 +627,36 @@ mod tests {
     }
 
     #[test]
+    fn only_assigned_to_me_excludes_unassigned() {
+        // With the option on, an unassigned issue is ignored even when it would
+        // otherwise outrank the assigned one; the assigned-to-me issue wins.
+        let issues = [issue(1, &[], &["urgent"]), issue(2, &["me"], &[])];
+        let selection = select(&issues, "me", &labels(&["urgent"]), true, |_| false);
+        assert_eq!(selection.picked.unwrap().number, 2);
+    }
+
+    #[test]
+    fn only_assigned_to_me_drops_unassigned_silently() {
+        // An unassigned-only pool yields nothing, and the dropped issue isn't
+        // reported as a skip (it's not noteworthy when the option is on).
+        let issues = [issue(1, &[], &["urgent"])];
+        let selection = select(&issues, "me", &labels(&["urgent"]), true, |_| false);
+        assert!(selection.picked.is_none());
+        assert!(selection.skipped_started.is_empty());
+        assert!(selection.skipped_blocked.is_empty());
+        assert!(selection.skipped_tracking.is_empty());
+    }
+
+    #[test]
+    fn unassigned_eligible_when_option_off() {
+        // Guard the default: with the option off, an unassigned issue is still
+        // picked (today's behaviour) rather than being filtered out.
+        let issues = [issue(1, &[], &[])];
+        let selection = select(&issues, "me", &[], false, |_| false);
+        assert_eq!(selection.picked.unwrap().number, 1);
+    }
+
+    #[test]
     fn prs_are_excluded() {
         let issues = [pr(1), issue(2, &[], &[])];
         let picked = pick(&issues, "me", &[]).picked.unwrap();
@@ -622,7 +671,7 @@ mod tests {
             issue(2, &["other"], &[]),
             issue(3, &[], &[]),
         ];
-        let selection = select(&issues, "me", &[], |n| n == 1);
+        let selection = select(&issues, "me", &[], false, |n| n == 1);
         assert_eq!(selection.picked.unwrap().number, 3);
         assert_eq!(selection.skipped_started, [1]);
     }
@@ -658,6 +707,7 @@ mod tests {
             issues,
             "me",
             &[],
+            false,
             |_| false,
             |n| {
                 attempts.borrow_mut().push(n);
@@ -730,7 +780,7 @@ mod tests {
         let mut both = blocked(1, 1);
         both.sub_issues_summary = SubIssuesSummary { total: 2 };
         let issues = [both, issue(2, &[], &[])];
-        let selection = select(&issues, "me", &[], |n| n == 1);
+        let selection = select(&issues, "me", &[], false, |n| n == 1);
         assert_eq!(selection.picked.unwrap().number, 2);
         assert_eq!(selection.skipped_started, [1]);
         assert!(selection.skipped_blocked.is_empty());
@@ -742,7 +792,7 @@ mod tests {
         let mut both = blocked(1, 1);
         both.sub_issues_summary = SubIssuesSummary { total: 2 };
         let issues = [both];
-        let selection = select(&issues, "me", &[], |_| false);
+        let selection = select(&issues, "me", &[], false, |_| false);
         assert_eq!(selection.skipped_blocked, [1]);
         assert!(selection.skipped_tracking.is_empty());
     }

@@ -235,6 +235,10 @@ worktrees_dir = "worktrees"
 # Labels marking an issue as urgent, most urgent first (optional; used by
 # `ghwf next`).
 priority_labels = ["urgent", "soon"]
+# When true, `ghwf next` only considers issues already assigned to you, ignoring
+# unassigned ones (optional; default false). Suits teams that allocate work by
+# discussion or a manager rather than picking off the list.
+only_assigned_to_me = true
 # Label `ghwf create-issue` applies to a follow-up to mark it blocked by the
 # issue it was filed from (optional; defaults to `blocked`). It's set in the
 # create payload so the follow-up carries it from the moment it exists, with the
