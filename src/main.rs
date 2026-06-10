@@ -385,7 +385,12 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     let repo_ctx = github::config_repo()?;
     let issue_data = github::fetch_issue(issue, repo_ctx.as_ref())?;
     let issue_comments = github::fetch_comments(issue, repo_ctx.as_ref())?;
+    // The issue's own repo (which may be a foreign `issue_repos` repo) and the
+    // code repo where the worktree, branch, and PR live (the configured
+    // `main_repo`, or the issue repo when there's no config). They coincide for
+    // the common single-repo case.
     let (owner, repo) = github::parse_owner_repo(&issue_data.html_url)?;
+    let (code_owner, code_repo) = github::code_repo(&(owner.clone(), repo.clone()))?;
     let number = issue_data.number;
 
     // Load the issue's workflow state once; mutate and save it at the end.
@@ -410,7 +415,7 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     // the workflow. The PR object is kept: its draft flag drives the
     // implement → review transition below.
     let pr_object = match pr_number {
-        Some(pr) => Some(github::fetch_pr(&owner, &repo, pr)?),
+        Some(pr) => Some(github::fetch_pr(&code_owner, &code_repo, pr)?),
         None => None,
     };
     let prior_pr_outcome = issue_state.pr_outcome;
@@ -422,7 +427,13 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     // reaction details for prompts whose rollup shows any.
     let mut prompt_thumbs = collect_prompt_thumbs(&owner, &repo, &issue_comments, "issue")?;
     if let Some(comments) = early_pr_comments.as_deref() {
-        prompt_thumbs.extend(collect_prompt_thumbs(&owner, &repo, comments, "PR")?);
+        // PR reactions live in the code repo, where the PR is.
+        prompt_thumbs.extend(collect_prompt_thumbs(
+            &code_owner,
+            &code_repo,
+            comments,
+            "PR",
+        )?);
     }
     let mut outcome = advance_phase(
         &mut issue_state,
@@ -467,7 +478,7 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         Some(pr_outcome) => render::concluded_body(
             pr_outcome,
             pr_number
-                .map(|pr| format!("https://github.com/{owner}/{repo}/pull/{pr}"))
+                .map(|pr| format!("https://github.com/{code_owner}/{code_repo}/pull/{pr}"))
                 .as_deref(),
             number,
         ),
@@ -484,12 +495,19 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
                         .is_none_or(|p| !p.no_branch && p.branch.is_none());
                 if needs_worktree {
                     issue_state.attention = state::Attention::WaitingOnGhwf;
-                    labels::sync(&owner, &repo, number, pr_number, &mut issue_state);
+                    labels::sync(
+                        &(owner.clone(), repo.clone()),
+                        &(code_owner.clone(), code_repo.clone()),
+                        number,
+                        pr_number,
+                        &mut issue_state,
+                    );
                 }
+                // The worktree, branch, and PR live in the code repo.
                 prep::run(
                     &issue_data,
-                    &owner,
-                    &repo,
+                    &code_owner,
+                    &code_repo,
                     number,
                     no_branch,
                     &mut issue_state,
@@ -497,15 +515,15 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
             }
             state::Phase::Implement => implement::run(
                 &issue_data,
-                &owner,
-                &repo,
+                &code_owner,
+                &code_repo,
                 number,
                 &issue_state,
                 pr_instructions.as_deref(),
             )?,
             state::Phase::Review => implement::review(
-                &owner,
-                &repo,
+                &code_owner,
+                &code_repo,
                 number,
                 &issue_state,
                 pr_instructions.as_deref(),
@@ -557,11 +575,16 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         &outcome.notes,
         !issue_state.intro_posted,
         pr_number
-            .map(|pr| format!("https://github.com/{owner}/{repo}/pull/{pr}"))
+            .map(|pr| format!("https://github.com/{code_owner}/{code_repo}/pull/{pr}"))
             .as_deref(),
         new_conclusion,
     );
     let status_posted = status.is_some();
+    // The issue thread is addressed by its full URL so a foreign `issue_repos`
+    // issue resolves to its own repo (a bare number would resolve against the
+    // configured repo); the PR thread is addressed by its bare number, which
+    // resolves against the configured (code) repo where the PR lives.
+    let issue_subject = issue_data.html_url.as_str();
     // The status comments posted to each thread this run, kept so the
     // reaction watches below can target them — a just-posted prompt is the
     // likeliest 👍 target.
@@ -572,12 +595,7 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         match pr_number {
             // No PR yet: the issue is the only thread.
             None => {
-                posted_issue = post_status(
-                    &number.to_string(),
-                    &status_body,
-                    repo_ctx.as_ref(),
-                    "issue",
-                );
+                posted_issue = post_status(issue_subject, &status_body, repo_ctx.as_ref(), "issue");
             }
             // Full update on the phase's primary thread; the other thread
             // gets a one-line stub linking to it — or the full body when the
@@ -585,9 +603,9 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
             Some(pr) => {
                 let primary_is_pr = render::status_primary_is_pr(phase);
                 let (primary, primary_noun, secondary, secondary_noun) = if primary_is_pr {
-                    (pr.to_string(), "PR", number.to_string(), "issue")
+                    (pr.to_string(), "PR", issue_subject.to_string(), "issue")
                 } else {
-                    (number.to_string(), "issue", pr.to_string(), "PR")
+                    (issue_subject.to_string(), "issue", pr.to_string(), "PR")
                 };
                 let full = post_status(&primary, &status_body, repo_ctx.as_ref(), primary_noun);
                 let secondary_body = match &full {
@@ -686,7 +704,7 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
                 Some(comments) => comments,
                 None => github::fetch_comments(&pr.to_string(), repo_ctx.as_ref())?,
             };
-            let pr_review_comments = github::fetch_review_comments(&owner, &repo, pr)?;
+            let pr_review_comments = github::fetch_review_comments(&code_owner, &code_repo, pr)?;
             (Some(pr_comments), Some(pr_review_comments))
         }
         None => (None, None),
@@ -732,8 +750,10 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     // box to a confirmation marks it consumed, so it neither re-surfaces nor is
     // re-watched on later runs.
     let mut submissions = Vec::new();
+    let issue_repo = (owner.clone(), repo.clone());
+    let code_repo_ref = (code_owner.clone(), code_repo.clone());
     let (issue_subs, issue_options_watch) =
-        scan_options(&issue_comments, &my_token, "issue thread");
+        scan_options(&issue_comments, &my_token, "issue thread", &issue_repo);
     submissions.extend(issue_subs);
     if let Some(watch) = issue_options_watch {
         wait_state
@@ -741,16 +761,20 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
             .insert("issue".to_string(), watch);
     }
     if let Some(comments) = pr_comments.as_deref() {
-        let (pr_subs, pr_options_watch) = scan_options(comments, &my_token, "PR thread");
+        let (pr_subs, pr_options_watch) =
+            scan_options(comments, &my_token, "PR thread", &code_repo_ref);
         submissions.extend(pr_subs);
         if let Some(watch) = pr_options_watch {
             wait_state.options_watches.insert("pr".to_string(), watch);
         }
     }
     for sub in &submissions {
-        if let Err(err) =
-            github::update_issue_comment(&owner, &repo, sub.comment_id, &sub.rewritten_body)
-        {
+        if let Err(err) = github::update_issue_comment(
+            &sub.repo.0,
+            &sub.repo.1,
+            sub.comment_id,
+            &sub.rewritten_body,
+        ) {
             eprintln!(
                 "warning: recorded the submitted answers, but couldn't mark the \
                  question comment as submitted: {err:#}"
@@ -870,7 +894,13 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     issue_state.wait = Some(wait_state);
     // Mirror the workflow state onto GitHub labels, best-effort, when
     // configured. Mutates `labels_synced`, so it runs before the save.
-    labels::sync(&owner, &repo, number, pr_number, &mut issue_state);
+    labels::sync(
+        &issue_repo,
+        &code_repo_ref,
+        number,
+        pr_number,
+        &mut issue_state,
+    );
     state::save(&owner, &repo, number, &issue_state)?;
 
     Ok(())
@@ -922,7 +952,11 @@ fn collect_new_comments<'a>(
 
 /// An `ask` answer the user has just submitted, ready to surface (`view`) and
 /// to consume (`comment_id` + `rewritten_body`, used to mark the comment done).
+/// `repo` is where the options comment lives — the issue's repo for an
+/// issue-thread question, the code repo for a PR-thread one — so it's edited in
+/// the right place when the issue and PR repos differ.
 struct PendingSubmission {
+    repo: github::RepoRef,
     comment_id: u64,
     rewritten_body: String,
     view: render::OptionSubmission,
@@ -931,11 +965,13 @@ struct PendingSubmission {
 /// Scan one thread's comments for this session's `ask` options comments.
 /// Returns the answers whose submit box is now ticked — each with the rewritten
 /// body that marks it consumed — and the latest still-open question on the
-/// thread, to keep watching.
+/// thread, to keep watching. `repo` is the thread's repo, recorded on each
+/// submission so it's consumed in the right place.
 fn scan_options(
     comments: &[models::Comment],
     my_token: &str,
     thread_noun: &'static str,
+    repo: &github::RepoRef,
 ) -> (Vec<PendingSubmission>, Option<state::OptionsWatch>) {
     let mut submissions = Vec::new();
     let mut outstanding: Option<&models::Comment> = None;
@@ -951,6 +987,7 @@ fn scan_options(
                 let (selected, unselected): (Vec<_>, Vec<_>) =
                     parsed.options.into_iter().partition(|o| o.checked);
                 submissions.push(PendingSubmission {
+                    repo: repo.clone(),
                     comment_id: comment.id,
                     rewritten_body: render::rewrite_submitted_body(
                         &comment.body,
@@ -1252,7 +1289,8 @@ fn maybe_delete_plan(issue: &models::Issue, number: u64, issue_state: &state::Is
     let (Some(worktree), Some(branch)) = (prep.worktree_path.as_ref(), prep.branch.as_ref()) else {
         return;
     };
-    let (_, slug) = state::branch_and_slug(number, &issue.title);
+    // Only the slug is needed here, which is independent of the branch prefix.
+    let (_, slug) = state::branch_and_slug(None, number, &issue.title);
     let plan_rel = format!("plans/{number}-{slug}.md");
     match plan_cleanup::remove_plan_commit(worktree, branch, &plan_rel) {
         Ok(plan_cleanup::Removal::Removed) => {
@@ -1282,7 +1320,11 @@ fn resolve_pr(issue: &str) -> Result<(String, String, u64)> {
         );
     };
     match issue_state.prep.as_ref().and_then(|p| p.pr_number) {
-        Some(pr) => Ok((owner, repo, pr)),
+        // The PR lives in the code repo, which may differ from the issue's repo.
+        Some(pr) => {
+            let (code_owner, code_repo) = github::code_repo(&(owner, repo))?;
+            Ok((code_owner, code_repo, pr))
+        }
         None => bail!("no PR for issue #{number} yet — it is created in the prep-and-plan phase."),
     }
 }
@@ -1566,29 +1608,31 @@ fn hand_off(issue: &str, question: bool) -> Result<()> {
     };
 
     // Full comment on the phase's primary thread; when a PR exists, the other
-    // thread gets a one-line stub linking to it, best-effort.
+    // thread gets a one-line stub linking to it, best-effort. The issue thread
+    // is addressed by its full URL (so a foreign `issue_repos` issue resolves to
+    // its own repo); the PR thread by its bare number (which resolves against
+    // the configured code repo where the PR lives).
     let pr_number = issue_state.prep.as_ref().and_then(|p| p.pr_number);
+    let issue_subject = format!("https://github.com/{owner}/{repo}/issues/{number}");
     let primary_is_pr = pr_number.is_some() && render::status_primary_is_pr(phase);
-    let primary = if primary_is_pr {
-        pr_number.expect("primary_is_pr requires a PR")
+    let primary_subject = if primary_is_pr {
+        pr_number.expect("primary_is_pr requires a PR").to_string()
     } else {
-        number
+        issue_subject.clone()
     };
-    let comment = github::post_issue_comment(&primary.to_string(), &full_body, repo_ctx.as_ref())?;
+    let comment = github::post_issue_comment(&primary_subject, &full_body, repo_ctx.as_ref())?;
     if let Some(pr) = pr_number {
-        let (secondary, secondary_noun, primary_noun) = if primary_is_pr {
-            (number, "issue", "PR")
+        let (secondary_subject, secondary_noun, primary_noun) = if primary_is_pr {
+            (issue_subject.clone(), "issue", "PR")
         } else {
-            (pr, "PR", "issue")
+            (pr.to_string(), "PR", "issue")
         };
         let noun = if question { "Question" } else { "Hand-off" };
         let stub = render::build_status_comment_body(&format!(
             "{noun} posted on the {primary_noun}: {}",
             comment.html_url
         ));
-        if let Err(err) =
-            github::post_issue_comment(&secondary.to_string(), &stub, repo_ctx.as_ref())
-        {
+        if let Err(err) = github::post_issue_comment(&secondary_subject, &stub, repo_ctx.as_ref()) {
             eprintln!("warning: failed to post the hand-off stub to the {secondary_noun}: {err:#}");
         }
     }
@@ -1616,7 +1660,14 @@ fn hand_off(issue: &str, question: bool) -> Result<()> {
             wait.etags.remove(&format!("reactions_{thread}"));
         }
     }
-    labels::sync(&owner, &repo, number, pr_number, &mut issue_state);
+    let code = github::code_repo(&(owner.clone(), repo.clone()))?;
+    labels::sync(
+        &(owner.clone(), repo.clone()),
+        &code,
+        number,
+        pr_number,
+        &mut issue_state,
+    );
     state::save(&owner, &repo, number, &issue_state)?;
 
     println!("{}", render::comment_json(&comment)?);
@@ -1673,28 +1724,30 @@ fn ask(issue: &str, options: &[String]) -> Result<()> {
     );
 
     // Full comment on the phase's primary thread; when a PR exists, the other
-    // thread gets a one-line stub linking to it, best-effort.
+    // thread gets a one-line stub linking to it, best-effort. The issue thread
+    // is addressed by its full URL (so a foreign `issue_repos` issue resolves to
+    // its own repo); the PR thread by its bare number (which resolves against
+    // the configured code repo where the PR lives).
     let pr_number = issue_state.prep.as_ref().and_then(|p| p.pr_number);
+    let issue_subject = format!("https://github.com/{owner}/{repo}/issues/{number}");
     let primary_is_pr = pr_number.is_some() && render::status_primary_is_pr(issue_state.phase);
-    let primary = if primary_is_pr {
-        pr_number.expect("primary_is_pr requires a PR")
+    let primary_subject = if primary_is_pr {
+        pr_number.expect("primary_is_pr requires a PR").to_string()
     } else {
-        number
+        issue_subject.clone()
     };
-    let comment = github::post_issue_comment(&primary.to_string(), &full_body, repo_ctx.as_ref())?;
+    let comment = github::post_issue_comment(&primary_subject, &full_body, repo_ctx.as_ref())?;
     if let Some(pr) = pr_number {
-        let (secondary, secondary_noun, primary_noun) = if primary_is_pr {
-            (number, "issue", "PR")
+        let (secondary_subject, secondary_noun, primary_noun) = if primary_is_pr {
+            (issue_subject.clone(), "issue", "PR")
         } else {
-            (pr, "PR", "issue")
+            (pr.to_string(), "PR", "issue")
         };
         let stub = render::build_status_comment_body(&format!(
             "Question posted on the {primary_noun}: {}",
             comment.html_url
         ));
-        if let Err(err) =
-            github::post_issue_comment(&secondary.to_string(), &stub, repo_ctx.as_ref())
-        {
+        if let Err(err) = github::post_issue_comment(&secondary_subject, &stub, repo_ctx.as_ref()) {
             eprintln!("warning: failed to post the question stub to the {secondary_noun}: {err:#}");
         }
     }
@@ -1717,7 +1770,14 @@ fn ask(issue: &str, options: &[String]) -> Result<()> {
         // The watch endpoint's URL changed with it; drop the stale ETag.
         wait.etags.remove(&format!("options_{thread}"));
     }
-    labels::sync(&owner, &repo, number, pr_number, &mut issue_state);
+    let code = github::code_repo(&(owner.clone(), repo.clone()))?;
+    labels::sync(
+        &(owner.clone(), repo.clone()),
+        &code,
+        number,
+        pr_number,
+        &mut issue_state,
+    );
     state::save(&owner, &repo, number, &issue_state)?;
 
     println!("{}", render::comment_json(&comment)?);
@@ -1780,7 +1840,10 @@ mod tests {
         // Blocked label leads; extras follow; a case-insensitive duplicate of
         // the blocked label and empty entries are dropped.
         assert_eq!(
-            assemble_labels(Some("blocked"), &["foo".into(), "Blocked".into(), "  ".into()]),
+            assemble_labels(
+                Some("blocked"),
+                &["foo".into(), "Blocked".into(), "  ".into()]
+            ),
             vec!["blocked", "foo"]
         );
         // No blocker: just the (trimmed, de-duplicated) extras.
@@ -2240,7 +2303,12 @@ mod tests {
         .replacen("- [ ] A", "- [x] A", 1)
         .replace("- [ ] **Submit", "- [x] **Submit");
         let comments = vec![comment(9, &body, "2026-06-06T12:00:00Z")];
-        let (subs, watch) = super::scan_options(&comments, "tok", "issue thread");
+        let (subs, watch) = super::scan_options(
+            &comments,
+            "tok",
+            "issue thread",
+            &("Org".to_string(), "repo".to_string()),
+        );
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].comment_id, 9);
         assert_eq!(subs[0].view.selected, vec!["A".to_string()]);
@@ -2258,7 +2326,12 @@ mod tests {
             comment(9, &body("Old"), "2026-06-06T12:00:00Z"),
             comment(10, &body("New"), "2026-06-06T13:00:00Z"),
         ];
-        let (subs, watch) = super::scan_options(&comments, "tok", "issue thread");
+        let (subs, watch) = super::scan_options(
+            &comments,
+            "tok",
+            "issue thread",
+            &("Org".to_string(), "repo".to_string()),
+        );
         assert!(subs.is_empty());
         assert_eq!(watch.unwrap().comment_id, 10);
     }
@@ -2273,7 +2346,12 @@ mod tests {
             comment(9, &other, "2026-06-06T12:00:00Z"),
             comment(10, "just talking", "2026-06-06T12:30:00Z"),
         ];
-        let (subs, watch) = super::scan_options(&comments, "tok", "issue thread");
+        let (subs, watch) = super::scan_options(
+            &comments,
+            "tok",
+            "issue thread",
+            &("Org".to_string(), "repo".to_string()),
+        );
         assert!(subs.is_empty());
         assert!(watch.is_none());
     }

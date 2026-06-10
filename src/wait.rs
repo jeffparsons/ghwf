@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use crate::github::{self, Conditional};
+use crate::github::{self, Conditional, RepoRef};
 use crate::models::{Comment, Issue, PullRequest, Reaction, ReviewComment, User};
 use crate::state::{self, OptionsWatch, PostedRef, ReactionWatch, WaitState};
 use crate::{render, store};
@@ -38,19 +38,37 @@ pub fn run(issue: &str, timeout_secs: u64) -> Result<()> {
     let pr_number = issue_state.prep.as_ref().and_then(|p| p.pr_number);
     let last_posted = issue_state.last_posted.clone();
 
+    // The issue and PR may live in different repos (an `issue_repos` foreign
+    // issue): issue-thread endpoints poll the issue repo, PR-thread endpoints
+    // the code repo. They coincide for the common single-repo case.
+    let issue_repo: RepoRef = (owner.clone(), repo.clone());
+    let code_repo = github::code_repo(&issue_repo)?;
+    let same_repo = issue_repo == code_repo;
+
     // Outside a Claude session there is no token; only status comments hide.
     let my_token = match std::env::var(store::SESSION_ID_ENV) {
         Ok(id) if !id.is_empty() => Some(store::session_token(&id)?),
         _ => None,
     };
 
-    let endpoints = poll_endpoints(&owner, &repo, number, pr_number, &wait_state);
+    let endpoints = poll_endpoints(&issue_repo, &code_repo, number, pr_number, &wait_state);
     // The reaction and options watches again, on their own: the events feed is
     // structurally blind to a reaction or a checkbox edit on a hidden comment,
     // so feed mode polls these directly every cycle rather than leaving them to
     // the backstop sweep. They share ETag keys with their twins in `endpoints`.
-    let mut watch_endpoints = reaction_endpoints(&owner, &repo, &wait_state.reaction_watches);
-    watch_endpoints.extend(options_endpoints(&owner, &repo, &wait_state.options_watches));
+    let mut watch_endpoints =
+        reaction_endpoints(&issue_repo, &code_repo, &wait_state.reaction_watches);
+    watch_endpoints.extend(options_endpoints(
+        &issue_repo,
+        &code_repo,
+        &wait_state.options_watches,
+    ));
+    // The events feed is per-repo. When the issue and PR live in different
+    // repos there are two feeds to watch; rather than juggle both (each with its
+    // own ETag and trust gate), keep such waits in direct conditional polling —
+    // which is the correctness path anyway, the feed being only an idle-mode
+    // optimisation. The feed endpoint is the issue repo's, used only when the
+    // repos coincide.
     let feed_endpoint = format!("repos/{owner}/{repo}/events?per_page=100");
 
     match pr_number {
@@ -142,8 +160,10 @@ pub fn run(issue: &str, timeout_secs: u64) -> Result<()> {
             }
         }
 
-        // Quiet at the cap: try handing over to feed-first idle mode.
-        if matches!(mode, Mode::Direct) && backoff >= BACKOFF_CAP && !feed_distrusted {
+        // Quiet at the cap: try handing over to feed-first idle mode. Skipped
+        // when the issue and PR live in different repos (two feeds — see above);
+        // such waits stay in direct polling at the cap.
+        if same_repo && matches!(mode, Mode::Direct) && backoff >= BACKOFF_CAP && !feed_distrusted {
             match enter_feed_mode(
                 &feed_endpoint,
                 &mut wait_state,
@@ -260,51 +280,69 @@ enum EndpointKind {
     Options(&'static str),
 }
 
-/// The fixed set of endpoints one `wait` invocation polls. The PR endpoints
-/// exist only when prep state records a PR (only `work-on` opens PRs, so the
-/// set can't change mid-wait); the reaction watches are likewise fixed at
-/// entry.
+/// The thread's repo: the PR thread lives in the code repo, everything else in
+/// the issue repo. They coincide for the common single-repo case.
+fn thread_repo<'a>(thread: &str, issue_repo: &'a RepoRef, code_repo: &'a RepoRef) -> &'a RepoRef {
+    match thread {
+        "pr" => code_repo,
+        _ => issue_repo,
+    }
+}
+
+/// The fixed set of endpoints one `wait` invocation polls. The issue endpoints
+/// live in `issue_repo`, the PR endpoints in `code_repo` (they differ for a
+/// foreign `issue_repos` issue). The PR endpoints exist only when prep state
+/// records a PR (only `work-on` opens PRs, so the set can't change mid-wait);
+/// the reaction watches are likewise fixed at entry.
 fn poll_endpoints(
-    owner: &str,
-    repo: &str,
+    issue_repo: &RepoRef,
+    code_repo: &RepoRef,
     number: u64,
     pr: Option<u64>,
     wait: &WaitState,
 ) -> Vec<Endpoint> {
     let since = &wait.since;
+    let (io, ir) = (&issue_repo.0, &issue_repo.1);
     let mut endpoints = vec![
         Endpoint {
             key: "issue",
-            url: format!("repos/{owner}/{repo}/issues/{number}"),
+            url: format!("repos/{io}/{ir}/issues/{number}"),
             kind: EndpointKind::IssueObject,
         },
         Endpoint {
             key: "issue_comments",
-            url: format!(
-                "repos/{owner}/{repo}/issues/{number}/comments?per_page=100&since={since}"
-            ),
+            url: format!("repos/{io}/{ir}/issues/{number}/comments?per_page=100&since={since}"),
             kind: EndpointKind::Conversation("issue thread"),
         },
     ];
     if let Some(pr) = pr {
+        let (co, cr) = (&code_repo.0, &code_repo.1);
         endpoints.push(Endpoint {
             key: "pr",
-            url: format!("repos/{owner}/{repo}/pulls/{pr}"),
+            url: format!("repos/{co}/{cr}/pulls/{pr}"),
             kind: EndpointKind::PrObject,
         });
         endpoints.push(Endpoint {
             key: "pr_comments",
-            url: format!("repos/{owner}/{repo}/issues/{pr}/comments?per_page=100&since={since}"),
+            url: format!("repos/{co}/{cr}/issues/{pr}/comments?per_page=100&since={since}"),
             kind: EndpointKind::Conversation("PR thread"),
         });
         endpoints.push(Endpoint {
             key: "pr_review_comments",
-            url: format!("repos/{owner}/{repo}/pulls/{pr}/comments?per_page=100&since={since}"),
+            url: format!("repos/{co}/{cr}/pulls/{pr}/comments?per_page=100&since={since}"),
             kind: EndpointKind::ReviewComments,
         });
     }
-    endpoints.extend(reaction_endpoints(owner, repo, &wait.reaction_watches));
-    endpoints.extend(options_endpoints(owner, repo, &wait.options_watches));
+    endpoints.extend(reaction_endpoints(
+        issue_repo,
+        code_repo,
+        &wait.reaction_watches,
+    ));
+    endpoints.extend(options_endpoints(
+        issue_repo,
+        code_repo,
+        &wait.options_watches,
+    ));
     endpoints
 }
 
@@ -313,14 +351,15 @@ fn poll_endpoints(
 /// (hidden) comment, which the digest filters and the events feed doesn't
 /// surface, so this is the only way a submission can wake a wait.
 fn options_endpoints(
-    owner: &str,
-    repo: &str,
+    issue_repo: &RepoRef,
+    code_repo: &RepoRef,
     watches: &BTreeMap<String, OptionsWatch>,
 ) -> Vec<Endpoint> {
     ["issue", "pr"]
         .into_iter()
         .filter_map(|thread| {
             let watch = watches.get(thread)?;
+            let (owner, repo) = thread_repo(thread, issue_repo, code_repo);
             Some(Endpoint {
                 key: match thread {
                     "issue" => "options_issue",
@@ -337,14 +376,15 @@ fn options_endpoints(
 /// reactions list. A reaction bumps neither the comment's `updated_at` nor
 /// the events feed, so this is the only way a 👍 can wake a wait.
 fn reaction_endpoints(
-    owner: &str,
-    repo: &str,
+    issue_repo: &RepoRef,
+    code_repo: &RepoRef,
     watches: &BTreeMap<String, ReactionWatch>,
 ) -> Vec<Endpoint> {
     ["issue", "pr"]
         .into_iter()
         .filter_map(|thread| {
             let watch = watches.get(thread)?;
+            let (owner, repo) = thread_repo(thread, issue_repo, code_repo);
             Some(Endpoint {
                 key: match thread {
                     "issue" => "reactions_issue",
@@ -706,20 +746,18 @@ fn feed_wake_reasons(
             // pinned, milestoned, locked, …) are noise; ghwf makes some of
             // them itself (label sync, self-assignment) and must not wake on
             // them.
-            "IssuesEvent" if ours(&event.payload.issue) => {
-                match event.payload.action.as_deref() {
-                    Some("closed") => {
-                        reasons.push("The issue was closed (via the events feed).".to_string())
-                    }
-                    Some("reopened") => {
-                        reasons.push("The issue was reopened (via the events feed).".to_string())
-                    }
-                    Some("edited") => {
-                        reasons.push("The issue was edited (via the events feed).".to_string())
-                    }
-                    _ => continue,
+            "IssuesEvent" if ours(&event.payload.issue) => match event.payload.action.as_deref() {
+                Some("closed") => {
+                    reasons.push("The issue was closed (via the events feed).".to_string())
                 }
-            }
+                Some("reopened") => {
+                    reasons.push("The issue was reopened (via the events feed).".to_string())
+                }
+                Some("edited") => {
+                    reasons.push("The issue was edited (via the events feed).".to_string())
+                }
+                _ => continue,
+            },
             // Closed concludes (or halts) the workflow; draft flips advance
             // it. Pushes (`synchronize`) and reopens must not wake.
             "PullRequestEvent" if ours(&event.payload.pull_request) => {

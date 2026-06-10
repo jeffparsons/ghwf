@@ -52,12 +52,98 @@ pub struct Config {
     /// after as the GitHub-UI truth. Defaults to `blocked`.
     #[serde(default = "default_blocked_label")]
     pub blocked_label: String,
+    /// Repos whose issues may be worked on even though the code, worktree, and
+    /// PR live in `main_repo`. The configured repo is always allowed; this lists
+    /// *additional* issue-only repos. Empty by default. Each entry is either a
+    /// plain `"owner/repo"` string or a table with an optional `branch_prefix`.
+    #[serde(default)]
+    pub issue_repos: Vec<IssueRepo>,
+}
+
+/// An entry in [`Config::issue_repos`]: a foreign repo whose issues may be
+/// worked on. Either a plain `"owner/repo"` string or a table that also carries
+/// a `branch_prefix` controlling how that repo's branches are named.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum IssueRepo {
+    /// `"owner/repo"` — the branch prefix defaults to the repo name.
+    Plain(String),
+    /// `{ repo = "owner/repo", branch_prefix = "docs" }`. `branch_prefix`
+    /// omitted → repo name; `""` → no prefix (collision risk accepted).
+    Detailed {
+        repo: String,
+        branch_prefix: Option<String>,
+    },
+}
+
+impl IssueRepo {
+    /// The `"owner/repo"` spec, whichever form was used.
+    fn spec(&self) -> &str {
+        match self {
+            IssueRepo::Plain(spec) => spec,
+            IssueRepo::Detailed { repo, .. } => repo,
+        }
+    }
+
+    /// Parse and validate the spec into `(owner, repo)`.
+    pub fn repo_ref(&self) -> Result<(String, String)> {
+        parse_owner_repo_spec(self.spec())
+    }
+
+    /// The explicit `branch_prefix` override, if any. `None` means "unset" (the
+    /// caller defaults to the repo name); `Some("")` means "no prefix".
+    fn branch_prefix(&self) -> Option<&str> {
+        match self {
+            IssueRepo::Plain(_) => None,
+            IssueRepo::Detailed { branch_prefix, .. } => branch_prefix.as_deref(),
+        }
+    }
+}
+
+/// Parse `"owner/repo"` into its halves, rejecting anything that isn't exactly
+/// one non-empty owner and one non-empty repo.
+fn parse_owner_repo_spec(spec: &str) -> Result<(String, String)> {
+    let trimmed = spec.trim();
+    match trimmed.split_once('/') {
+        Some((owner, repo)) if !owner.is_empty() && !repo.is_empty() && !repo.contains('/') => {
+            Ok((owner.to_string(), repo.to_string()))
+        }
+        _ => bail!("invalid issue_repos entry `{spec}`: expected the form \"owner/repo\""),
+    }
 }
 
 /// The default name for [`Config::blocked_label`], also used by callers that
 /// run without a `ghwf.toml` (where there is no `Config` to read it from).
 pub fn default_blocked_label() -> String {
     "blocked".to_string()
+}
+
+impl Config {
+    /// The validated `(owner, repo)` of every `issue_repos` entry. A malformed
+    /// entry is a hard error — better to fail loudly than silently drop an
+    /// allowlist entry the user is relying on.
+    pub fn issue_repo_refs(&self) -> Result<Vec<(String, String)>> {
+        self.issue_repos.iter().map(IssueRepo::repo_ref).collect()
+    }
+
+    /// The branch-name prefix for an issue living in `(owner, repo)`:
+    /// - `None` when the repo isn't a configured issue repo (e.g. it's the main
+    ///   repo) or its entry sets `branch_prefix = ""` (opt out);
+    /// - `Some(name)` to prefix with `name` — the entry's `branch_prefix`, or
+    ///   the repo name by default.
+    pub fn issue_branch_prefix(&self, owner: &str, repo: &str) -> Result<Option<String>> {
+        for entry in &self.issue_repos {
+            let (o, r) = entry.repo_ref()?;
+            if o.eq_ignore_ascii_case(owner) && r.eq_ignore_ascii_case(repo) {
+                return Ok(match entry.branch_prefix() {
+                    Some("") => None,
+                    Some(prefix) => Some(prefix.to_string()),
+                    None => Some(r),
+                });
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// The `[labels]` section: one GitHub label name per phase and per attention
@@ -341,6 +427,70 @@ mod tests {
         // Pre-existing configs without the key keep loading and get the default.
         let config: Config = toml::from_str(r#"worktrees_dir = "worktrees""#).unwrap();
         assert_eq!(config.blocked_label, "blocked");
+    }
+
+    #[test]
+    fn issue_repos_default_to_empty() {
+        // Pre-existing configs without the key keep loading.
+        let config: Config = toml::from_str(r#"worktrees_dir = "worktrees""#).unwrap();
+        assert!(config.issue_repos.is_empty());
+    }
+
+    #[test]
+    fn issue_repos_parse_both_forms_mixed() {
+        let config: Config = toml::from_str(
+            r#"
+            worktrees_dir = "worktrees"
+            issue_repos = [
+                "Org/plain",
+                { repo = "Org/with-prefix", branch_prefix = "wp" },
+                { repo = "Org/no-prefix", branch_prefix = "" },
+                { repo = "Org/default-prefix" },
+            ]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.issue_repo_refs().unwrap(),
+            [
+                ("Org".to_string(), "plain".to_string()),
+                ("Org".to_string(), "with-prefix".to_string()),
+                ("Org".to_string(), "no-prefix".to_string()),
+                ("Org".to_string(), "default-prefix".to_string()),
+            ]
+        );
+        // Plain form → repo name; explicit prefix wins; "" opts out; an absent
+        // prefix in the table form also defaults to the repo name.
+        assert_eq!(
+            config.issue_branch_prefix("Org", "plain").unwrap(),
+            Some("plain".to_string())
+        );
+        assert_eq!(
+            config.issue_branch_prefix("org", "with-prefix").unwrap(),
+            Some("wp".to_string())
+        );
+        assert_eq!(
+            config.issue_branch_prefix("Org", "no-prefix").unwrap(),
+            None
+        );
+        assert_eq!(
+            config.issue_branch_prefix("Org", "default-prefix").unwrap(),
+            Some("default-prefix".to_string())
+        );
+        // A repo that isn't listed (e.g. the main repo) gets no prefix.
+        assert_eq!(config.issue_branch_prefix("Org", "main").unwrap(), None);
+    }
+
+    #[test]
+    fn issue_repos_malformed_entry_errors() {
+        let config: Config = toml::from_str(
+            r#"
+            worktrees_dir = "worktrees"
+            issue_repos = ["not-a-repo"]
+            "#,
+        )
+        .unwrap();
+        assert!(config.issue_repo_refs().is_err());
     }
 
     #[test]

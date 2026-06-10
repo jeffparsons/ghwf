@@ -267,6 +267,33 @@ pub fn run() -> Result<()> {
         }
     }
 
+    if !doc.contains_key("issue_repos")
+        && prompt(
+            Confirm::new(
+                "Allow working on issues from other repos? (the code, worktree, and PR \
+                 still live in this repo)",
+            )
+            .with_default(false)
+            .prompt(),
+        )?
+    {
+        let input = prompt(
+            Text::new("Additional issue repos, comma-separated (e.g. `Org/docs`):").prompt(),
+        )?;
+        let issue_repos = parse_issue_repos(&input);
+        if issue_repos.is_empty() {
+            println!("No repos given; skipping.");
+        } else {
+            set_issue_repos(&mut doc, &issue_repos);
+            doc_changed = true;
+            println!(
+                "Tip: to shorten or disable the branch-name prefix for a repo, edit its \
+                 entry into the table form, e.g. `{{ repo = \"Org/docs\", branch_prefix = \"docs\" }}` \
+                 (see the README)."
+            );
+        }
+    }
+
     if !doc.contains_key("labels") {
         if prompt(
             Confirm::new("Set up workflow status labels now? (creates labels in the GitHub repo)")
@@ -539,6 +566,30 @@ fn parse_priority_labels(input: &str) -> Vec<String> {
         .collect()
 }
 
+/// Write the `issue_repos` key as an array of plain `"owner/repo"` strings. The
+/// richer `{ repo = …, branch_prefix = … }` form is a documented hand-edit.
+fn set_issue_repos(doc: &mut DocumentMut, issue_repos: &[String]) {
+    let array: toml_edit::Array = issue_repos.iter().map(String::as_str).collect();
+    insert_with_comment(
+        doc,
+        "issue_repos",
+        toml_edit::value(array),
+        "Repos whose issues may be worked on while the code, worktree, and PR\n\
+         stay in this repo. Each entry is \"owner/repo\", or a table\n\
+         { repo = \"owner/repo\", branch_prefix = \"…\" } to set the branch prefix.",
+    );
+}
+
+/// Parse the comma-separated issue-repos answer: trimmed, empties dropped.
+fn parse_issue_repos(input: &str) -> Vec<String> {
+    input
+        .split(',')
+        .map(str::trim)
+        .filter(|repo| !repo.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Append `line` to the file at `path`, creating it if needed and making sure
 /// the previous content ends with a newline first.
 fn append_line(path: &Path, line: &str) -> Result<()> {
@@ -558,8 +609,8 @@ fn append_line(path: &Path, line: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_priority_labels, set_blocked_label, set_delete_plan_on_approval, set_essentials,
-        set_only_assigned_to_me, set_permission_mode, set_priority_labels, PR_STUB,
+        parse_issue_repos, parse_priority_labels, set_blocked_label, set_delete_plan_on_approval,
+        set_essentials, set_only_assigned_to_me, set_permission_mode, set_priority_labels, PR_STUB,
     };
     use crate::config::Config;
     use std::path::PathBuf;
@@ -666,6 +717,28 @@ pre-plan = \"a\"
             ["urgent", "soon"]
         );
         assert!(parse_priority_labels("  ").is_empty());
+    }
+
+    #[test]
+    fn issue_repos_answer_parses_loosely() {
+        assert_eq!(
+            parse_issue_repos(" Org/docs , Org/wiki ,, "),
+            ["Org/docs", "Org/wiki"]
+        );
+        assert!(parse_issue_repos("  ").is_empty());
+    }
+
+    #[test]
+    fn set_issue_repos_writes_plain_string_array() {
+        let mut doc = "worktrees_dir = \"worktrees\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        super::set_issue_repos(&mut doc, &["Org/docs".to_string()]);
+        let config: Config = toml::from_str(&doc.to_string()).unwrap();
+        assert_eq!(
+            config.issue_repo_refs().unwrap(),
+            [("Org".to_string(), "docs".to_string())]
+        );
     }
 
     #[test]

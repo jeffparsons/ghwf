@@ -9,6 +9,10 @@ use crate::{config, git, github};
 /// Ensure the issue's branch + worktree exist, creating `state.prep` (in branch
 /// mode) if needed. Returns `(worktree_path, branch)`.
 ///
+/// `owner`/`repo` are the *code* repo (where the worktree, branch, and PR live —
+/// the configured `main_repo`), which may differ from the issue's own repo. The
+/// branch is qualified by `issue_repos`' prefix for foreign-repo issues.
+///
 /// Shared by the prep-and-plan phase and the outside-Claude launcher (which
 /// creates the worktree as early as pre-plan, so the session it starts is
 /// anchored there from the first launch). Records the branch and worktree path
@@ -29,7 +33,8 @@ pub fn ensure_worktree(
     let prep = state.prep.as_mut().expect("prep state was just set");
 
     if prep.branch.is_none() {
-        let (branch, _) = state::branch_and_slug(issue.number, &issue.title);
+        let prefix = issue_branch_prefix(&located, issue)?;
+        let (branch, _) = state::branch_and_slug(prefix.as_deref(), issue.number, &issue.title);
         let worktree_path = located.worktrees_dir_path().join(&branch);
         git::fetch(&main_repo)?;
         let default = github::default_branch(owner, repo)?;
@@ -47,6 +52,14 @@ pub fn ensure_worktree(
     let worktree = prep.worktree_path.clone().expect("worktree path set above");
     let branch = prep.branch.clone().expect("branch set above");
     Ok((worktree, branch))
+}
+
+/// The branch-name prefix for `issue`, per the `issue_repos` config. `None` when
+/// the issue lives in the configured repo (the common case) or the entry opts
+/// out of prefixing.
+fn issue_branch_prefix(located: &config::Located, issue: &Issue) -> Result<Option<String>> {
+    let (owner, repo) = github::parse_owner_repo(&issue.html_url)?;
+    located.config.issue_branch_prefix(&owner, &repo)
 }
 
 /// Best-effort: fast-forward the worktree that has `default` checked out to
@@ -94,6 +107,9 @@ fn try_update_default_worktree(main_repo: &Path, default: &str) -> Result<()> {
 /// remains: create the worktree/branch, wait for Claude to write the plan, then
 /// commit, push, and open a draft PR. Returns the banner body describing the
 /// current state and what Claude should do next.
+///
+/// `owner`/`repo` are the *code* repo (the configured `main_repo`), where the
+/// worktree, branch, and PR live — which may differ from the issue's own repo.
 pub fn run(
     issue: &Issue,
     owner: &str,
@@ -119,7 +135,8 @@ pub fn run(
         );
     }
 
-    let (_, slug) = state::branch_and_slug(number, &issue.title);
+    // Only the slug is needed here, which is independent of the branch prefix.
+    let (_, slug) = state::branch_and_slug(None, number, &issue.title);
     let plan_rel = format!("plans/{number}-{slug}.md");
 
     if prep.no_branch {
