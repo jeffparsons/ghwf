@@ -59,7 +59,9 @@ enum Commands {
     ///
     /// With `--wait`, block until an eligible issue appears rather than erroring
     /// when there is none — run one per terminal as a pool of single-use
-    /// workers that each grab and start the next issue to come along.
+    /// workers that each grab and start the next issue to come along. With
+    /// `--forever`, keep going after each issue concludes, so one terminal works
+    /// the queue indefinitely.
     Next {
         /// Work without a dedicated branch/worktree/PR (just write the plan file).
         #[arg(long)]
@@ -72,6 +74,12 @@ enum Commands {
         /// Omit to wait indefinitely.
         #[arg(long, requires = "wait")]
         timeout: Option<u64>,
+        /// Keep working issues one after another: when a session's workflow
+        /// concludes, bring it down and claim the next eligible issue, waiting
+        /// when the queue is empty. Stops when you quit a session before its
+        /// workflow concludes. Implies waiting, so it conflicts with --timeout.
+        #[arg(long, conflicts_with = "timeout")]
+        forever: bool,
     },
     /// Clone a GitHub repo into ghwf's preferred layout: a container
     /// directory holding the bare repo (as `<name>.git`), a generated
@@ -271,7 +279,11 @@ fn main() -> Result<()> {
             no_branch,
             wait,
             timeout,
+            forever,
         } => {
+            if forever {
+                return next::run_forever(no_branch);
+            }
             let number = if wait {
                 next::wait_for_pick(timeout)?
             } else {
@@ -1864,11 +1876,28 @@ fn record_last_posted(
 mod tests {
     use super::{
         advance_on_pr_ready, advance_phase, assemble_labels, latest_prompt_watch,
-        needs_worktree_guard, AdvanceOutcome, PromptThumbs,
+        needs_worktree_guard, AdvanceOutcome, Cli, PromptThumbs,
     };
     use crate::models::{Comment, PullRequest, Reaction, User};
     use crate::render::{NoteKind, Transition, Trigger};
     use crate::state::{Directive, IssueState, Phase, PrOutcome, PrepState};
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn cli_definition_is_valid() {
+        // Catches arg-config mistakes like a conflict referencing a nonexistent
+        // argument.
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn next_forever_parses_and_conflicts_with_timeout() {
+        // `next --forever` parses on its own…
+        assert!(Cli::try_parse_from(["ghwf", "next", "--forever"]).is_ok());
+        // …but `--forever` is the opposite of a one-shot give-up, so pairing it
+        // with `--timeout` is rejected.
+        assert!(Cli::try_parse_from(["ghwf", "next", "--forever", "--timeout", "30"]).is_err());
+    }
 
     #[test]
     fn assemble_labels_puts_blocked_first_and_dedupes() {
