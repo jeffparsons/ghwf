@@ -343,6 +343,16 @@ permission_mode = "auto"
 # (dirty worktree, merge commits on the branch, the plan modified by a later
 # commit, a rejected push), and a no-op in --no-branch mode.
 delete_plan_on_approval = true
+# GitHub logins whose comments and 👍 reactions ghwf acts on, in addition to you
+# (the authenticated user, always accepted) and the repo's collaborators —
+# anyone with an OWNER / MEMBER / COLLABORATOR association (optional; empty by
+# default). Everyone else's comments and reactions are ignored, so a public
+# repo's workflow can't be driven by strangers. Matched case-insensitively. A
+# 👍 reaction carries no association, so collaborator auto-accept for reactions
+# is resolved via the repo's collaborator list; an org member with no repo
+# access is accepted on a typed comment but not on a bare 👍, and should be
+# listed here.
+allowed_users = ["octocat"]
 ```
 
 The `config ls`/`info`/`example` commands are generated from the `Config` type

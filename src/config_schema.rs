@@ -180,6 +180,7 @@ fn example_covers_every_field(
         only_assigned_to_me,
         blocked_label,
         issue_repos,
+        allowed_users,
     } = config;
     let LabelsConfig {
         phase: _,
@@ -233,6 +234,12 @@ fn render_example() -> String {
     detailed.insert("branch_prefix", "wiki".into());
     issue_repos.push(toml_edit::Value::InlineTable(detailed));
     insert(&mut doc, "issue_repos", toml_edit::value(issue_repos));
+
+    insert(
+        &mut doc,
+        "allowed_users",
+        toml_edit::value(["octocat"].into_iter().collect::<toml_edit::Array>()),
+    );
 
     // The [labels] table, with its kebab-cased phase/attention keys taken from
     // reflection so they can't drift from the structs.

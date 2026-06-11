@@ -1,3 +1,4 @@
+mod access;
 mod attach;
 mod clone;
 mod collect_garbage;
@@ -605,11 +606,42 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
             "PR",
         )?);
     }
+    // Only allow-listed authors (the operator, `allowed_users`, and repo
+    // collaborators) may drive the workflow or feed the session. Resolve the
+    // policy once per run; `allowed_users` comes from the config, if any.
+    let allowed_users = config::find()?
+        .map(|located| located.config.allowed_users)
+        .unwrap_or_default();
+    let mut access = access::AccessList::resolve(&allowed_users)?;
+    let issue_repo_ref = (owner.clone(), repo.clone());
+    let code_repo_ref = (code_owner.clone(), code_repo.clone());
+    // A 👍's author carries no association, so the collaborator rule for it
+    // needs the repo's collaborator list. Fetch it only when an unconsumed 👍
+    // from a not-already-accepted user actually hinges on it (usually none, so
+    // no extra API call).
+    for prompt in &prompt_thumbs {
+        let repo = if prompt.source == "PR" {
+            &code_repo_ref
+        } else {
+            &issue_repo_ref
+        };
+        for reaction in &prompt.reactions {
+            if reaction.is_thumbs_up()
+                && !issue_state.consumed_reactions.contains(&reaction.id)
+                && access.reaction_needs_collaborators(&reaction.user.login)
+            {
+                access.ensure_collaborators(repo)?;
+            }
+        }
+    }
     let mut outcome = advance_phase(
         &mut issue_state,
         &issue_comments,
         early_pr_comments.as_deref(),
         &prompt_thumbs,
+        &access,
+        &issue_repo_ref,
+        &code_repo_ref,
     );
     // The implement phase has no approval command: the user marking the draft
     // PR ready for review is what advances it.
@@ -945,10 +977,8 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     // box to a confirmation marks it consumed, so it neither re-surfaces nor is
     // re-watched on later runs.
     let mut submissions = Vec::new();
-    let issue_repo = (owner.clone(), repo.clone());
-    let code_repo_ref = (code_owner.clone(), code_repo.clone());
     let (issue_subs, issue_options_watch) =
-        scan_options(&issue_comments, &my_token, "issue thread", &issue_repo);
+        scan_options(&issue_comments, &my_token, "issue thread", &issue_repo_ref);
     submissions.extend(issue_subs);
     if let Some(watch) = issue_options_watch {
         wait_state
@@ -984,9 +1014,20 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     let body_hash = store::content_hash(issue_data.body.as_deref().unwrap_or(""));
     let body_changed = record.issue_body_hash.as_deref() != Some(&body_hash);
 
-    let new_issue = collect_new_comments(&issue_comments, &record.comments, &my_token);
+    let (new_issue, mut ignored_comments) = collect_new_comments(
+        &issue_comments,
+        &record.comments,
+        &my_token,
+        &access,
+        "issue",
+    );
     let new_pr = match pr_comments.as_deref() {
-        Some(comments) => collect_new_comments(comments, &record.comments, &my_token),
+        Some(comments) => {
+            let (views, ignored) =
+                collect_new_comments(comments, &record.comments, &my_token, &access, "PR");
+            ignored_comments.extend(ignored);
+            views
+        }
         None => Vec::new(),
     };
 
@@ -999,15 +1040,29 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         }
         let hash = store::content_hash(&comment.body);
         let previous = record.review_comments.get(&comment.id);
-        if previous != Some(&hash) {
-            new_review.push(ReviewCommentView {
-                comment,
-                body: render::strip_ghwf_marker(&comment.body),
-                location: comment.location(),
-                updated: previous.is_some(),
-            });
+        if previous == Some(&hash) {
+            continue;
         }
+        // Anyone can leave an inline review on a public PR, so gate these too.
+        if !access.accepts_comment(&comment.user.login, &comment.author_association) {
+            ignored_comments.push(render::IgnoredInput {
+                by: comment.user.login.clone(),
+                source: "PR",
+                kind: render::IgnoredKind::Comment,
+            });
+            continue;
+        }
+        new_review.push(ReviewCommentView {
+            comment,
+            body: render::strip_ghwf_marker(&comment.body),
+            location: comment.location(),
+            updated: previous.is_some(),
+        });
     }
+    // Fold the ignored comments in with any ignored reactions, so the banner
+    // reports them together. Ignored input is informational only — it must not
+    // count as `activity` below (it shouldn't hand the ball back to Claude).
+    outcome.ignored.extend(ignored_comments);
 
     // Anything new arriving — a directive (fired or noted), the issue body
     // changing, or fresh digest content — resets the Stop hook's
@@ -1045,6 +1100,7 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
             phase,
             &outcome.transitions,
             &outcome.notes,
+            &outcome.ignored,
             status_posted,
             &body
         )
@@ -1090,7 +1146,7 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     // Mirror the workflow state onto GitHub labels, best-effort, when
     // configured. Mutates `labels_synced`, so it runs before the save.
     labels::sync(
-        &issue_repo,
+        &issue_repo_ref,
         &code_repo_ref,
         number,
         pr_number,
@@ -1143,28 +1199,43 @@ fn post_status(
 
 /// Collect one thread's new-or-changed conversation comments, diffed against
 /// the seen-record's comment map by content hash. Hidden comments (ghwf status
-/// updates, this session's own posts) are skipped.
+/// updates, this session's own posts) are skipped. Comments from authors who
+/// aren't allow-listed are not surfaced; each newly-seen one is reported as an
+/// ignored input instead (the seen-record dedupes them to one report apiece).
+/// `source` is the thread the comments belong to ("issue" / "PR").
 fn collect_new_comments<'a>(
     comments: &'a [models::Comment],
     seen: &std::collections::BTreeMap<u64, String>,
     my_token: &str,
-) -> Vec<CommentView<'a>> {
+    access: &access::AccessList,
+    source: &'static str,
+) -> (Vec<CommentView<'a>>, Vec<render::IgnoredInput>) {
     let mut new = Vec::new();
+    let mut ignored = Vec::new();
     for comment in comments {
         if render::hidden_from_digest(&comment.body, Some(my_token)) {
             continue;
         }
         let hash = store::content_hash(&comment.body);
         let previous = seen.get(&comment.id);
-        if previous != Some(&hash) {
-            new.push(CommentView {
-                comment,
-                body: render::strip_ghwf_marker(&comment.body),
-                updated: previous.is_some(),
-            });
+        if previous == Some(&hash) {
+            continue;
         }
+        if !access.accepts_comment(&comment.user.login, &comment.author_association) {
+            ignored.push(render::IgnoredInput {
+                by: comment.user.login.clone(),
+                source,
+                kind: render::IgnoredKind::Comment,
+            });
+            continue;
+        }
+        new.push(CommentView {
+            comment,
+            body: render::strip_ghwf_marker(&comment.body),
+            updated: previous.is_some(),
+        });
     }
-    new
+    (new, ignored)
 }
 
 /// An `ask` answer the user has just submitted, ready to surface (`view`) and
@@ -1288,6 +1359,10 @@ fn needs_worktree_guard(phase: state::Phase, issue_state: &state::IssueState) ->
 struct AdvanceOutcome {
     transitions: Vec<render::Transition>,
     notes: Vec<render::DirectiveNote>,
+    // Non-allow-listed 👍 reactions that were ignored. Ignored comments are
+    // collected separately by the digest layer; both render together in the
+    // banner.
+    ignored: Vec<render::IgnoredInput>,
 }
 
 /// A ghwf-authored approval prompt comment with the reactions currently on it,
@@ -1367,6 +1442,9 @@ fn advance_phase(
     issue_comments: &[models::Comment],
     pr_comments: Option<&[models::Comment]>,
     prompt_thumbs: &[PromptThumbs],
+    access: &access::AccessList,
+    issue_repo: &github::RepoRef,
+    code_repo: &github::RepoRef,
 ) -> AdvanceOutcome {
     // Merge both threads and both event kinds chronologically, so successive
     // approvals fire in the order they were given.
@@ -1416,8 +1494,14 @@ fn advance_phase(
                     continue;
                 };
                 // Consume the directive whatever happens next, so it never
-                // re-fires.
+                // re-fires — including once consumed-but-ignored, so adding the
+                // author to the allow-list later can't make an old comment fire.
                 issue_state.consumed_directives.insert(comment.id);
+                // Only allow-listed authors drive the workflow. The ignored
+                // comment itself is reported by the digest layer, so just skip.
+                if !access.accepts_comment(&comment.user.login, &comment.author_association) {
+                    continue;
+                }
                 (directive, &comment.user.login, source, false)
             }
             ApprovalEvent::Thumb {
@@ -1429,6 +1513,20 @@ fn advance_phase(
                     continue;
                 }
                 issue_state.consumed_reactions.insert(reaction.id);
+                let repo = if source == "PR" {
+                    code_repo
+                } else {
+                    issue_repo
+                };
+                if !access.accepts_reaction(repo, &reaction.user.login) {
+                    // A 👍 has no other surfacing path, so note it here.
+                    outcome.ignored.push(render::IgnoredInput {
+                        by: reaction.user.login.clone(),
+                        source,
+                        kind: render::IgnoredKind::Reaction,
+                    });
+                    continue;
+                }
                 (directive, &reaction.user.login, source, true)
             }
         };
@@ -2290,6 +2388,17 @@ mod tests {
         }
     }
 
+    // An accept-all policy for the existing advance_phase tests: the comment
+    // helper's author ("user") is the authenticated user, and the reaction
+    // helper's author ("reactor") is allow-listed.
+    fn access_all() -> crate::access::AccessList {
+        crate::access::AccessList::new("user", &["reactor".to_string()])
+    }
+
+    fn repo_ref() -> crate::github::RepoRef {
+        ("o".to_string(), "r".to_string())
+    }
+
     fn comment(id: u64, body: &str, created_at: &str) -> Comment {
         Comment {
             id,
@@ -2351,7 +2460,15 @@ mod tests {
     fn matching_directive_advances_and_consumes() {
         let mut state = state_in(Phase::PrePlan);
         let comments = [comment(1, "/approve-pre-plan", "2026-01-01T00:00:00Z")];
-        let outcome = advance_phase(&mut state, &comments, None, &[]);
+        let outcome = advance_phase(
+            &mut state,
+            &comments,
+            None,
+            &[],
+            &access_all(),
+            &repo_ref(),
+            &repo_ref(),
+        );
         assert_eq!(state.phase, Phase::PrepAndPlan);
         assert_eq!(outcome.transitions.len(), 1);
         assert_eq!(
@@ -2366,7 +2483,15 @@ mod tests {
     fn pr_thread_directive_advances() {
         let mut state = state_in(Phase::PrepAndPlan);
         let pr = [comment(2, "/approve-plan", "2026-01-01T00:00:00Z")];
-        let outcome = advance_phase(&mut state, &[], Some(&pr), &[]);
+        let outcome = advance_phase(
+            &mut state,
+            &[],
+            Some(&pr),
+            &[],
+            &access_all(),
+            &repo_ref(),
+            &repo_ref(),
+        );
         assert_eq!(state.phase, Phase::Implement);
         assert_eq!(outcome.transitions.len(), 1);
         assert_eq!(directive_parts(&outcome.transitions[0]).1, "user");
@@ -2377,7 +2502,15 @@ mod tests {
         let mut state = state_in(Phase::PrepAndPlan);
         let issue = [comment(1, "/approve-plan", "2026-01-01T00:00:00Z")];
         let pr = [comment(2, "/approve-plan", "2026-01-01T00:01:00Z")];
-        let outcome = advance_phase(&mut state, &issue, Some(&pr), &[]);
+        let outcome = advance_phase(
+            &mut state,
+            &issue,
+            Some(&pr),
+            &[],
+            &access_all(),
+            &repo_ref(),
+            &repo_ref(),
+        );
         assert_eq!(state.phase, Phase::Implement);
         assert_eq!(outcome.transitions.len(), 1);
         assert_eq!(outcome.notes.len(), 1);
@@ -2390,7 +2523,15 @@ mod tests {
     fn premature_directive_is_noted_not_fired() {
         let mut state = state_in(Phase::PrePlan);
         let comments = [comment(1, "/approve-plan", "2026-01-01T00:00:00Z")];
-        let outcome = advance_phase(&mut state, &comments, None, &[]);
+        let outcome = advance_phase(
+            &mut state,
+            &comments,
+            None,
+            &[],
+            &access_all(),
+            &repo_ref(),
+            &repo_ref(),
+        );
         assert_eq!(state.phase, Phase::PrePlan);
         assert!(outcome.transitions.is_empty());
         assert!(matches!(outcome.notes[0].kind, NoteKind::Premature));
@@ -2403,7 +2544,15 @@ mod tests {
         for command in ["/proceed", "/approve-implementation"] {
             let mut state = state_in(Phase::PrePlan);
             let comments = [comment(1, command, "2026-01-01T00:00:00Z")];
-            let outcome = advance_phase(&mut state, &comments, None, &[]);
+            let outcome = advance_phase(
+                &mut state,
+                &comments,
+                None,
+                &[],
+                &access_all(),
+                &repo_ref(),
+                &repo_ref(),
+            );
             assert_eq!(state.phase, Phase::PrePlan);
             assert!(outcome.transitions.is_empty());
             assert!(matches!(outcome.notes[0].kind, NoteKind::Retired));
@@ -2490,7 +2639,15 @@ mod tests {
         // A status comment may mention an approval command at line start.
         let body = crate::render::build_status_comment_body("/approve-pre-plan");
         let comments = [comment(1, &body, "2026-01-01T00:00:00Z")];
-        let outcome = advance_phase(&mut state, &comments, None, &[]);
+        let outcome = advance_phase(
+            &mut state,
+            &comments,
+            None,
+            &[],
+            &access_all(),
+            &repo_ref(),
+            &repo_ref(),
+        );
         assert_eq!(state.phase, Phase::PrePlan);
         assert!(outcome.transitions.is_empty());
         assert!(outcome.notes.is_empty());
@@ -2524,12 +2681,36 @@ mod tests {
         ]
         .into();
 
-        let new = collect_new_comments(&comments, &seen, "mine");
+        let (new, ignored) = collect_new_comments(&comments, &seen, "mine", &access_all(), "issue");
         assert_eq!(new.len(), 2);
         assert_eq!(new[0].comment.id, 2);
         assert!(new[0].updated);
         assert_eq!(new[1].comment.id, 3);
         assert!(!new[1].updated);
+        // The comment helper's author is the authenticated user, so nothing is
+        // ignored on acceptance grounds here.
+        assert!(ignored.is_empty());
+    }
+
+    #[test]
+    fn collect_new_comments_filters_non_allow_listed_authors() {
+        use super::collect_new_comments;
+        use std::collections::BTreeMap;
+
+        let mut stranger = comment(1, "drive-by", "2026-01-01T00:00:00Z");
+        stranger.user.login = "stranger".to_string();
+        stranger.author_association = "NONE".to_string();
+        let mine = comment(2, "from me", "2026-01-01T00:01:00Z");
+        let comments = [stranger, mine];
+        let seen: BTreeMap<u64, String> = BTreeMap::new();
+
+        // "user" is the authenticated user; "stranger" (NONE) is not allowed.
+        let access = crate::access::AccessList::new("user", &[]);
+        let (new, ignored) = collect_new_comments(&comments, &seen, "tok", &access, "issue");
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].comment.id, 2);
+        assert_eq!(ignored.len(), 1);
+        assert_eq!(ignored[0].by, "stranger");
     }
 
     #[test]
@@ -2556,7 +2737,15 @@ mod tests {
             comment(1, "/approve-pre-plan", "2026-01-01T00:00:00Z"),
             comment(2, &claude_body, "2026-01-01T00:01:00Z"),
         ];
-        let outcome = advance_phase(&mut state, &comments, None, &[]);
+        let outcome = advance_phase(
+            &mut state,
+            &comments,
+            None,
+            &[],
+            &access_all(),
+            &repo_ref(),
+            &repo_ref(),
+        );
         assert_eq!(state.phase, Phase::PrePlan);
         assert!(outcome.transitions.is_empty());
         assert!(outcome.notes.is_empty());
@@ -2570,7 +2759,15 @@ mod tests {
         // issue slice: the chronological merge must fire pre-plan's first.
         let issue = [comment(2, "/approve-plan", "2026-01-01T00:01:00Z")];
         let pr = [comment(1, "/approve-pre-plan", "2026-01-01T00:00:00Z")];
-        let outcome = advance_phase(&mut state, &issue, Some(&pr), &[]);
+        let outcome = advance_phase(
+            &mut state,
+            &issue,
+            Some(&pr),
+            &[],
+            &access_all(),
+            &repo_ref(),
+            &repo_ref(),
+        );
         assert_eq!(state.phase, Phase::Implement);
         assert_eq!(outcome.transitions.len(), 2);
         assert_eq!(
@@ -2589,7 +2786,15 @@ mod tests {
             Directive::ApprovePrePlan,
             vec![reaction(100, "+1", "2026-01-01T00:00:00Z")],
         )];
-        let outcome = advance_phase(&mut state, &[], None, &prompts);
+        let outcome = advance_phase(
+            &mut state,
+            &[],
+            None,
+            &prompts,
+            &access_all(),
+            &repo_ref(),
+            &repo_ref(),
+        );
         assert_eq!(state.phase, Phase::PrepAndPlan);
         assert_eq!(outcome.transitions.len(), 1);
         let (command, by, via_reaction) = directive_parts(&outcome.transitions[0]);
@@ -2598,7 +2803,15 @@ mod tests {
         assert_eq!(by, "reactor");
         assert!(state.consumed_reactions.contains(&100));
         // Re-running with the same reaction is a no-op.
-        let outcome = advance_phase(&mut state, &[], None, &prompts);
+        let outcome = advance_phase(
+            &mut state,
+            &[],
+            None,
+            &prompts,
+            &access_all(),
+            &repo_ref(),
+            &repo_ref(),
+        );
         assert_eq!(state.phase, Phase::PrepAndPlan);
         assert!(outcome.transitions.is_empty());
         assert!(outcome.notes.is_empty());
@@ -2613,13 +2826,71 @@ mod tests {
             Directive::ApprovePrePlan,
             vec![reaction(100, "+1", "2026-01-01T00:01:00Z")],
         )];
-        let outcome = advance_phase(&mut state, &comments, None, &prompts);
+        let outcome = advance_phase(
+            &mut state,
+            &comments,
+            None,
+            &prompts,
+            &access_all(),
+            &repo_ref(),
+            &repo_ref(),
+        );
         assert_eq!(state.phase, Phase::PrepAndPlan);
         assert_eq!(outcome.transitions.len(), 1);
         assert!(!directive_parts(&outcome.transitions[0]).2);
         assert_eq!(outcome.notes.len(), 1);
         assert!(matches!(outcome.notes[0].kind, NoteKind::Stale));
         assert!(outcome.notes[0].via_reaction);
+        assert!(state.consumed_reactions.contains(&100));
+    }
+
+    #[test]
+    fn non_allow_listed_directive_does_not_advance_but_is_consumed() {
+        let mut state = state_in(Phase::PrePlan);
+        let mut stranger = comment(1, "/approve-pre-plan", "2026-01-01T00:00:00Z");
+        stranger.user.login = "stranger".to_string();
+        stranger.author_association = "NONE".to_string();
+        // Only "user" is accepted; "stranger" (NONE) is not.
+        let access = crate::access::AccessList::new("user", &[]);
+        let outcome = advance_phase(
+            &mut state,
+            &[stranger],
+            None,
+            &[],
+            &access,
+            &repo_ref(),
+            &repo_ref(),
+        );
+        assert_eq!(state.phase, Phase::PrePlan);
+        assert!(outcome.transitions.is_empty());
+        // Consumed, so adding the author to the allow-list later can't make this
+        // old comment fire retroactively.
+        assert!(state.consumed_directives.contains(&1));
+    }
+
+    #[test]
+    fn non_allow_listed_thumbs_up_does_not_advance_and_is_noted() {
+        let mut state = state_in(Phase::PrePlan);
+        let prompts = [thumbs(
+            10,
+            Directive::ApprovePrePlan,
+            vec![reaction(100, "+1", "2026-01-01T00:00:00Z")],
+        )];
+        // The reaction author "reactor" is not accepted (no collaborators set).
+        let access = crate::access::AccessList::new("user", &[]);
+        let outcome = advance_phase(
+            &mut state,
+            &[],
+            None,
+            &prompts,
+            &access,
+            &repo_ref(),
+            &repo_ref(),
+        );
+        assert_eq!(state.phase, Phase::PrePlan);
+        assert!(outcome.transitions.is_empty());
+        assert_eq!(outcome.ignored.len(), 1);
+        assert_eq!(outcome.ignored[0].by, "reactor");
         assert!(state.consumed_reactions.contains(&100));
     }
 
@@ -2631,7 +2902,15 @@ mod tests {
             Directive::ApprovePlan,
             vec![reaction(100, "+1", "2026-01-01T00:00:00Z")],
         )];
-        let outcome = advance_phase(&mut state, &[], None, &prompts);
+        let outcome = advance_phase(
+            &mut state,
+            &[],
+            None,
+            &prompts,
+            &access_all(),
+            &repo_ref(),
+            &repo_ref(),
+        );
         assert_eq!(state.phase, Phase::PrePlan);
         assert!(outcome.transitions.is_empty());
         assert!(matches!(outcome.notes[0].kind, NoteKind::Premature));
@@ -2649,7 +2928,15 @@ mod tests {
                 reaction(101, "-1", "2026-01-01T00:01:00Z"),
             ],
         )];
-        let outcome = advance_phase(&mut state, &[], None, &prompts);
+        let outcome = advance_phase(
+            &mut state,
+            &[],
+            None,
+            &prompts,
+            &access_all(),
+            &repo_ref(),
+            &repo_ref(),
+        );
         assert_eq!(state.phase, Phase::PrePlan);
         assert!(outcome.transitions.is_empty());
         assert!(outcome.notes.is_empty());
@@ -2667,7 +2954,15 @@ mod tests {
             Directive::ApprovePrePlan,
             vec![reaction(100, "+1", "2026-01-01T00:00:00Z")],
         )];
-        let outcome = advance_phase(&mut state, &comments, None, &prompts);
+        let outcome = advance_phase(
+            &mut state,
+            &comments,
+            None,
+            &prompts,
+            &access_all(),
+            &repo_ref(),
+            &repo_ref(),
+        );
         assert_eq!(state.phase, Phase::Implement);
         assert_eq!(outcome.transitions.len(), 2);
         let (command, _, via_reaction) = directive_parts(&outcome.transitions[0]);
