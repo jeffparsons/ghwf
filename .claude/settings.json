@@ -1,11 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "Bash(ghwf create-issue-comment:*)",
-      "Bash(ghwf hand-off:*)",
-      "Bash(ghwf wait:*)",
-      "Bash(ghwf work-on:*)",
-      "Bash(ghwf worktree-path:*)"
+      "Bash(ghwf:*)"
     ]
   }
 }
