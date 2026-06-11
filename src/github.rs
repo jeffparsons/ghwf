@@ -127,6 +127,18 @@ pub fn add_assignee(owner: &str, repo: &str, number: u64, login: &str) -> Result
     gh_api_stdin(&["--method", "POST", &endpoint, "--input", "-"], &payload).map(|_| ())
 }
 
+/// The logins of a repo's collaborators (everyone with access — the owner,
+/// direct and outside collaborators, and team/org members with access),
+/// following pagination. Calling this needs push access to the repo, which the
+/// ghwf operator has.
+pub fn fetch_collaborators(owner: &str, repo: &str) -> Result<Vec<String>> {
+    let endpoint = format!("repos/{owner}/{repo}/collaborators?per_page=100");
+    let json = gh_api(&["--paginate", &endpoint])?;
+    let users: Vec<User> =
+        serde_json::from_str(&json).context("failed to parse collaborators JSON from `gh api`")?;
+    Ok(users.into_iter().map(|u| u.login).collect())
+}
+
 /// The login of the authenticated `gh` user.
 pub fn authenticated_user() -> Result<String> {
     let json = gh_api(&["user"])?;

@@ -381,12 +381,44 @@ pub struct DirectiveNote {
     pub via_reaction: bool,
 }
 
+/// A comment or 👍 reaction ghwf ignored because its author isn't allow-listed
+/// (not the operator, in `allowed_users`, or a repo collaborator).
+pub struct IgnoredInput {
+    /// The login of whoever posted it.
+    pub by: String,
+    /// Which conversation thread it was on ("issue" / "PR").
+    pub source: &'static str,
+    pub kind: IgnoredKind,
+}
+
+/// What kind of input was ignored, for the wording of its banner line.
+pub enum IgnoredKind {
+    Comment,
+    Reaction,
+}
+
+/// One banner line reporting an ignored, non-allow-listed input.
+fn render_ignored(ignored: &IgnoredInput) -> String {
+    let IgnoredInput { by, source, kind } = ignored;
+    match kind {
+        IgnoredKind::Comment => format!(
+            "Note: ignored a comment from {by} (on the {source}) — not allow-listed, \
+             so it was not surfaced."
+        ),
+        IgnoredKind::Reaction => format!(
+            "Note: ignored a 👍 reaction from {by} (on the {source}) — not allow-listed, \
+             so it did not advance the workflow."
+        ),
+    }
+}
+
 /// Render the phase banner shown atop `work-on` output: the current phase, any
 /// transitions and directive notes from this run, then the phase-specific `body`.
 pub fn render_phase_banner(
     phase: Phase,
     transitions: &[Transition],
     notes: &[DirectiveNote],
+    ignored: &[IgnoredInput],
     status_posted: bool,
     body: &str,
 ) -> String {
@@ -398,6 +430,10 @@ pub fn render_phase_banner(
 
     for note in notes {
         out.push_str(&format!("\n{}", render_note(note)));
+    }
+
+    for item in ignored {
+        out.push_str(&format!("\n{}", render_ignored(item)));
     }
     if status_posted {
         out.push_str(
@@ -933,7 +969,7 @@ mod tests {
             Phase::Implement,
             "/approve-plan",
         )];
-        let out = render_phase_banner(Phase::Implement, &transitions, &[], false, "body");
+        let out = render_phase_banner(Phase::Implement, &transitions, &[], &[], false, "body");
         assert!(out.contains(
             "Phase advanced: prep-and-plan → implement (triggered by `/approve-plan` from user)."
         ));
@@ -942,7 +978,7 @@ mod tests {
     #[test]
     fn banner_premature_note_suggests_current_command() {
         let notes = [note(NoteKind::Premature, "/approve-plan", Phase::PrePlan)];
-        let out = render_phase_banner(Phase::PrePlan, &[], &notes, false, "body");
+        let out = render_phase_banner(Phase::PrePlan, &[], &notes, &[], false, "body");
         assert!(out.contains("`/approve-plan` from user (on the PR) was ignored"));
         assert!(out.contains("only in the pre-plan phase"));
         assert!(out.contains("the command that advances it is `/approve-pre-plan`"));
@@ -951,7 +987,7 @@ mod tests {
     #[test]
     fn banner_retired_note_in_terminal_phase() {
         let notes = [note(NoteKind::Retired, "/proceed", Phase::Review)];
-        let out = render_phase_banner(Phase::Review, &[], &notes, false, "body");
+        let out = render_phase_banner(Phase::Review, &[], &notes, &[], false, "body");
         assert!(out.contains("`/proceed` is retired"));
         assert!(out.contains("there is nothing further to approve"));
     }
@@ -963,7 +999,7 @@ mod tests {
             "/approve-implementation",
             Phase::Implement,
         )];
-        let out = render_phase_banner(Phase::Implement, &[], &notes, false, "body");
+        let out = render_phase_banner(Phase::Implement, &[], &notes, &[], false, "body");
         assert!(out.contains("`/approve-implementation` is retired"));
         assert!(out.contains("marking the draft PR ready for review advances it"));
     }
@@ -975,7 +1011,7 @@ mod tests {
             to: Phase::Review,
             trigger: Trigger::PrReady,
         }];
-        let out = render_phase_banner(Phase::Review, &transitions, &[], false, "body");
+        let out = render_phase_banner(Phase::Review, &transitions, &[], &[], false, "body");
         assert!(out.contains(
             "Phase advanced: implement → review (triggered by the PR being marked ready \
              for review)."
@@ -984,9 +1020,9 @@ mod tests {
 
     #[test]
     fn banner_status_posted_line_only_when_posted() {
-        let out = render_phase_banner(Phase::Implement, &[], &[], true, "body");
+        let out = render_phase_banner(Phase::Implement, &[], &[], &[], true, "body");
         assert!(out.contains("posted a status update"));
-        let out = render_phase_banner(Phase::Implement, &[], &[], false, "body");
+        let out = render_phase_banner(Phase::Implement, &[], &[], &[], false, "body");
         assert!(!out.contains("posted a status update"));
     }
 
@@ -1001,7 +1037,7 @@ mod tests {
                 via_reaction: true,
             },
         }];
-        let out = render_phase_banner(Phase::PrepAndPlan, &transitions, &[], false, "body");
+        let out = render_phase_banner(Phase::PrepAndPlan, &transitions, &[], &[], false, "body");
         assert!(out.contains(
             "Phase advanced: pre-plan → prep-and-plan (triggered by a 👍 reaction from user, \
              equivalent to `/approve-pre-plan`)."
@@ -1016,7 +1052,7 @@ mod tests {
             Phase::PrepAndPlan,
         )];
         notes[0].via_reaction = true;
-        let out = render_phase_banner(Phase::PrepAndPlan, &[], &notes, false, "body");
+        let out = render_phase_banner(Phase::PrepAndPlan, &[], &notes, &[], false, "body");
         assert!(out.contains(
             "Note: A 👍 reaction (equivalent to `/approve-pre-plan`) from user (on the PR) \
              was ignored"

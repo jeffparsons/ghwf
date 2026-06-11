@@ -7,7 +7,7 @@ use serde::Deserialize;
 use crate::github::{self, Conditional, RepoRef};
 use crate::models::{Comment, Issue, PullRequest, Reaction, ReviewComment, User};
 use crate::state::{self, OptionsWatch, PostedRef, ReactionWatch, WaitState};
-use crate::{render, store};
+use crate::{access, config, render, store};
 
 /// Exit code when the timeout elapses with nothing new (exit 0 = activity
 /// detected, exit 1 = error).
@@ -51,6 +51,26 @@ pub fn run(issue: &str, timeout_secs: u64) -> Result<()> {
         _ => None,
     };
 
+    // The same allow-list `work-on` enforces, so non-allow-listed comments and
+    // 👍 reactions don't even wake the session (each wake costs a Claude turn).
+    // `work-on` remains authoritative; this is just the wake gate. Resolve once;
+    // pre-fetch collaborators for both repos (reactions can arrive any time),
+    // best-effort so a missing permission degrades gracefully rather than
+    // breaking the wait.
+    let allowed_users = config::find()?
+        .map(|located| located.config.allowed_users)
+        .unwrap_or_default();
+    let mut access = access::AccessList::resolve(&allowed_users)?;
+    for repo in [&issue_repo, &code_repo] {
+        if let Err(err) = access.ensure_collaborators(repo) {
+            eprintln!(
+                "warning: couldn't fetch collaborators for {}/{} ({err:#}); a \
+                 collaborator's 👍 may not wake the wait until the next sweep.",
+                repo.0, repo.1
+            );
+        }
+    }
+
     let endpoints = poll_endpoints(&issue_repo, &code_repo, number, pr_number, &wait_state);
     // The reaction and options watches again, on their own: the events feed is
     // structurally blind to a reaction or a checkbox edit on a hidden comment,
@@ -91,7 +111,7 @@ pub fn run(issue: &str, timeout_secs: u64) -> Result<()> {
     loop {
         // One cycle in the current mode; its result decides reasons and pace.
         let cycle = match &mut mode {
-            Mode::Direct => direct_cycle(&endpoints, &mut wait_state, my_token.as_deref()),
+            Mode::Direct => direct_cycle(&endpoints, &mut wait_state, my_token.as_deref(), &access),
             Mode::Feed {
                 last_sweep,
                 interval,
@@ -99,7 +119,7 @@ pub fn run(issue: &str, timeout_secs: u64) -> Result<()> {
                 if last_sweep.elapsed() >= FEED_SWEEP_INTERVAL {
                     // The lag backstop: a full direct cycle, on schedule.
                     *last_sweep = Instant::now();
-                    direct_cycle(&endpoints, &mut wait_state, my_token.as_deref())
+                    direct_cycle(&endpoints, &mut wait_state, my_token.as_deref(), &access)
                 } else {
                     feed_cycle(
                         &feed_endpoint,
@@ -107,12 +127,17 @@ pub fn run(issue: &str, timeout_secs: u64) -> Result<()> {
                         number,
                         pr_number,
                         my_token.as_deref(),
+                        &access,
                         interval,
                     )
                     .and_then(|mut outcome| {
                         // The feed can't show reactions; poll the watches too.
-                        let reactions =
-                            direct_cycle(&watch_endpoints, &mut wait_state, my_token.as_deref())?;
+                        let reactions = direct_cycle(
+                            &watch_endpoints,
+                            &mut wait_state,
+                            my_token.as_deref(),
+                            &access,
+                        )?;
                         outcome.reasons.extend(reactions.reasons);
                         outcome.fresh |= reactions.fresh;
                         Ok(outcome)
@@ -171,6 +196,7 @@ pub fn run(issue: &str, timeout_secs: u64) -> Result<()> {
                 pr_number,
                 last_posted.as_ref(),
                 my_token.as_deref(),
+                &access,
             ) {
                 Ok(FeedEntry::Wake(reasons)) => {
                     persist(&owner, &repo, number, &mut issue_state, &wait_state);
@@ -218,9 +244,7 @@ pub fn run(issue: &str, timeout_secs: u64) -> Result<()> {
     }
 
     persist(&owner, &repo, number, &mut issue_state, &wait_state);
-    println!(
-        "No new activity within {timeout_secs} s. Run `ghwf wait` again to keep waiting."
-    );
+    println!("No new activity within {timeout_secs} s. Run `ghwf wait` again to keep waiting.");
     std::process::exit(EXIT_TIMEOUT);
 }
 
@@ -406,6 +430,7 @@ fn direct_cycle(
     endpoints: &[Endpoint],
     wait: &mut WaitState,
     my_token: Option<&str>,
+    access: &access::AccessList,
 ) -> Result<CycleOutcome> {
     let mut outcome = CycleOutcome::default();
     for endpoint in endpoints {
@@ -417,7 +442,14 @@ fn direct_cycle(
                 if let Some(etag) = etag {
                     wait.etags.insert(endpoint.key.to_string(), etag);
                 }
-                evaluate_fresh(endpoint, &body, wait, my_token, &mut outcome.reasons)?;
+                evaluate_fresh(
+                    endpoint,
+                    &body,
+                    wait,
+                    my_token,
+                    access,
+                    &mut outcome.reasons,
+                )?;
             }
         }
     }
@@ -431,6 +463,7 @@ fn evaluate_fresh(
     body: &str,
     wait: &WaitState,
     my_token: Option<&str>,
+    access: &access::AccessList,
     reasons: &mut Vec<String>,
 ) -> Result<()> {
     match &endpoint.kind {
@@ -477,7 +510,7 @@ fn evaluate_fresh(
         EndpointKind::Conversation(noun) => {
             let comments: Vec<Comment> = serde_json::from_str(body)
                 .with_context(|| format!("failed to parse comments JSON from {}", endpoint.url))?;
-            comment_reasons(&comments, noun, &wait.comments, my_token, reasons);
+            comment_reasons(&comments, noun, &wait.comments, my_token, access, reasons);
         }
         EndpointKind::Reactions(thread) => {
             let reactions: Vec<Reaction> = serde_json::from_str(body)
@@ -494,6 +527,11 @@ fn evaluate_fresh(
                     continue;
                 }
                 if baseline.is_some_and(|ids| ids.contains(&reaction.id)) {
+                    continue;
+                }
+                // A non-allow-listed 👍 never advances the workflow, so don't
+                // wake the session for it.
+                if !access.accepts_reaction_any(&reaction.user.login) {
                     continue;
                 }
                 reasons.push(format!(
@@ -525,6 +563,9 @@ fn evaluate_fresh(
                 if render::hidden_from_digest(&comment.body, my_token) {
                     continue;
                 }
+                if !access.accepts_comment(&comment.user.login, &comment.author_association) {
+                    continue;
+                }
                 let hash = store::content_hash(&comment.body);
                 match wait.review_comments.get(&comment.id) {
                     Some(known) if *known == hash => {}
@@ -554,10 +595,16 @@ fn comment_reasons(
     noun: &str,
     baseline: &BTreeMap<u64, String>,
     my_token: Option<&str>,
+    access: &access::AccessList,
     reasons: &mut Vec<String>,
 ) {
     for comment in comments {
         if render::hidden_from_digest(&comment.body, my_token) {
+            continue;
+        }
+        // A non-allow-listed comment isn't surfaced by `work-on`, so don't wake
+        // the session for it either.
+        if !access.accepts_comment(&comment.user.login, &comment.author_association) {
             continue;
         }
         let hash = store::content_hash(&comment.body);
@@ -612,6 +659,10 @@ struct FeedComment {
     id: u64,
     body: String,
     user: User,
+    // The events feed's comment payload carries the author's association, so the
+    // allow-list gate works in feed mode too.
+    #[serde(default)]
+    author_association: String,
 }
 
 /// Attempt the handover to feed mode: one unconditional feed fetch, evaluated
@@ -623,6 +674,7 @@ fn enter_feed_mode(
     pr: Option<u64>,
     last_posted: Option<&PostedRef>,
     my_token: Option<&str>,
+    access: &access::AccessList,
 ) -> Result<FeedEntry> {
     // Unconditional: the trust gate needs page content, not a 304.
     let Conditional::Fresh {
@@ -639,7 +691,7 @@ fn enter_feed_mode(
     let events: Vec<FeedEvent> =
         serde_json::from_str(&body).context("failed to parse events feed JSON")?;
 
-    let reasons = feed_wake_reasons(&events, number, pr, &wait.since, my_token);
+    let reasons = feed_wake_reasons(&events, number, pr, &wait.since, my_token, access);
     if !reasons.is_empty() {
         return Ok(FeedEntry::Wake(reasons));
     }
@@ -656,6 +708,7 @@ fn feed_cycle(
     number: u64,
     pr: Option<u64>,
     my_token: Option<&str>,
+    access: &access::AccessList,
     interval: &mut Duration,
 ) -> Result<CycleOutcome> {
     let etag = wait.etags.get("events").cloned();
@@ -676,7 +729,7 @@ fn feed_cycle(
             let events: Vec<FeedEvent> =
                 serde_json::from_str(&body).context("failed to parse events feed JSON")?;
             Ok(CycleOutcome {
-                reasons: feed_wake_reasons(&events, number, pr, &wait.since, my_token),
+                reasons: feed_wake_reasons(&events, number, pr, &wait.since, my_token, access),
                 // Fresh here means *some* repo activity, not necessarily ours;
                 // don't let unrelated churn reset the direct backoff.
                 fresh: false,
@@ -700,6 +753,7 @@ fn feed_wake_reasons(
     pr: Option<u64>,
     since: &str,
     my_token: Option<&str>,
+    access: &access::AccessList,
 ) -> Vec<String> {
     let ours = |subject: &Option<FeedSubject>| {
         subject
@@ -719,6 +773,9 @@ fn feed_wake_reasons(
                 if render::hidden_from_digest(&comment.body, my_token) {
                     continue;
                 }
+                if !access.accepts_comment(&comment.user.login, &comment.author_association) {
+                    continue;
+                }
                 let noun = match (&event.payload.issue, pr) {
                     (Some(subject), Some(pr)) if subject.number == pr => "PR thread",
                     _ => "issue thread",
@@ -733,6 +790,9 @@ fn feed_wake_reasons(
                     continue;
                 };
                 if render::hidden_from_digest(&comment.body, my_token) {
+                    continue;
+                }
+                if !access.accepts_comment(&comment.user.login, &comment.author_association) {
                     continue;
                 }
                 reasons.push(format!(
@@ -834,10 +894,18 @@ mod tests {
         comment_reasons, evaluate_fresh, feed_interval, feed_trusted, feed_wake_reasons, Endpoint,
         EndpointKind, FeedComment, FeedEvent, FeedPayload, FeedSubject,
     };
+    use crate::access::AccessList;
     use crate::models::{Comment, User};
     use crate::state::{PostedRef, ReactionWatch, WaitState};
     use std::collections::BTreeMap;
     use std::time::Duration;
+
+    // An accept-all policy for the existing wake tests: the test comments carry
+    // an OWNER association (accepted as collaborators), and the reaction helper's
+    // author ("reactor") is allow-listed.
+    fn access_all() -> AccessList {
+        AccessList::new("user", &["reactor".to_string()])
+    }
 
     fn comment(id: u64, body: &str) -> Comment {
         Comment {
@@ -869,6 +937,7 @@ mod tests {
             "issue thread",
             &baseline(&[]),
             Some("tok"),
+            &access_all(),
             &mut reasons,
         );
         assert_eq!(reasons.len(), 1);
@@ -884,6 +953,7 @@ mod tests {
             "issue thread",
             &baseline(&[(5, "hello")]),
             Some("tok"),
+            &access_all(),
             &mut reasons,
         );
         assert!(reasons.is_empty());
@@ -897,6 +967,7 @@ mod tests {
             "PR thread",
             &baseline(&[(5, "hello")]),
             Some("tok"),
+            &access_all(),
             &mut reasons,
         );
         assert_eq!(reasons.len(), 1);
@@ -918,6 +989,7 @@ mod tests {
             "issue thread",
             &baseline(&[]),
             Some("tok"),
+            &access_all(),
             &mut reasons,
         );
         // Only the other session's comment is activity.
@@ -959,6 +1031,7 @@ mod tests {
             &body.to_string(),
             &wait,
             Some("tok"),
+            &access_all(),
             &mut reasons,
         )
         .unwrap();
@@ -983,6 +1056,45 @@ mod tests {
     fn non_thumbs_up_reactions_do_not_wake() {
         let body = serde_json::json!([reaction_json(100, "heart"), reaction_json(101, "rocket")]);
         assert!(reaction_reasons(body, &[]).is_empty());
+    }
+
+    #[test]
+    fn non_allow_listed_thumbs_up_does_not_wake() {
+        // "reactor" is not the operator, allow-listed, or a known collaborator.
+        let endpoint = Endpoint {
+            key: "reactions_issue",
+            url: "repos/o/r/issues/comments/9/reactions?per_page=100".to_string(),
+            kind: EndpointKind::Reactions("issue"),
+        };
+        let wait = WaitState::default();
+        let mut reasons = Vec::new();
+        evaluate_fresh(
+            &endpoint,
+            &serde_json::json!([reaction_json(100, "+1")]).to_string(),
+            &wait,
+            Some("tok"),
+            &AccessList::new("someone-else", &[]),
+            &mut reasons,
+        )
+        .unwrap();
+        assert!(reasons.is_empty());
+    }
+
+    #[test]
+    fn non_allow_listed_comment_does_not_wake() {
+        let mut stranger = comment(5, "drive-by");
+        stranger.user.login = "stranger".to_string();
+        stranger.author_association = "NONE".to_string();
+        let mut reasons = Vec::new();
+        comment_reasons(
+            &[stranger],
+            "issue thread",
+            &baseline(&[]),
+            Some("tok"),
+            &AccessList::new("user", &[]),
+            &mut reasons,
+        );
+        assert!(reasons.is_empty());
     }
 
     /// Run `evaluate_fresh` for an issue-thread options endpoint against a
@@ -1016,6 +1128,7 @@ mod tests {
             &body.to_string(),
             &wait,
             Some("tok"),
+            &access_all(),
             &mut reasons,
         )
         .unwrap();
@@ -1075,6 +1188,7 @@ mod tests {
             &body.to_string(),
             &WaitState::default(),
             Some("tok"),
+            &access_all(),
             &mut reasons,
         )
         .unwrap();
@@ -1123,6 +1237,7 @@ mod tests {
             &body.to_string(),
             &wait,
             Some("tok"),
+            &access_all(),
             &mut reasons,
         )
         .unwrap();
@@ -1169,10 +1284,10 @@ mod tests {
     #[test]
     fn feed_wakes_on_pr_closed_event() {
         let events = [feed_pr_event(18, "closed", true, "2026-06-06T13:00:00Z")];
-        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, None);
+        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, None, &access_all());
         assert_eq!(reasons, ["The PR was merged (via the events feed)."]);
         let events = [feed_pr_event(18, "closed", false, "2026-06-06T13:00:00Z")];
-        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, None);
+        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, None, &access_all());
         assert_eq!(
             reasons,
             ["The PR was closed without merging (via the events feed)."]
@@ -1187,7 +1302,7 @@ mod tests {
             false,
             "2026-06-06T13:00:00Z",
         )];
-        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, None);
+        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, None, &access_all());
         assert_eq!(
             reasons,
             ["The PR was marked ready for review (via the events feed)."]
@@ -1198,7 +1313,7 @@ mod tests {
             false,
             "2026-06-06T13:00:00Z",
         )];
-        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, None);
+        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, None, &access_all());
         assert_eq!(
             reasons,
             ["The PR was converted back to draft (via the events feed)."]
@@ -1216,7 +1331,7 @@ mod tests {
             // Ours and closed, but before the watermark.
             feed_pr_event(18, "closed", true, "2026-06-06T11:00:00Z"),
         ];
-        assert!(feed_wake_reasons(&events, 7, Some(18), SINCE, None).is_empty());
+        assert!(feed_wake_reasons(&events, 7, Some(18), SINCE, None, &access_all()).is_empty());
     }
 
     fn feed_comment_event(issue: u64, comment_id: u64, body: &str, at: &str) -> FeedEvent {
@@ -1236,6 +1351,7 @@ mod tests {
                     user: User {
                         login: "user".to_string(),
                     },
+                    author_association: "OWNER".to_string(),
                 }),
             },
         }
@@ -1246,12 +1362,12 @@ mod tests {
     #[test]
     fn feed_wakes_on_matching_comment_event() {
         let events = [feed_comment_event(7, 1, "hi", "2026-06-06T13:00:00Z")];
-        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, Some("tok"));
+        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, Some("tok"), &access_all());
         assert_eq!(reasons.len(), 1);
         assert!(reasons[0].contains("issue thread"));
         // The PR thread is named when the event is for the PR's number.
         let events = [feed_comment_event(18, 1, "hi", "2026-06-06T13:00:00Z")];
-        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, Some("tok"));
+        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, Some("tok"), &access_all());
         assert!(reasons[0].contains("PR thread"));
     }
 
@@ -1266,7 +1382,9 @@ mod tests {
             // Ours and fresh, but our own post.
             feed_comment_event(7, 3, &own, "2026-06-06T13:00:00Z"),
         ];
-        assert!(feed_wake_reasons(&events, 7, Some(18), SINCE, Some("tok")).is_empty());
+        assert!(
+            feed_wake_reasons(&events, 7, Some(18), SINCE, Some("tok"), &access_all()).is_empty()
+        );
     }
 
     #[test]
@@ -1284,7 +1402,7 @@ mod tests {
                 comment: None,
             },
         }];
-        let reasons = feed_wake_reasons(&events, 7, None, SINCE, None);
+        let reasons = feed_wake_reasons(&events, 7, None, SINCE, None, &access_all());
         assert_eq!(reasons.len(), 1);
         assert!(reasons[0].contains("closed"));
     }
@@ -1313,18 +1431,18 @@ mod tests {
             feed_issue_event(7, "unlabeled", "2026-06-06T13:00:01Z"),
             feed_issue_event(7, "assigned", "2026-06-06T13:00:02Z"),
         ];
-        assert!(feed_wake_reasons(&events, 7, None, SINCE, None).is_empty());
+        assert!(feed_wake_reasons(&events, 7, None, SINCE, None, &access_all()).is_empty());
     }
 
     #[test]
     fn feed_wakes_on_issue_edited_and_reopened() {
         let edited = [feed_issue_event(7, "edited", "2026-06-06T13:00:00Z")];
-        let reasons = feed_wake_reasons(&edited, 7, None, SINCE, None);
+        let reasons = feed_wake_reasons(&edited, 7, None, SINCE, None, &access_all());
         assert_eq!(reasons.len(), 1);
         assert!(reasons[0].contains("edited"));
 
         let reopened = [feed_issue_event(7, "reopened", "2026-06-06T13:00:00Z")];
-        let reasons = feed_wake_reasons(&reopened, 7, None, SINCE, None);
+        let reasons = feed_wake_reasons(&reopened, 7, None, SINCE, None, &access_all());
         assert_eq!(reasons.len(), 1);
         assert!(reasons[0].contains("reopened"));
     }

@@ -294,6 +294,27 @@ pub fn run() -> Result<()> {
         }
     }
 
+    if !doc.contains_key("allowed_users")
+        && prompt(
+            Confirm::new(
+                "Allow-list extra users to drive the workflow via comments/👍? \
+                 (you and repo collaborators are always accepted)",
+            )
+            .with_default(false)
+            .prompt(),
+        )?
+    {
+        let input =
+            prompt(Text::new("Additional allowed GitHub logins, comma-separated:").prompt())?;
+        let allowed_users = parse_allowed_users(&input);
+        if allowed_users.is_empty() {
+            println!("No logins given; skipping.");
+        } else {
+            set_allowed_users(&mut doc, &allowed_users);
+            doc_changed = true;
+        }
+    }
+
     if !doc.contains_key("labels") {
         if prompt(
             Confirm::new("Set up workflow status labels now? (creates labels in the GitHub repo)")
@@ -586,6 +607,29 @@ fn parse_issue_repos(input: &str) -> Vec<String> {
         .split(',')
         .map(str::trim)
         .filter(|repo| !repo.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Write the `allowed_users` key as an array of GitHub logins.
+fn set_allowed_users(doc: &mut DocumentMut, allowed_users: &[String]) {
+    let array: toml_edit::Array = allowed_users.iter().map(String::as_str).collect();
+    insert_with_comment(
+        doc,
+        "allowed_users",
+        toml_edit::value(array),
+        "GitHub logins whose comments and 👍 reactions ghwf acts on, in addition\n\
+         to you (the authenticated user) and repo collaborators. Everyone else's\n\
+         comments and reactions are ignored. Matched case-insensitively.",
+    );
+}
+
+/// Parse the comma-separated allowed-users answer: trimmed, empties dropped.
+fn parse_allowed_users(input: &str) -> Vec<String> {
+    input
+        .split(',')
+        .map(str::trim)
+        .filter(|login| !login.is_empty())
         .map(str::to_string)
         .collect()
 }

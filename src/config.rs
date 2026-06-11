@@ -65,6 +65,17 @@ pub struct Config {
     /// plain `"owner/repo"` string or a table with an optional `branch_prefix`.
     #[serde(default)]
     pub issue_repos: Vec<IssueRepo>,
+    /// GitHub logins whose comments and 👍 reactions ghwf acts on, in addition
+    /// to the always-accepted authenticated user and the repo's collaborators
+    /// (anyone with an OWNER / MEMBER / COLLABORATOR association). Everyone
+    /// else's comments and reactions are ignored, so a public repo's workflow
+    /// can't be driven by strangers. Matched case-insensitively; empty by
+    /// default. Note: a 👍 reaction carries no association, so collaborator
+    /// auto-accept for reactions is resolved via the repo's collaborator list —
+    /// an org member with no repo access is accepted on a typed comment but not
+    /// on a bare 👍, and should be listed here (or use the `/approve-*` comment).
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
 }
 
 /// An entry in [`Config::issue_repos`]: a foreign repo whose issues may be
