@@ -444,6 +444,86 @@ fn qualify_bare_number(arg: &str, bound: Option<&str>) -> Option<String> {
     Some(format!("https://github.com/{owner}/{repo}/issues/{arg}"))
 }
 
+/// Parse a ghwf issue (or PR) URL into `(owner, repo, number)`. Pure: a bound
+/// issue is always a full URL produced by ghwf, so no network call is needed.
+/// Returns `None` when the value isn't a URL we can read all three parts from.
+fn parse_issue_url(url: &str) -> Option<(String, String, u64)> {
+    let (owner, repo) = github::parse_owner_repo(url).ok()?;
+    // The number is the final path segment (`…/issues/N` or `…/pull/N`).
+    let number = url.rsplit('/').next()?.parse::<u64>().ok()?;
+    Some((owner, repo, number))
+}
+
+/// Guard against an in-session command acting on a thread outside the bound
+/// issue's workflow — the wrong-repo footgun from #90.
+///
+/// `target` is the workflow issue the command resolved to act on (a PR thread is
+/// already mapped back to its issue by `find_workflow_issue`), or `None` when the
+/// named thread is not a tracked workflow at all. `bound` is the bound issue URL
+/// (`$GHWF_ISSUE` or worktree state). A no-op when there is no bound issue
+/// (nothing to compare against) or it can't be parsed (stay lenient, as
+/// `qualify_bare_number` does); otherwise the two must name the same issue or the
+/// command bails.
+fn ensure_target_matches_bound(
+    target: Option<(&str, &str, u64)>,
+    bound: Option<&str>,
+) -> Result<()> {
+    let Some((b_owner, b_repo, b_number)) = bound.and_then(parse_issue_url) else {
+        return Ok(());
+    };
+    if target == Some((b_owner.as_str(), b_repo.as_str(), b_number)) {
+        return Ok(());
+    }
+    let target_desc = match target {
+        Some((owner, repo, number)) => format!("`{owner}/{repo}#{number}`"),
+        None => "a thread with no recorded ghwf workflow".to_string(),
+    };
+    bail!(
+        "explicit target {target_desc} does not match this session's issue \
+         `{b_owner}/{b_repo}#{b_number}`; in-session commands act on the bound \
+         issue — omit the argument, or pass the bound issue's URL or number."
+    )
+}
+
+/// Format the one-line resolved-target banner printed before a mutation.
+/// `title_state` carries the issue's title and `OPEN`/`CLOSED` state when a fetch
+/// succeeded; absent, the line degrades to just the identity.
+fn format_target_line(
+    owner: &str,
+    repo: &str,
+    number: u64,
+    title_state: Option<(&str, &str)>,
+) -> String {
+    match title_state {
+        Some((title, state)) => {
+            format!(
+                "→ {owner}/{repo}#{number} \"{title}\" ({})",
+                state.to_uppercase()
+            )
+        }
+        None => format!("→ {owner}/{repo}#{number}"),
+    }
+}
+
+/// Echo the resolved target to stderr before a mutation, so a misroute is visible
+/// to both the model and a watching human (#90). Best-effort: a failed title/state
+/// fetch downgrades the line to the bare identity rather than blocking the post.
+/// Always stderr, so it never pollutes the JSON the comment commands write to
+/// stdout.
+fn echo_target(owner: &str, repo: &str, number: u64, repo_ctx: Option<&github::RepoRef>) {
+    let url = format!("https://github.com/{owner}/{repo}/issues/{number}");
+    let title_state = github::fetch_issue(&url, repo_ctx)
+        .ok()
+        .map(|issue| (issue.title, issue.state));
+    let line = format_target_line(
+        owner,
+        repo,
+        number,
+        title_state.as_ref().map(|(t, s)| (t.as_str(), s.as_str())),
+    );
+    eprintln!("{line}");
+}
+
 /// Print the absolute worktree path recorded for an issue (for scripts and the
 /// `/work-on` slash command). Errors if no worktree has been created yet.
 fn worktree_path(issue: &str) -> Result<()> {
@@ -1577,8 +1657,18 @@ fn create_issue_comment(issue: &str, attach: &[PathBuf]) -> Result<()> {
     // Upload any attachments into the issue's own repo (where the comment lives)
     // before posting, so a failed upload never leaves broken links.
     let (owner, repo, number) = github::resolve_issue_ref(issue, repo_ctx.as_ref())?;
+    // Refuse to post to a thread outside the bound issue's workflow (#90): when a
+    // bound issue exists, the named thread must map back to it.
+    if let Some(bound) = infer_issue_arg()? {
+        let workflow = state::find_workflow_issue(&owner, &repo, number)?;
+        let target = workflow
+            .as_ref()
+            .map(|(workflow_number, _)| (owner.as_str(), repo.as_str(), *workflow_number));
+        ensure_target_matches_bound(target, Some(bound.as_str()))?;
+    }
     let user_body = append_attachments(&owner, &repo, number, &user_body, attach)?;
     let body = render::build_comment_body(&user_body, token.as_deref());
+    echo_target(&owner, &repo, number, repo_ctx.as_ref());
     let comment = github::post_issue_comment(issue, &body, repo_ctx.as_ref())?;
 
     // Remember the post for feed-lag self-calibration in `wait`, best-effort.
@@ -1749,6 +1839,8 @@ fn hand_off(issue: &str, question: bool, attach: &[PathBuf]) -> Result<()> {
              `ghwf work-on` first."
         );
     };
+    // Refuse to hand off against a thread outside the bound issue's workflow (#90).
+    ensure_target_matches_bound(Some((&owner, &repo, number)), infer_issue_arg()?.as_deref())?;
 
     if issue_state.pr_outcome.is_some() {
         bail!(
@@ -1807,6 +1899,7 @@ fn hand_off(issue: &str, question: bool, attach: &[PathBuf]) -> Result<()> {
         _ => render::build_comment_body(&user_body, token.as_deref()),
     };
 
+    echo_target(&owner, &repo, number, repo_ctx.as_ref());
     let comment = github::post_issue_comment(&primary_subject, &full_body, repo_ctx.as_ref())?;
     if let Some(pr) = pr_number {
         let (secondary_subject, secondary_noun, primary_noun) = if primary_is_pr {
@@ -1893,6 +1986,8 @@ fn ask(issue: &str, options: &[String]) -> Result<()> {
              `ghwf work-on` first."
         );
     };
+    // Refuse to ask against a thread outside the bound issue's workflow (#90).
+    ensure_target_matches_bound(Some((&owner, &repo, number)), infer_issue_arg()?.as_deref())?;
     if issue_state.pr_outcome.is_some() {
         bail!(
             "the workflow for issue #{number} has concluded (its PR was merged or \
@@ -1923,6 +2018,7 @@ fn ask(issue: &str, options: &[String]) -> Result<()> {
     } else {
         issue_subject.clone()
     };
+    echo_target(&owner, &repo, number, repo_ctx.as_ref());
     let comment = github::post_issue_comment(&primary_subject, &full_body, repo_ctx.as_ref())?;
     if let Some(pr) = pr_number {
         let (secondary_subject, secondary_noun, primary_noun) = if primary_is_pr {
@@ -2015,8 +2111,9 @@ fn record_last_posted(
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_on_pr_ready, advance_phase, assemble_labels, latest_prompt_watch,
-        needs_worktree_guard, qualify_bare_number, AdvanceOutcome, Cli, PromptThumbs,
+        advance_on_pr_ready, advance_phase, assemble_labels, ensure_target_matches_bound,
+        format_target_line, latest_prompt_watch, needs_worktree_guard, parse_issue_url,
+        qualify_bare_number, AdvanceOutcome, Cli, PromptThumbs,
     };
     use crate::models::{Comment, PullRequest, Reaction, User};
     use crate::render::{NoteKind, Transition, Trigger};
@@ -2055,6 +2152,84 @@ mod tests {
         // A bound value we can't read an owner/repo from must not crash the
         // command — leave the argument as the caller gave it.
         assert_eq!(qualify_bare_number("42", Some("not-a-url")), None);
+    }
+
+    #[test]
+    fn parse_issue_url_reads_owner_repo_and_number() {
+        // Both the issue and PR URL shapes yield all three parts…
+        assert_eq!(
+            parse_issue_url("https://github.com/owner-a/repo-a/issues/100"),
+            Some(("owner-a".to_string(), "repo-a".to_string(), 100))
+        );
+        assert_eq!(
+            parse_issue_url("https://github.com/owner-a/repo-a/pull/7"),
+            Some(("owner-a".to_string(), "repo-a".to_string(), 7))
+        );
+        // …and a value we can't read all three from yields None rather than panicking.
+        assert_eq!(parse_issue_url("not-a-url"), None);
+    }
+
+    #[test]
+    fn target_matching_the_bound_issue_is_allowed() {
+        // The resolved workflow issue names the same issue as the bound URL.
+        let bound = "https://github.com/owner-a/repo-a/issues/100";
+        assert!(ensure_target_matches_bound(Some(("owner-a", "repo-a", 100)), Some(bound)).is_ok());
+    }
+
+    #[test]
+    fn target_in_a_different_repo_is_refused() {
+        // The report's bug: a same-numbered object in another repo must not pass.
+        let bound = "https://github.com/owner-a/repo-a/issues/100";
+        assert!(
+            ensure_target_matches_bound(Some(("owner-b", "repo-b", 100)), Some(bound)).is_err()
+        );
+    }
+
+    #[test]
+    fn target_with_a_different_number_is_refused() {
+        // Same repo, wrong issue — a sibling issue is still a misroute.
+        let bound = "https://github.com/owner-a/repo-a/issues/100";
+        assert!(ensure_target_matches_bound(Some(("owner-a", "repo-a", 42)), Some(bound)).is_err());
+    }
+
+    #[test]
+    fn target_with_no_recorded_workflow_is_refused() {
+        // A bound issue exists but the named thread isn't a tracked workflow
+        // (the closed dependabot PR in the report) — refuse.
+        let bound = "https://github.com/owner-a/repo-a/issues/100";
+        assert!(ensure_target_matches_bound(None, Some(bound)).is_err());
+    }
+
+    #[test]
+    fn no_bound_issue_skips_validation() {
+        // Nothing to compare against (e.g. a standalone, non-session command):
+        // any target — even none — is allowed.
+        assert!(ensure_target_matches_bound(Some(("owner-b", "repo-b", 7)), None).is_ok());
+        assert!(ensure_target_matches_bound(None, None).is_ok());
+    }
+
+    #[test]
+    fn unparseable_bound_skips_validation() {
+        // An unreadable bound value stays lenient, matching qualify_bare_number.
+        assert!(
+            ensure_target_matches_bound(Some(("owner-b", "repo-b", 7)), Some("not-a-url")).is_ok()
+        );
+    }
+
+    #[test]
+    fn target_line_includes_title_and_state_when_known() {
+        assert_eq!(
+            format_target_line("owner-a", "repo-a", 100, Some(("Fix the thing", "open"))),
+            "→ owner-a/repo-a#100 \"Fix the thing\" (OPEN)"
+        );
+    }
+
+    #[test]
+    fn target_line_degrades_to_identity_without_a_fetch() {
+        assert_eq!(
+            format_target_line("owner-a", "repo-a", 100, None),
+            "→ owner-a/repo-a#100"
+        );
     }
 
     #[test]

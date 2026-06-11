@@ -77,7 +77,13 @@ outside-Claude launcher), so later `work-on` runs don't need the flag repeated.
 The issue argument is optional everywhere it appears: when omitted, ghwf falls
 back to `$GHWF_ISSUE` (set on sessions started by the launcher below), then to
 the issue whose recorded worktree contains the current directory. An explicit
-argument always wins.
+argument otherwise wins — with one guard: the comment-posting commands
+(`create-issue-comment`, `hand-off`, `ask`) refuse an explicit target that
+names a different workflow than the session's bound issue, so a stray issue
+number or a URL built from the wrong repo can't silently post to the wrong
+place. A bare number is anchored to the bound issue's repo (not the cwd's git
+remote) before this check. Each of these commands also echoes its resolved
+target (`→ owner/repo#N "title" (OPEN)`) to stderr before posting.
 
 ## Picking an issue automatically
 
