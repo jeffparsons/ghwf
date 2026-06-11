@@ -33,7 +33,7 @@ pub fn run(issue: &str, timeout_secs: u64) -> Result<()> {
     let (owner, repo, number) = github::resolve_issue_ref(issue, repo_ctx.as_ref())?;
     let mut issue_state = state::load(&owner, &repo, number)?;
     let Some(mut wait_state) = issue_state.wait.take() else {
-        bail!("no wait baseline recorded for issue #{number}; run `ghwf work-on {number}` first.");
+        bail!("no wait baseline recorded for issue #{number}; run `ghwf work-on` first.");
     };
     let pr_number = issue_state.prep.as_ref().and_then(|p| p.pr_number);
     let last_posted = issue_state.last_posted.clone();
@@ -219,7 +219,7 @@ pub fn run(issue: &str, timeout_secs: u64) -> Result<()> {
 
     persist(&owner, &repo, number, &mut issue_state, &wait_state);
     println!(
-        "No new activity within {timeout_secs} s. Run `ghwf wait {number}` again to keep waiting."
+        "No new activity within {timeout_secs} s. Run `ghwf wait` again to keep waiting."
     );
     std::process::exit(EXIT_TIMEOUT);
 }

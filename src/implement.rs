@@ -31,7 +31,7 @@ pub fn run(
     };
 
     if prep.no_branch {
-        return Ok(no_branch_body(number, &plan_rel));
+        return Ok(no_branch_body(&plan_rel));
     }
 
     let worktree = prep
@@ -47,7 +47,6 @@ pub fn run(
         &worktree,
         &plan_rel,
         pr_url.as_deref(),
-        number,
         pr_instructions,
     ))
 }
@@ -68,7 +67,7 @@ pub fn review(
     };
 
     if prep.no_branch {
-        return review_no_branch_body(number);
+        return review_no_branch_body();
     }
 
     let Some(pr) = prep.pr_number else {
@@ -76,7 +75,7 @@ pub fn review(
     };
 
     let pr_url = format!("https://github.com/{owner}/{repo}/pull/{pr}");
-    review_body(&pr_url, number, pr_instructions)
+    review_body(&pr_url, pr_instructions)
 }
 
 /// Detect whether the open PR's branch conflicts with the freshly-fetched
@@ -139,7 +138,6 @@ fn branch_body(
     worktree: &str,
     plan_rel: &str,
     pr_url: Option<&str>,
-    number: u64,
     pr_instructions: Option<&Path>,
 ) -> String {
     let pr_line = pr_url
@@ -152,52 +150,52 @@ fn branch_body(
          {pr_line}\n\
          Implement per the plan, committing and pushing to the branch as you go (the draft \
          PR updates automatically). Address any PR feedback shown below. {} When the work is \
-         complete and ready for human review, hand off with `ghwf hand-off {number}` (body \
+         complete and ready for human review, hand off with `ghwf hand-off` (body \
          from stdin): a comment summarising the change. ghwf appends the next-step \
          instructions (the user marks the draft PR ready for review) — do not write \
          them yourself.\n\n{}\n\n{}",
         pr_maintenance_instruction(pr_instructions),
-        crate::render::question_instruction(number),
-        crate::render::wait_instruction(number)
+        crate::render::question_instruction(),
+        crate::render::wait_instruction()
     )
 }
 
-fn no_branch_body(number: u64, plan_rel: &str) -> String {
+fn no_branch_body(plan_rel: &str) -> String {
     format!(
         "Implement (--no-branch) — code the change per `{plan_rel}`.\n\n\
          You are managing the branch and commits yourself; there is no ghwf worktree or PR. \
-         When the work is complete, hand off with `ghwf hand-off {number}` (body from \
+         When the work is complete, hand off with `ghwf hand-off` (body from \
          stdin).\n\n{}\n\n{}",
-        crate::render::question_instruction(number),
-        crate::render::wait_instruction(number)
+        crate::render::question_instruction(),
+        crate::render::wait_instruction()
     )
 }
 
-fn review_body(pr_url: &str, number: u64, pr_instructions: Option<&Path>) -> String {
+fn review_body(pr_url: &str, pr_instructions: Option<&Path>) -> String {
     format!(
         "Review — awaiting human review.\n\n\
          The PR is ready for review: {pr_url}\n\n\
          Nothing more is needed from you unless review feedback arrives; it will appear below \
-         on future `ghwf work-on {number}` runs. {}\n\n{}\n\n{}",
+         on future `ghwf work-on` runs. {}\n\n{}\n\n{}",
         pr_maintenance_instruction(pr_instructions),
-        crate::render::question_instruction(number),
-        crate::render::wait_instruction(number)
+        crate::render::question_instruction(),
+        crate::render::wait_instruction()
     )
 }
 
-fn review_no_branch_body(number: u64) -> String {
+fn review_no_branch_body() -> String {
     format!(
         "Review — the work is complete.\n\n\
          There is no ghwf PR to mark ready (this issue was worked with --no-branch); hand off \
          for human review however you normally would.\n\n{}\n\n{}",
-        crate::render::question_instruction(number),
-        crate::render::wait_instruction(number)
+        crate::render::question_instruction(),
+        crate::render::wait_instruction()
     )
 }
 
 fn no_prep_body(number: u64) -> String {
     format!(
-        "No prep state is recorded for issue #{number}. Run `ghwf work-on {number}` through the \
+        "No prep state is recorded for issue #{number}. Run `ghwf work-on` through the \
          earlier phases (pre-plan, prep-and-plan) first."
     )
 }
@@ -245,25 +243,25 @@ mod tests {
     #[test]
     fn waiting_bodies_include_wait_instruction() {
         for body in [
-            branch_body("/wt", "plans/7-x.md", None, 7, None),
-            no_branch_body(7, "plans/7-x.md"),
-            review_body("https://github.com/o/r/pull/18", 7, None),
-            review_no_branch_body(7),
+            branch_body("/wt", "plans/7-x.md", None, None),
+            no_branch_body("plans/7-x.md"),
+            review_body("https://github.com/o/r/pull/18", None),
+            review_no_branch_body(),
         ] {
-            assert!(body.contains("`ghwf wait 7`"), "missing in: {body}");
+            assert!(body.contains("`ghwf wait`"), "missing in: {body}");
         }
     }
 
     #[test]
     fn waiting_bodies_route_questions_off_interactive_prompts() {
         for body in [
-            branch_body("/wt", "plans/7-x.md", None, 7, None),
-            no_branch_body(7, "plans/7-x.md"),
-            review_body("https://github.com/o/r/pull/18", 7, None),
-            review_no_branch_body(7),
+            branch_body("/wt", "plans/7-x.md", None, None),
+            no_branch_body("plans/7-x.md"),
+            review_body("https://github.com/o/r/pull/18", None),
+            review_no_branch_body(),
         ] {
             assert!(
-                body.contains("`ghwf hand-off 7 --question`"),
+                body.contains("`ghwf hand-off --question`"),
                 "missing in: {body}"
             );
         }
@@ -272,10 +270,10 @@ mod tests {
     #[test]
     fn implement_bodies_hand_off_without_retired_command() {
         for body in [
-            branch_body("/wt", "plans/7-x.md", None, 7, None),
-            no_branch_body(7, "plans/7-x.md"),
+            branch_body("/wt", "plans/7-x.md", None, None),
+            no_branch_body("plans/7-x.md"),
         ] {
-            assert!(body.contains("`ghwf hand-off 7`"), "missing in: {body}");
+            assert!(body.contains("`ghwf hand-off`"), "missing in: {body}");
             assert!(
                 !body.contains("/approve-implementation"),
                 "retired in: {body}"
@@ -287,8 +285,8 @@ mod tests {
     fn pr_bodies_name_the_instructions_file_when_present() {
         let path = Path::new("/base/pull-request.md");
         for body in [
-            branch_body("/wt", "plans/7-x.md", None, 7, Some(path)),
-            review_body("https://github.com/o/r/pull/18", 7, Some(path)),
+            branch_body("/wt", "plans/7-x.md", None, Some(path)),
+            review_body("https://github.com/o/r/pull/18", Some(path)),
         ] {
             assert!(
                 body.contains("`/base/pull-request.md`"),
@@ -304,8 +302,8 @@ mod tests {
     #[test]
     fn pr_bodies_fall_back_to_generic_instruction() {
         for body in [
-            branch_body("/wt", "plans/7-x.md", None, 7, None),
-            review_body("https://github.com/o/r/pull/18", 7, None),
+            branch_body("/wt", "plans/7-x.md", None, None),
+            review_body("https://github.com/o/r/pull/18", None),
         ] {
             assert!(
                 body.contains("keep them accurate, concise, and current"),

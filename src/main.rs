@@ -382,8 +382,21 @@ fn main() -> Result<()> {
 /// else $GHWF_ISSUE (set on the session by the outside-Claude launcher), else
 /// the issue whose recorded worktree contains the current directory. An
 /// explicit argument always wins — the fallbacks are defaults, not locks.
+///
+/// An explicit *bare number* is anchored to the bound issue's repo (see
+/// `qualify_bare_number`) rather than the cwd's git remote, so a session bound
+/// to one repo can't silently act on a same-numbered object in another.
 fn resolve_issue_arg(arg: Option<String>) -> Result<String> {
     if let Some(arg) = arg {
+        // A bare number is ambiguous: left as-is it resolves against the cwd's
+        // git remote, which silently targets the wrong repo when the session is
+        // bound to an issue in a different repo. Anchor it to the bound issue's
+        // repo instead. An explicit URL is left untouched, so it still wins.
+        if arg.parse::<u64>().is_ok() {
+            if let Some(qualified) = qualify_bare_number(&arg, infer_issue_arg()?.as_deref()) {
+                return Ok(qualified);
+            }
+        }
         return Ok(arg);
     }
     if let Some(inferred) = infer_issue_arg()? {
@@ -418,6 +431,19 @@ fn infer_issue_arg() -> Result<Option<String>> {
     Ok(None)
 }
 
+/// Anchor a bare issue number to the bound issue's repo.
+///
+/// Given the bound issue (`bound`, a URL from `$GHWF_ISSUE` or worktree state),
+/// rewrite a bare number into that repo's issue URL so it can't resolve against
+/// the cwd's git remote. Returns `None` — leave the argument untouched — when it
+/// isn't a bare number, there's no bound issue, or the bound value can't be
+/// parsed. Pure, so the resolution rule is unit-testable without a session.
+fn qualify_bare_number(arg: &str, bound: Option<&str>) -> Option<String> {
+    arg.parse::<u64>().ok()?;
+    let (owner, repo) = github::parse_owner_repo(bound?).ok()?;
+    Some(format!("https://github.com/{owner}/{repo}/issues/{arg}"))
+}
+
 /// Print the absolute worktree path recorded for an issue (for scripts and the
 /// `/work-on` slash command). Errors if no worktree has been created yet.
 fn worktree_path(issue: &str) -> Result<()> {
@@ -430,7 +456,7 @@ fn worktree_path(issue: &str) -> Result<()> {
             Ok(())
         }
         None => bail!(
-            "no worktree recorded for issue #{number}; run `ghwf work-on {number}` \
+            "no worktree recorded for issue #{number}; run `ghwf work-on` \
              (in branch mode) to create one."
         ),
     }
@@ -567,7 +593,7 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
             number,
         ),
         None => match phase {
-            state::Phase::PrePlan => render::pre_plan_body(number),
+            state::Phase::PrePlan => render::pre_plan_body(),
             state::Phase::PrepAndPlan => {
                 // The worktree-creation stretch is ghwf's own slow work; let
                 // the labels say so while it runs. The end-of-run settle
@@ -749,7 +775,7 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
             .and_then(|p| p.worktree_path.as_ref())
             .expect("guard requires a recorded worktree path");
         let config_dir = config::find()?.map(|located| located.dir);
-        worktree::ensure_inside(worktree, config_dir.as_deref(), number)?;
+        worktree::ensure_inside(worktree, config_dir.as_deref(), &owner, &repo, number)?;
     }
 
     let my_token = store::session_token(&session_id)?;
@@ -1427,7 +1453,7 @@ fn resolve_pr(issue: &str) -> Result<(String, String, u64)> {
     else {
         bail!(
             "no workflow state recorded for issue #{thread_number}; run \
-             `ghwf work-on {thread_number}` first."
+             `ghwf work-on` first."
         );
     };
     match issue_state.prep.as_ref().and_then(|p| p.pr_number) {
@@ -1720,7 +1746,7 @@ fn hand_off(issue: &str, question: bool, attach: &[PathBuf]) -> Result<()> {
     else {
         bail!(
             "no workflow state recorded for issue #{thread_number}; run \
-             `ghwf work-on {thread_number}` first."
+             `ghwf work-on` first."
         );
     };
 
@@ -1864,7 +1890,7 @@ fn ask(issue: &str, options: &[String]) -> Result<()> {
     else {
         bail!(
             "no workflow state recorded for issue #{thread_number}; run \
-             `ghwf work-on {thread_number}` first."
+             `ghwf work-on` first."
         );
     };
     if issue_state.pr_outcome.is_some() {
@@ -1990,12 +2016,46 @@ fn record_last_posted(
 mod tests {
     use super::{
         advance_on_pr_ready, advance_phase, assemble_labels, latest_prompt_watch,
-        needs_worktree_guard, AdvanceOutcome, Cli, PromptThumbs,
+        needs_worktree_guard, qualify_bare_number, AdvanceOutcome, Cli, PromptThumbs,
     };
     use crate::models::{Comment, PullRequest, Reaction, User};
     use crate::render::{NoteKind, Transition, Trigger};
     use crate::state::{Directive, IssueState, Phase, PrOutcome, PrepState};
     use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn bare_number_anchors_to_the_bound_issue_repo() {
+        // The session is bound to repo A; a bare number must resolve there, not
+        // against whatever repo the cwd happens to be a checkout of.
+        let bound = "https://github.com/owner-a/repo-a/issues/100";
+        assert_eq!(
+            qualify_bare_number("42", Some(bound)).as_deref(),
+            Some("https://github.com/owner-a/repo-a/issues/42")
+        );
+    }
+
+    #[test]
+    fn bare_number_without_a_bound_issue_is_left_alone() {
+        // No bound issue: fall back to today's behaviour (config repo, then cwd).
+        assert_eq!(qualify_bare_number("42", None), None);
+    }
+
+    #[test]
+    fn explicit_url_argument_is_never_rewritten() {
+        // A URL is unambiguous and must override the bound issue's repo.
+        let bound = "https://github.com/owner-a/repo-a/issues/100";
+        assert_eq!(
+            qualify_bare_number("https://github.com/owner-b/repo-b/issues/42", Some(bound)),
+            None
+        );
+    }
+
+    #[test]
+    fn unparseable_bound_value_falls_back_to_passthrough() {
+        // A bound value we can't read an owner/repo from must not crash the
+        // command — leave the argument as the caller gave it.
+        assert_eq!(qualify_bare_number("42", Some("not-a-url")), None);
+    }
 
     #[test]
     fn cli_definition_is_valid() {
