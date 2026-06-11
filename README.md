@@ -282,8 +282,11 @@ works.
 
 ghwf needs a `ghwf.toml`, found by walking up from the current directory.
 `ghwf clone` generates one; `ghwf config init` sets one up (or extends one)
-interactively for other layouts. The annotated example below shows what it
-manages:
+interactively for other layouts. To discover the options without leaving the
+terminal, `ghwf config ls` lists them (drill into a table with, e.g., `ghwf
+config ls labels`), `ghwf config info <key>` prints one option's full docs, and
+`ghwf config example` writes a fully-filled, annotated `ghwf.toml` to stdout.
+The annotated example below shows what it manages:
 
 ```toml
 # Path to the main git repo (omit or "." if the config sits at the repo root).
@@ -335,6 +338,11 @@ permission_mode = "auto"
 # commit, a rejected push), and a no-op in --no-branch mode.
 delete_plan_on_approval = true
 ```
+
+The `config ls`/`info`/`example` commands are generated from the `Config` type
+itself (via [facet](https://facet.rs/) reflection), reading the same doc
+comments that document each field in the source — so the listing stays complete
+and never drifts from the code as options are added.
 
 ## Installing the Claude Code integration
 

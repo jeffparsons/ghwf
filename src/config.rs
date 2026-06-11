@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
+use facet::Facet;
 use serde::Deserialize;
 
 use crate::state::{Attention, Phase};
@@ -12,7 +13,11 @@ pub const CONFIG_FILE: &str = "ghwf.toml";
 pub const PR_INSTRUCTIONS_FILE: &str = "pull-request.md";
 
 /// Contents of a `ghwf.toml`. Paths are relative to the file's own directory.
-#[derive(Deserialize)]
+///
+/// `Facet` is derived alongside serde purely for reflection: `ghwf config ls`,
+/// `config info`, and `config example` read this shape (and its doc comments)
+/// so the options stay self-documenting. serde + `toml` remain the real parser.
+#[derive(Deserialize, Facet)]
 pub struct Config {
     /// Path to the main git repo. Defaults to the config's directory.
     pub main_repo: Option<PathBuf>,
@@ -65,8 +70,10 @@ pub struct Config {
 /// An entry in [`Config::issue_repos`]: a foreign repo whose issues may be
 /// worked on. Either a plain `"owner/repo"` string or a table that also carries
 /// a `branch_prefix` controlling how that repo's branches are named.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, Facet)]
 #[serde(untagged)]
+// `Facet` requires enums to carry an explicit representation; serde ignores it.
+#[repr(u8)]
 pub enum IssueRepo {
     /// `"owner/repo"` — the branch prefix defaults to the repo name.
     Plain(String),
@@ -151,20 +158,30 @@ impl Config {
 /// The `[labels]` section: one GitHub label name per phase and per attention
 /// state. All names are required once the section is present — partial
 /// configs would make the sync's remove-undesired step ambiguous.
-#[derive(Deserialize)]
+#[derive(Deserialize, Facet)]
 pub struct LabelsConfig {
+    /// Label names for each workflow phase.
     pub phase: PhaseLabels,
+    /// Label names for each attention state.
     pub attention: AttentionLabels,
 }
 
 /// Label names for the `[labels.phase]` table.
-#[derive(Deserialize)]
+#[derive(Deserialize, Facet)]
 #[serde(rename_all = "kebab-case")]
+// Mirror serde's rename so facet's reflection carries the kebab-case wire keys
+// (facet doesn't read serde attributes).
+#[facet(rename_all = "kebab-case")]
 pub struct PhaseLabels {
+    /// Label for the pre-plan phase (gathering information before planning).
     pub pre_plan: String,
+    /// Label for the prep-and-plan phase (worktree created, plan being written).
     pub prep_and_plan: String,
+    /// Label for the implement phase (coding the change).
     pub implement: String,
+    /// Label for the review phase (change ready for human review).
     pub review: String,
+    /// Label for the terminal finished phase.
     // Defaulted so a `[labels.phase]` table written before the `finished` phase
     // existed keeps parsing; new setups write it explicitly.
     #[serde(default = "default_finished_label")]
@@ -178,11 +195,17 @@ fn default_finished_label() -> String {
 }
 
 /// Label names for the `[labels.attention]` table.
-#[derive(Deserialize)]
+#[derive(Deserialize, Facet)]
 #[serde(rename_all = "kebab-case")]
+// Mirror serde's rename so facet's reflection carries the kebab-case wire keys.
+#[facet(rename_all = "kebab-case")]
 pub struct AttentionLabels {
+    /// Label for when the workflow is waiting on the user (needs a reply or
+    /// approval).
     pub waiting_on_user: String,
+    /// Label for when Claude is actively working the issue.
     pub waiting_on_claude: String,
+    /// Label for when ghwf is preparing (e.g. creating a worktree).
     pub waiting_on_ghwf: String,
 }
 
