@@ -511,6 +511,17 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         .map(|located| located.pr_instructions_path())
         .filter(|path| path.is_file());
 
+    // The instant a PR's merge is first detected, bring the local default-branch
+    // worktree (if any) up to the merged tip, so a long-lived main checkout
+    // benefits from the merge without anyone working on it directly. Gated on
+    // `new_conclusion` so it fires once per merge, not on every later run over an
+    // already-finished issue.
+    if new_conclusion == Some(state::PrOutcome::Merged) {
+        if let Some(located) = located.as_ref() {
+            update_main_worktree_after_merge(located, &code_owner, &code_repo);
+        }
+    }
+
     // If configured, erase the plan commit now that the implementation has been
     // approved — i.e. the draft PR was just marked ready for review this run
     // (advance_on_pr_ready pushed the transition). It fires at most once: on
@@ -961,6 +972,28 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     state::save(&owner, &repo, number, &issue_state)?;
 
     Ok(())
+}
+
+/// Best-effort: after a PR merge is first detected, fetch and fast-forward the
+/// local default-branch worktree to the merged tip. Reuses
+/// [`prep::update_default_worktree`], which only touches a worktree that is
+/// clean and strictly behind `origin/<default>` and otherwise just notes the
+/// skip. A failure to fetch or resolve the default branch is a warning, never a
+/// hard error — a merged PR's workflow is already over.
+fn update_main_worktree_after_merge(located: &config::Located, code_owner: &str, code_repo: &str) {
+    let main_repo = located.main_repo_path();
+    if let Err(err) = git::fetch(&main_repo) {
+        eprintln!("warning: failed to fetch before updating the default-branch worktree: {err:#}");
+        return;
+    }
+    let default = match github::default_branch(code_owner, code_repo) {
+        Ok(default) => default,
+        Err(err) => {
+            eprintln!("warning: failed to resolve the default branch: {err:#}");
+            return;
+        }
+    };
+    prep::update_default_worktree(&main_repo, &default);
 }
 
 /// Post a ghwf status update to a conversation thread, best-effort: a failure
