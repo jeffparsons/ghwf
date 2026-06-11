@@ -2,6 +2,7 @@ mod attach;
 mod clone;
 mod collect_garbage;
 mod config;
+mod config_schema;
 mod git;
 mod github;
 mod implement;
@@ -292,6 +293,23 @@ enum ConfigCommands {
     /// a `[labels]` section to `ghwf.toml`. Re-run once the section exists to
     /// create any configured label still missing from the repo.
     Labels,
+    /// List the available config options, each with a one-line summary. Pass a
+    /// dotted path (e.g. `labels.phase`) to list the options inside a nested
+    /// table.
+    Ls {
+        /// Dotted path to a nested table whose options to list; omit for the
+        /// top level.
+        path: Option<String>,
+    },
+    /// Show the full documentation and type of a single config option, named by
+    /// dotted path (e.g. `labels.phase.pre-plan`).
+    Info {
+        /// Dotted path to the option.
+        key: String,
+    },
+    /// Print a fully-filled, annotated `ghwf.toml` to standard output, showing
+    /// every option with its documentation and an example value.
+    Example,
 }
 
 fn main() -> Result<()> {
@@ -339,6 +357,9 @@ fn main() -> Result<()> {
         Commands::Config { command } => match command {
             ConfigCommands::Init => init::run(),
             ConfigCommands::Labels => labels::configure(),
+            ConfigCommands::Ls { path } => config_schema::ls(path.as_deref()),
+            ConfigCommands::Info { key } => config_schema::info(&key),
+            ConfigCommands::Example => config_schema::example(),
         },
         Commands::WorktreePath { issue } => worktree_path(&resolve_issue_arg(issue)?),
         Commands::Install { force } => install::run(force),
