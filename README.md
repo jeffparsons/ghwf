@@ -351,7 +351,11 @@ delete_plan_on_approval = true
 # 👍 reaction carries no association, so collaborator auto-accept for reactions
 # is resolved via the repo's collaborator list; an org member with no repo
 # access is accepted on a typed comment but not on a bare 👍, and should be
-# listed here.
+# listed here. The same allow-list also gates *automatic* issue selection
+# (`ghwf next` / `forever`): only issues authored by you, an allow-listed login,
+# or a repo collaborator are auto-picked, so strangers can't get a public repo's
+# workflow to start working on the issues they open. A skipped issue can still be
+# worked deliberately with `ghwf work-on <n>`.
 allowed_users = ["octocat"]
 ```
 

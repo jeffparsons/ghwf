@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// A GitHub user, trimmed to the fields we care about.
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Default)]
 pub struct User {
     pub login: String,
 }
@@ -92,6 +92,15 @@ pub struct SubIssuesSummary {
 pub struct IssueListing {
     pub number: u64,
     pub title: String,
+    // The issue author and their association with the repo, used to gate
+    // automatic selection on the allow-list (#93). Both the repo-wide listing
+    // and the sub-issues endpoint return them; defaulted so the many tests that
+    // build a listing literally still parse (an empty login matches no allow-list
+    // rule).
+    #[serde(default)]
+    pub user: User,
+    #[serde(default)]
+    pub author_association: String,
     // The repo-wide listing is fetched with `?state=open`, so this is elided in
     // most tests and defaults to empty (treated as open). It is load-bearing
     // only for sub-issue children, which the endpoint returns in any state.

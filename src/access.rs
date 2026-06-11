@@ -79,6 +79,15 @@ impl AccessList {
         self.is_self_or_allowed(login) || COLLABORATOR_ASSOCIATIONS.contains(&association)
     }
 
+    /// Accept an issue for *automatic* selection by its author login and GitHub
+    /// `author_association` — so a public repo's strangers can't get ghwf to
+    /// auto-pick the issues they open (#93). Same rule as [`accepts_comment`]:
+    /// the association classifies collaborators with no API call, since the
+    /// open-issues listing carries it.
+    pub fn accepts_issue(&self, login: &str, association: &str) -> bool {
+        self.accepts_comment(login, association)
+    }
+
     /// Accept a 👍 reaction by its author login, against the collaborator set
     /// for `repo`. Pure: returns false for an unknown collaborator if the set
     /// hasn't been fetched (call [`AccessList::ensure_collaborators`] first).
@@ -144,6 +153,22 @@ mod tests {
         }
         for assoc in ["CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "NONE", ""] {
             assert!(!access.accepts_comment("someone", assoc), "{assoc}");
+        }
+    }
+
+    #[test]
+    fn issues_accept_operator_allowed_and_collaborator_authors() {
+        let access = AccessList::new("me", &["friend".to_string()]);
+        // Operator and allow-listed authors, regardless of association.
+        assert!(access.accepts_issue("me", "NONE"));
+        assert!(access.accepts_issue("Friend", "NONE"));
+        // Collaborator associations are accepted with no list fetch.
+        for assoc in ["OWNER", "MEMBER", "COLLABORATOR"] {
+            assert!(access.accepts_issue("someone", assoc), "{assoc}");
+        }
+        // A stranger with no qualifying association is rejected.
+        for assoc in ["CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "NONE", ""] {
+            assert!(!access.accepts_issue("stranger", assoc), "{assoc}");
         }
     }
 
