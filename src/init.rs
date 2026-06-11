@@ -297,8 +297,9 @@ pub fn run() -> Result<()> {
     if !doc.contains_key("allowed_users")
         && prompt(
             Confirm::new(
-                "Allow-list extra users to drive the workflow via comments/👍? \
-                 (you and repo collaborators are always accepted)",
+                "Allow-list extra users to drive the workflow (comments/👍 and \
+                 automatic issue selection)? (you and repo collaborators are \
+                 always accepted)",
             )
             .with_default(false)
             .prompt(),
@@ -618,9 +619,10 @@ fn set_allowed_users(doc: &mut DocumentMut, allowed_users: &[String]) {
         doc,
         "allowed_users",
         toml_edit::value(array),
-        "GitHub logins whose comments and 👍 reactions ghwf acts on, in addition\n\
-         to you (the authenticated user) and repo collaborators. Everyone else's\n\
-         comments and reactions are ignored. Matched case-insensitively.",
+        "GitHub logins whose comments and 👍 reactions ghwf acts on, and whose\n\
+         issues automatic selection will pick up, in addition to you (the\n\
+         authenticated user) and repo collaborators. Everyone else's comments,\n\
+         reactions, and issues are ignored. Matched case-insensitively.",
     );
 }
 

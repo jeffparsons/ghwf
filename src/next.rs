@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::github::Conditional;
 use crate::models::IssueListing;
-use crate::{config, github, launch, state, wait};
+use crate::{access, config, github, launch, state, wait};
 
 /// Direct polling starts here…
 const BACKOFF_FLOOR: Duration = Duration::from_secs(5);
@@ -29,15 +29,10 @@ const MAX_CONSECUTIVE_FAILURES: u32 = 30;
 /// reserves it against concurrent `next`/`next --wait` runs (a resumed winner is
 /// reserved by the launcher's session lease instead), and assigns it on GitHub.
 pub fn pick() -> Result<u64> {
-    let (priority_labels, only_assigned_to_me) = match config::find()? {
-        Some(located) => (
-            located.config.priority_labels,
-            located.config.only_assigned_to_me,
-        ),
-        None => (Vec::new(), false),
-    };
+    let (priority_labels, only_assigned_to_me, allowed_users) = config_selection_settings()?;
     let (owner, repo) = github::repo_or_cwd()?;
     let me = github::authenticated_user()?;
+    let access = access::AccessList::resolve(&allowed_users)?;
     let issues = github::list_open_issues(&owner, &repo)?;
 
     let selection = claim_pick(
@@ -47,6 +42,7 @@ pub fn pick() -> Result<u64> {
         only_assigned_to_me,
         |_| false,
         status_fn(&owner, &repo),
+        |issue| access.accepts_issue(&issue.user.login, &issue.author_association),
         |n| state::claim(&owner, &repo, n),
     )?;
 
@@ -76,15 +72,10 @@ pub fn wait_for_pick(timeout_secs: Option<u64>) -> Result<u64> {
 /// given up on this run (a `forever` worker's launch failures), excluded from
 /// selection so they can't be re-picked in a loop.
 fn wait_for_pick_excluding(timeout_secs: Option<u64>, skip: &BTreeSet<u64>) -> Result<u64> {
-    let (priority_labels, only_assigned_to_me) = match config::find()? {
-        Some(located) => (
-            located.config.priority_labels,
-            located.config.only_assigned_to_me,
-        ),
-        None => (Vec::new(), false),
-    };
+    let (priority_labels, only_assigned_to_me, allowed_users) = config_selection_settings()?;
     let (owner, repo) = github::repo_or_cwd()?;
     let me = github::authenticated_user()?;
+    let access = access::AccessList::resolve(&allowed_users)?;
     let endpoint = format!("repos/{owner}/{repo}/issues?state=open&per_page=100");
 
     match timeout_secs {
@@ -122,6 +113,7 @@ fn wait_for_pick_excluding(timeout_secs: Option<u64>, skip: &BTreeSet<u64>) -> R
                     only_assigned_to_me,
                     |n| skip.contains(&n),
                     status_fn(&owner, &repo),
+                    |issue| access.accepts_issue(&issue.user.login, &issue.author_association),
                     |n| state::claim(&owner, &repo, n),
                 )?;
                 if let Some(number) =
@@ -228,6 +220,20 @@ pub fn run_forever(no_branch: bool) -> Result<()> {
     }
 }
 
+/// The selection-relevant config: priority labels, the only-assigned-to-me flag,
+/// and the `allowed_users` list that gates which authors are auto-selected (#93).
+/// Defaults to empty/false when no config is found.
+fn config_selection_settings() -> Result<(Vec<String>, bool, Vec<String>)> {
+    Ok(match config::find()? {
+        Some(located) => (
+            located.config.priority_labels,
+            located.config.only_assigned_to_me,
+            located.config.allowed_users,
+        ),
+        None => (Vec::new(), false, Vec::new()),
+    })
+}
+
 /// The status classifier for a repo, reading each issue's recorded state and
 /// session lease.
 fn status_fn<'a>(owner: &'a str, repo: &'a str) -> impl Fn(u64) -> IssueStatus + 'a {
@@ -277,8 +283,9 @@ fn is_underway(owner: &str, repo: &str, number: u64) -> bool {
 /// there is resolved when the launcher backs off. `excluded` drops issues the
 /// caller has already given up on this run (a worker's launch failures), so a
 /// deterministic failure can't be re-picked in a loop. `excluded`, `status`,
-/// and `claim` are injected so the loop is testable without a filesystem or
-/// network.
+/// `accepts_author`, and `claim` are injected so the loop is testable without a
+/// filesystem or network.
+#[allow(clippy::too_many_arguments)]
 fn claim_pick<'a>(
     issues: &'a [IssueListing],
     me: &str,
@@ -286,6 +293,7 @@ fn claim_pick<'a>(
     only_assigned_to_me: bool,
     excluded: impl Fn(u64) -> bool,
     status: impl Fn(u64) -> IssueStatus,
+    accepts_author: impl Fn(&IssueListing) -> bool,
     mut claim: impl FnMut(u64) -> Result<bool>,
 ) -> Result<Selection<'a>> {
     // Issues lost to other workers this call, excluded from re-selection on top
@@ -299,6 +307,7 @@ fn claim_pick<'a>(
             only_assigned_to_me,
             |n| lost.contains(&n) || excluded(n),
             &status,
+            &accepts_author,
         );
         let Some(picked) = selection.picked else {
             return Ok(selection);
@@ -326,6 +335,12 @@ fn announce_pick(
 ) -> Option<u64> {
     for number in &selection.skipped_live {
         println!("Skipping #{number} — a session is currently running it.");
+    }
+    for number in &selection.skipped_unlisted_author {
+        println!(
+            "Skipping #{number} — its author isn't allow-listed for automatic \
+             selection; work it explicitly with `ghwf work-on {number}` if intended."
+        );
     }
     for number in &selection.skipped_blocked {
         println!("Skipping #{number} — blocked by an open issue.");
@@ -382,6 +397,7 @@ struct Selection<'a> {
     picked: Option<&'a IssueListing>,
     picked_status: Option<IssueStatus>,
     skipped_live: Vec<u64>,
+    skipped_unlisted_author: Vec<u64>,
     skipped_blocked: Vec<u64>,
     skipped_tracking: Vec<u64>,
 }
@@ -393,11 +409,13 @@ struct Selection<'a> {
 /// lowest issue number. PRs, issues assigned to someone else, and issues
 /// excluded by the caller (lost to a concurrent worker this call) are dropped
 /// outright. Of the rest, `Live` issues are skipped and reported, `Done` ones
-/// skipped silently, and `Resumable` ones are workable regardless of block or
-/// tracking state (their work is already underway). A `Fresh` issue that is
-/// currently blocked or a tracking issue (has sub-issues) is skipped and
-/// reported instead; when it qualifies for both, the precedence is blocked →
-/// tracking.
+/// skipped silently, and `Resumable` ones are workable regardless of author,
+/// block, or tracking state (their work is already underway). A `Fresh` issue is
+/// skipped and reported when its author isn't accepted by `accepts_author` (the
+/// #93 allow-list gate, so a public repo's strangers can't get ghwf to auto-pick
+/// their issues), when it is currently blocked, or when it is a tracking issue
+/// (has sub-issues); when it qualifies for more than one, the precedence is
+/// unlisted-author, then blocked, then tracking.
 ///
 /// When `only_assigned_to_me` is set, unassigned issues are excluded too (so the
 /// pool is exactly the issues assigned to `me`); like issues assigned to someone
@@ -409,8 +427,10 @@ fn select<'a>(
     only_assigned_to_me: bool,
     excluded: impl Fn(u64) -> bool,
     status: impl Fn(u64) -> IssueStatus,
+    accepts_author: impl Fn(&IssueListing) -> bool,
 ) -> Selection<'a> {
     let mut skipped_live = Vec::new();
+    let mut skipped_unlisted_author = Vec::new();
     let mut skipped_blocked = Vec::new();
     let mut skipped_tracking = Vec::new();
     let mut candidates: Vec<&IssueListing> = Vec::new();
@@ -436,13 +456,21 @@ fn select<'a>(
             }
             // Concluded — nothing to do, and not worth a line.
             IssueStatus::Done => continue,
-            // Work is underway: resume it whatever its block/tracking state.
+            // Work is underway: resume it whatever its author/block/tracking
+            // state (it already cleared the author gate when it started).
             IssueStatus::Resumable => {
                 candidates.push(issue);
                 continue;
             }
             // A fresh issue still has to clear the freshness gates below.
             IssueStatus::Fresh => {}
+        }
+        // The allow-list gate (#93): a fresh issue from a non-allow-listed
+        // author isn't auto-selected. Checked before block/tracking so a
+        // stranger's issue is reported as such, not as merely blocked.
+        if !accepts_author(issue) {
+            skipped_unlisted_author.push(issue.number);
+            continue;
         }
         if issue.is_blocked() {
             skipped_blocked.push(issue.number);
@@ -460,6 +488,7 @@ fn select<'a>(
         picked,
         picked_status: picked.map(|issue| status(issue.number)),
         skipped_live,
+        skipped_unlisted_author,
         skipped_blocked,
         skipped_tracking,
     }
@@ -643,11 +672,16 @@ mod tests {
     use crate::models::{IssueDependenciesSummary, IssueListing, Label, SubIssuesSummary, User};
 
     /// An open issue with the given assignees and labels, not blocked and not a
-    /// tracking issue.
+    /// tracking issue. Authored by `me` by default (the author gate is exercised
+    /// via [`authored`]); selection tests pass an accept-all author predicate.
     fn issue(number: u64, assignees: &[&str], labels: &[&str]) -> IssueListing {
         IssueListing {
             number,
             title: format!("issue {number}"),
+            user: User {
+                login: "me".to_string(),
+            },
+            author_association: String::new(),
             state: String::new(),
             assignees: assignees
                 .iter()
@@ -664,6 +698,17 @@ mod tests {
             pull_request: None,
             issue_dependencies_summary: IssueDependenciesSummary::default(),
             sub_issues_summary: SubIssuesSummary::default(),
+        }
+    }
+
+    /// An issue authored by `login` (with no special association), for the
+    /// allow-list author gate.
+    fn authored(number: u64, login: &str) -> IssueListing {
+        IssueListing {
+            user: User {
+                login: login.to_string(),
+            },
+            ..issue(number, &[], &[])
         }
     }
 
@@ -701,7 +746,8 @@ mod tests {
         names.iter().map(|n| n.to_string()).collect()
     }
 
-    /// Run `select` with every issue fresh and nothing excluded.
+    /// Run `select` with every issue fresh, nothing excluded, and every author
+    /// accepted (the author gate is exercised separately).
     fn pick<'a>(issues: &'a [IssueListing], me: &str, priority_labels: &[String]) -> Selection<'a> {
         select(
             issues,
@@ -710,6 +756,7 @@ mod tests {
             false,
             |_| false,
             |_| IssueStatus::Fresh,
+            |_| true,
         )
     }
 
@@ -796,6 +843,7 @@ mod tests {
             true,
             |_| false,
             |_| IssueStatus::Fresh,
+            |_| true,
         );
         assert_eq!(selection.picked.unwrap().number, 2);
     }
@@ -812,6 +860,7 @@ mod tests {
             true,
             |_| false,
             |_| IssueStatus::Fresh,
+            |_| true,
         );
         assert!(selection.picked.is_none());
         assert!(selection.skipped_live.is_empty());
@@ -824,7 +873,15 @@ mod tests {
         // Guard the default: with the option off, an unassigned issue is still
         // picked (today's behaviour) rather than being filtered out.
         let issues = [issue(1, &[], &[])];
-        let selection = select(&issues, "me", &[], false, |_| false, |_| IssueStatus::Fresh);
+        let selection = select(
+            &issues,
+            "me",
+            &[],
+            false,
+            |_| false,
+            |_| IssueStatus::Fresh,
+            |_| true,
+        );
         assert_eq!(selection.picked.unwrap().number, 1);
     }
 
@@ -856,6 +913,7 @@ mod tests {
                     IssueStatus::Fresh
                 }
             },
+            |_| true,
         );
         assert_eq!(selection.picked.unwrap().number, 3);
         assert_eq!(selection.skipped_live, [1]);
@@ -873,6 +931,7 @@ mod tests {
             false,
             |_| false,
             |_| IssueStatus::Resumable,
+            |_| true,
         );
         assert_eq!(selection.picked.unwrap().number, 1);
         assert_eq!(selection.picked_status, Some(IssueStatus::Resumable));
@@ -890,6 +949,7 @@ mod tests {
             false,
             |_| false,
             |_| IssueStatus::Resumable,
+            |_| true,
         );
         assert_eq!(selection.picked.unwrap().number, 1);
         assert!(selection.skipped_blocked.is_empty());
@@ -899,7 +959,15 @@ mod tests {
     fn done_issue_is_skipped_silently() {
         // A concluded issue is neither picked nor reported in any skip bucket.
         let issues = [issue(1, &[], &[])];
-        let selection = select(&issues, "me", &[], false, |_| false, |_| IssueStatus::Done);
+        let selection = select(
+            &issues,
+            "me",
+            &[],
+            false,
+            |_| false,
+            |_| IssueStatus::Done,
+            |_| true,
+        );
         assert!(selection.picked.is_none());
         assert!(selection.skipped_live.is_empty());
         assert!(selection.skipped_blocked.is_empty());
@@ -940,6 +1008,7 @@ mod tests {
             false,
             |_| false,
             |_| IssueStatus::Fresh,
+            |_| true,
             |n| {
                 attempts.borrow_mut().push(n);
                 Ok(won.contains(&n))
@@ -991,6 +1060,7 @@ mod tests {
             false,
             |_| false,
             |_| IssueStatus::Resumable,
+            |_| true,
             |n| {
                 attempts.borrow_mut().push(n);
                 Ok(true)
@@ -1014,6 +1084,7 @@ mod tests {
             false,
             |n| n == 3,
             |_| IssueStatus::Fresh,
+            |_| true,
             |n| {
                 attempts.borrow_mut().push(n);
                 Ok(true)
@@ -1039,6 +1110,62 @@ mod tests {
         let selection = pick(&issues, "me", &[]);
         assert_eq!(selection.picked.unwrap().number, 2);
         assert_eq!(selection.skipped_tracking, [1]);
+    }
+
+    #[test]
+    fn fresh_issue_from_unlisted_author_is_skipped_and_reported() {
+        // #1 sorts first but its author isn't accepted, so the accepted #2 wins
+        // and #1 is reported under the unlisted-author bucket.
+        let issues = [authored(1, "stranger"), authored(2, "friend")];
+        let selection = select(
+            &issues,
+            "me",
+            &[],
+            false,
+            |_| false,
+            |_| IssueStatus::Fresh,
+            |issue| issue.user.login == "friend",
+        );
+        assert_eq!(selection.picked.unwrap().number, 2);
+        assert_eq!(selection.skipped_unlisted_author, [1]);
+    }
+
+    #[test]
+    fn resumable_issue_from_unlisted_author_is_still_selected() {
+        // The author gate is fresh-only: work already underway is resumed
+        // regardless of who opened the issue.
+        let issues = [authored(1, "stranger")];
+        let selection = select(
+            &issues,
+            "me",
+            &[],
+            false,
+            |_| false,
+            |_| IssueStatus::Resumable,
+            |_| false,
+        );
+        assert_eq!(selection.picked.unwrap().number, 1);
+        assert!(selection.skipped_unlisted_author.is_empty());
+    }
+
+    #[test]
+    fn unlisted_author_takes_precedence_over_blocked() {
+        // An unlisted-author issue that is also blocked is reported only as
+        // unlisted-author (the gate is checked first).
+        let mut issue = blocked(1, 1);
+        issue.user.login = "stranger".to_string();
+        let issues = [issue];
+        let selection = select(
+            &issues,
+            "me",
+            &[],
+            false,
+            |_| false,
+            |_| IssueStatus::Fresh,
+            |_| false,
+        );
+        assert_eq!(selection.skipped_unlisted_author, [1]);
+        assert!(selection.skipped_blocked.is_empty());
     }
 
     #[test]
@@ -1070,6 +1197,7 @@ mod tests {
                     IssueStatus::Fresh
                 }
             },
+            |_| true,
         );
         assert_eq!(selection.picked.unwrap().number, 2);
         assert_eq!(selection.skipped_live, [1]);
@@ -1082,7 +1210,15 @@ mod tests {
         let mut both = blocked(1, 1);
         both.sub_issues_summary = SubIssuesSummary { total: 2 };
         let issues = [both];
-        let selection = select(&issues, "me", &[], false, |_| false, |_| IssueStatus::Fresh);
+        let selection = select(
+            &issues,
+            "me",
+            &[],
+            false,
+            |_| false,
+            |_| IssueStatus::Fresh,
+            |_| true,
+        );
         assert_eq!(selection.skipped_blocked, [1]);
         assert!(selection.skipped_tracking.is_empty());
     }
