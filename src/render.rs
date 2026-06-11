@@ -233,33 +233,31 @@ pub fn rewrite_submitted_body(body: &str, when: &str) -> String {
 
 /// One-line reminder, shared across phase banners, to route a question that
 /// blocks progress to the thread rather than an interactive prompt.
-pub fn question_instruction(number: u64) -> String {
-    format!(
-        "If you need an answer from the user to proceed, never use an interactive \
-         prompt (no AskUserQuestion, and don't ask in prose and stop): post the \
-         question with `ghwf hand-off {number} --question` (body from stdin) — that \
-         flips the issue to \"needs you\" — then `ghwf wait {number}` for the reply. \
-         When the answer is a choice among discrete options, use `ghwf ask {number} \
-         --option \"…\" --option \"…\"` (question on stdin) instead: ghwf renders the \
-         options as checkboxes, appends a submit box, and wakes you only once it's \
-         ticked. Offer an \"other / none of these\" option where it fits. \
-         If the user replies to only part of what you raised, assume more comments \
-         may be coming: answer what arrived and wait again rather than treating the \
-         unanswered questions, options, or suggested defaults as settled — only an \
-         explicit phase approval does that."
-    )
+pub fn question_instruction() -> String {
+    "If you need an answer from the user to proceed, never use an interactive \
+     prompt (no AskUserQuestion, and don't ask in prose and stop): post the \
+     question with `ghwf hand-off --question` (body from stdin) — that \
+     flips the issue to \"needs you\" — then `ghwf wait` for the reply. \
+     When the answer is a choice among discrete options, use `ghwf ask \
+     --option \"…\" --option \"…\"` (question on stdin) instead: ghwf renders the \
+     options as checkboxes, appends a submit box, and wakes you only once it's \
+     ticked. Offer an \"other / none of these\" option where it fits. \
+     If the user replies to only part of what you raised, assume more comments \
+     may be coming: answer what arrived and wait again rather than treating the \
+     unanswered questions, options, or suggested defaults as settled — only an \
+     explicit phase approval does that."
+        .to_string()
 }
 
 /// How Claude should wait for the next human response, appended to every
 /// banner body that ends in a waiting state.
-pub fn wait_instruction(number: u64) -> String {
-    format!(
-        "Once you have posted your comment(s) and have nothing else to do, run \
-         `ghwf wait {number}` — it blocks until there is new activity (up to ~9 minutes; \
-         give it a 10-minute command timeout). Exit 0 means new activity arrived: run \
-         `ghwf work-on {number}` to process it. Exit 2 means nothing yet: run \
-         `ghwf wait {number}` again. Do not poll with your own sleep loops."
-    )
+pub fn wait_instruction() -> String {
+    "Once you have posted your comment(s) and have nothing else to do, run \
+     `ghwf wait` — it blocks until there is new activity (up to ~9 minutes; \
+     give it a 10-minute command timeout). Exit 0 means new activity arrived: run \
+     `ghwf work-on` to process it. Exit 2 means nothing yet: run \
+     `ghwf wait` again. Do not poll with your own sleep loops."
+        .to_string()
 }
 
 /// The banner body shown in place of the phase body once the PR has left the
@@ -272,39 +270,39 @@ pub fn concluded_body(outcome: PrOutcome, pr_url: Option<&str>, number: u64) -> 
     match outcome {
         PrOutcome::Merged => format!(
             "{pr} has been merged — the workflow for issue #{number} is complete.\n\n\
-             Stop the wait/work-on loop: do not run `ghwf wait {number}` or \
-             `ghwf work-on {number}` again unless the user asks."
+             Stop the wait/work-on loop: do not run `ghwf wait` or \
+             `ghwf work-on` again unless the user asks."
         ),
         PrOutcome::Closed => format!(
             "{pr} was closed without being merged — the workflow for issue #{number} \
              has halted.\n\n\
              Surface this to the user and stop the wait/work-on loop: do not run \
-             `ghwf wait {number}` or `ghwf work-on {number}` again unless the user asks. \
-             (Reopening the PR resumes the workflow on the next `ghwf work-on {number}`.)"
+             `ghwf wait` or `ghwf work-on` again unless the user asks. \
+             (Reopening the PR resumes the workflow on the next `ghwf work-on`.)"
         ),
     }
 }
 
 /// Guidance shown to Claude during the pre-plan phase.
-pub fn pre_plan_body(number: u64) -> String {
+pub fn pre_plan_body() -> String {
     format!(
         "Pre-plan — gathering the information needed to write a plan.\n\n\
          Discuss on the issue itself. Post questions and clarifications as comments with \
-         `ghwf create-issue-comment {number}`; if an answer is needed before you can \
-         proceed, use `ghwf hand-off {number} --question` instead so the issue flips to \
-         \"needs you\" (or, for a choice among discrete options, `ghwf ask {number} \
+         `ghwf create-issue-comment`; if an answer is needed before you can \
+         proceed, use `ghwf hand-off --question` instead so the issue flips to \
+         \"needs you\" (or, for a choice among discrete options, `ghwf ask \
          --option \"…\" --option \"…\"`, which presents them as checkboxes). Either way, \
          never raise an interactive prompt (no AskUserQuestion). \
          A reply that addresses only part of what you asked is not a sign the user is \
          done — assume more may be coming, so respond and keep waiting rather than \
          proceeding on the unanswered points. \
          When you have enough information, hand off \
-         with `ghwf hand-off {number}` (body from stdin): a comment that summarises your \
+         with `ghwf hand-off` (body from stdin): a comment that summarises your \
          understanding and clearly states you are ready to write a plan. ghwf appends the \
          approval prompt itself — do not write one.\n\n\
          Do not start planning or advance the workflow yourself. Wait for the user's \
          approval; ghwf will then advance to the prep-and-plan phase.\n\n{}",
-        wait_instruction(number)
+        wait_instruction()
     )
 }
 
@@ -892,36 +890,39 @@ mod tests {
 
     #[test]
     fn pre_plan_body_includes_wait_instruction() {
-        let body = super::pre_plan_body(7);
-        assert!(body.contains("`ghwf wait 7`"));
-        assert!(body.contains("`ghwf work-on 7`"));
+        let body = super::pre_plan_body();
+        assert!(body.contains("`ghwf wait`"));
+        assert!(body.contains("`ghwf work-on`"));
     }
 
     #[test]
-    fn question_instruction_names_the_command_and_number() {
-        let out = super::question_instruction(7);
-        assert!(out.contains("`ghwf hand-off 7 --question`"));
-        assert!(out.contains("`ghwf wait 7`"));
+    fn question_instruction_names_the_command_without_a_number() {
+        let out = super::question_instruction();
+        assert!(out.contains("`ghwf hand-off --question`"));
+        assert!(out.contains("`ghwf wait`"));
         assert!(out.contains("AskUserQuestion"));
+        // A bare number would resolve against the cwd's repo, so it must not be
+        // suggested — the inferred form anchors to the bound issue.
+        assert!(!out.contains("hand-off 7"));
     }
 
     #[test]
     fn question_instruction_warns_against_treating_partial_replies_as_done() {
-        let out = super::question_instruction(7);
+        let out = super::question_instruction();
         assert!(out.contains("part of what you raised"));
         assert!(out.contains("more comments"));
     }
 
     #[test]
     fn pre_plan_body_steers_questions_off_interactive_prompts() {
-        let body = super::pre_plan_body(7);
-        assert!(body.contains("`ghwf hand-off 7 --question`"));
+        let body = super::pre_plan_body();
+        assert!(body.contains("`ghwf hand-off --question`"));
         assert!(body.contains("AskUserQuestion"));
     }
 
     #[test]
     fn pre_plan_body_warns_against_treating_partial_replies_as_done() {
-        let body = super::pre_plan_body(7);
+        let body = super::pre_plan_body();
         assert!(body.contains("part of what you asked"));
     }
 

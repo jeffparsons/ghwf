@@ -83,9 +83,9 @@ fn should_block(state: &IssueState) -> bool {
 fn block_reason(number: u64, phase: Phase) -> String {
     format!(
         "Issue #{number}'s ghwf workflow is still in the {} phase, so this session \
-         should keep watching for activity. Run `ghwf wait {number}` with a 10-minute \
-         command timeout: exit 0 means new activity arrived — run `ghwf work-on {number}` \
-         to process it; exit 2 means nothing yet — run `ghwf wait {number}` again. If the \
+         should keep watching for activity. Run `ghwf wait` with a 10-minute \
+         command timeout: exit 0 means new activity arrived — run `ghwf work-on` \
+         to process it; exit 2 means nothing yet — run `ghwf wait` again. If the \
          user has explicitly told you to stop working on this issue, stop instead.",
         phase.label()
     )
@@ -231,8 +231,10 @@ mod tests {
         let reason = block_reason(42, Phase::PrepAndPlan);
         assert!(reason.contains("#42"));
         assert!(reason.contains("prep-and-plan"));
-        assert!(reason.contains("ghwf wait 42"));
-        assert!(reason.contains("ghwf work-on 42"));
+        assert!(reason.contains("ghwf wait"));
+        assert!(reason.contains("ghwf work-on"));
+        // The bare number is omitted so the loop resolves against the bound issue.
+        assert!(!reason.contains("ghwf wait 42"));
         assert!(reason.contains("stop instead"));
     }
 }
