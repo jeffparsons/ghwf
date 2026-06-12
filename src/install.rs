@@ -46,6 +46,13 @@ Run `ghwf work-on $ARGUMENTS` and follow the phase banner exactly:
   so never write one. Both accept `--attach <path>` (repeatable) to attach a
   local file (e.g. a screenshot or log); it's committed to the repo's
   `ghwf-attachments` branch and linked from the comment.
+- Answer each question in the place it was asked: a comment on the issue
+  thread on the issue (`ghwf create-issue-comment $ARGUMENTS`), a comment on
+  the PR conversation thread on the PR (`ghwf create-issue-comment <PR#>`),
+  and an inline review comment in its own inline thread (`ghwf
+  reply-review-comment --id <id>`). Blocking questions back to the user and
+  phase hand-offs still go on the issue thread via `ghwf hand-off` / `ghwf
+  ask`.
 - Don't read a partial reply as the user being finished: if a comment
   addresses only some of what you raised, assume more may be coming. Unanswered
   questions, options, and suggested defaults stay open — only an explicit phase

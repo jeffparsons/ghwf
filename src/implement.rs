@@ -153,8 +153,9 @@ fn branch_body(
          complete and ready for human review, hand off with `ghwf hand-off` (body \
          from stdin): a comment summarising the change. ghwf appends the next-step \
          instructions (the user marks the draft PR ready for review) — do not write \
-         them yourself.\n\n{}\n\n{}",
+         them yourself.\n\n{}\n\n{}\n\n{}",
         pr_maintenance_instruction(pr_instructions),
+        crate::render::reply_where_asked_instruction(),
         crate::render::question_instruction(),
         crate::render::wait_instruction()
     )
@@ -176,8 +177,9 @@ fn review_body(pr_url: &str, pr_instructions: Option<&Path>) -> String {
         "Review — awaiting human review.\n\n\
          The PR is ready for review: {pr_url}\n\n\
          Nothing more is needed from you unless review feedback arrives; it will appear below \
-         on future `ghwf work-on` runs. {}\n\n{}\n\n{}",
+         on future `ghwf work-on` runs. {}\n\n{}\n\n{}\n\n{}",
         pr_maintenance_instruction(pr_instructions),
+        crate::render::reply_where_asked_instruction(),
         crate::render::question_instruction(),
         crate::render::wait_instruction()
     )
@@ -262,6 +264,23 @@ mod tests {
         ] {
             assert!(
                 body.contains("`ghwf hand-off --question`"),
+                "missing in: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn pr_bodies_steer_replies_to_where_asked() {
+        for body in [
+            branch_body("/wt", "plans/7-x.md", None, None),
+            review_body("https://github.com/o/r/pull/18", None),
+        ] {
+            assert!(
+                body.contains("Answer each question in the place it was asked"),
+                "missing in: {body}"
+            );
+            assert!(
+                body.contains("`ghwf reply-review-comment --id <id>`"),
                 "missing in: {body}"
             );
         }
