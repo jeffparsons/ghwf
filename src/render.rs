@@ -249,6 +249,18 @@ pub fn question_instruction() -> String {
         .to_string()
 }
 
+/// One-line reminder, shared by the phase banners where a PR exists, to answer
+/// each question in the thread it was asked in rather than defaulting to the
+/// issue thread.
+pub fn reply_where_asked_instruction() -> String {
+    "Answer each question in the place it was asked: a comment on the issue thread on the \
+     issue (`ghwf create-issue-comment`), a comment on the PR conversation thread on the PR \
+     (`ghwf create-issue-comment <PR#>`), and an inline review comment in its own inline \
+     thread (`ghwf reply-review-comment --id <id>`). Blocking questions back to the user and \
+     phase hand-offs still go on the issue thread via `ghwf hand-off` / `ghwf ask`."
+        .to_string()
+}
+
 /// How Claude should wait for the next human response, appended to every
 /// banner body that ends in a waiting state.
 pub fn wait_instruction() -> String {
@@ -732,7 +744,10 @@ pub fn render_work_on(
             out.push_str("\n<hr>\n");
         }
         prior_section = true;
-        out.push_str("\nNew inline review comments since you last ran `ghwf work-on`:\n");
+        out.push_str(
+            "\nNew inline review comments since you last ran `ghwf work-on`. Reply to each in \
+             its own inline thread:\n",
+        );
         for (i, view) in new_review.iter().enumerate() {
             if i > 0 {
                 out.push_str("\n<hr>\n");
@@ -743,7 +758,11 @@ pub fn render_work_on(
                 view.comment.user.login, view.comment.created_at, view.location, tag
             ));
             out.push_str(&blockquote(&view.body));
-            out.push('\n');
+            out.push_str(&format!(
+                "\nReply in this thread with `ghwf reply-review-comment --id {}` (body from \
+                 stdin).\n",
+                view.comment.id
+            ));
         }
     }
 
@@ -1354,9 +1373,12 @@ mod tests {
             &[review_view(&review)],
             &[],
         );
-        assert!(out.contains("New inline review comments since you last ran `ghwf work-on`:"));
+        assert!(out.contains("New inline review comments since you last ran `ghwf work-on`."));
         assert!(out.contains("**reviewer** at 2026-01-02T00:00:00Z said on `src/main.rs:42`:"));
         assert!(out.contains("> rename this"));
+        // The comment id and a ready-to-use reply command are surfaced so the
+        // reply can actually go in the inline thread it was asked in.
+        assert!(out.contains("`ghwf reply-review-comment --id 2`"));
     }
 
     #[test]

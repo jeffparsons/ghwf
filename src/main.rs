@@ -126,6 +126,10 @@ enum Commands {
     },
     /// Post a comment to an issue (or PR), reading the body from stdin.
     ///
+    /// Passing the issue number targets the issue thread; passing the PR number
+    /// targets the PR conversation thread (GitHub treats a PR as an issue). Use
+    /// this to answer a question on whichever thread it was asked.
+    ///
     /// The comment is prefixed with a "Claude says" header and tagged with hidden
     /// metadata identifying the authoring Claude session.
     CreateIssueComment {
