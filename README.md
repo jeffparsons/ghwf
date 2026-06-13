@@ -283,6 +283,23 @@ clone instead of fetching them over the network. The new repo is dissociated
 from the reference afterwards, so it's safe to delete the old clone — the
 typical migration move.
 
+Already have an ordinary clone you'd rather not re-download? `ghwf convert
+[path]` (default: the current directory) turns it into the layout above
+in place:
+
+```
+$ ghwf convert            # run from inside the clone
+```
+
+It builds a fresh single-branch bare repo — reusing the existing clone's
+objects, so the history isn't re-fetched — and moves it into the original
+path, renaming the original aside to `<name>.pre-ghwf/`. That backup is left
+fully intact, so any local-only branches, stashes, or uncommitted work are
+still there; the new bare repo itself is pristine, exactly as `ghwf clone`
+would produce. All the work happens in a scratch directory first and the
+final swap is two quick renames, so converting the directory you're sitting
+in is safe.
+
 `ghwf clone` generates only the config essentials; run `ghwf config init`
 afterwards for the optional extras (priority labels, PR instructions,
 workflow status labels). Other layouts remain fully supported — the command
