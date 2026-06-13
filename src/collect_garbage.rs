@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::models::BranchPr;
-use crate::{config, git, github, state, worktree};
+use crate::{config, git, github, state, store, worktree};
 
 /// Delete branches (local and remote) whose PRs have been merged, as long as
 /// the branch tip is exactly what got merged into the default branch, plus
@@ -51,6 +51,67 @@ pub fn run(dry_run: bool) -> Result<()> {
     if quiet {
         println!("Nothing to collect.");
     }
+    Ok(())
+}
+
+/// Run garbage collection automatically when this repo has opted in
+/// (`auto_collect_garbage`) and at least the configured interval has elapsed
+/// since the last automatic run. Best-effort: failures are warned about, never
+/// propagated. `owner`/`repo` key the per-repo throttle and should be the code
+/// repo GC acts on (which [`run`] resolves to independently).
+pub fn run_periodic(config: &config::Config, owner: &str, repo: &str) {
+    if !config.auto_collect_garbage {
+        return;
+    }
+    let interval_secs = config.auto_collect_garbage_interval_hours.saturating_mul(3600);
+    let now = state::now_epoch();
+    if !is_due(read_last_run(owner, repo), now, interval_secs) {
+        return;
+    }
+    println!("Running periodic garbage collection…");
+    if let Err(err) = run(false) {
+        eprintln!("warning: periodic garbage collection failed: {err:#}");
+    }
+    // Stamp regardless of GC's outcome, so a persistently-failing GC can't fire
+    // on every merge.
+    if let Err(err) = stamp_last_run(owner, repo, now) {
+        eprintln!("warning: failed to record periodic GC timestamp: {err:#}");
+    }
+}
+
+/// Whether an automatic GC is due, given the last run time, the current time,
+/// and the minimum gap. Never run → due; clock skew (`now` < `last`) → not due.
+fn is_due(last_run: Option<u64>, now: u64, interval_secs: u64) -> bool {
+    match last_run {
+        None => true,
+        Some(last) => now.saturating_sub(last) >= interval_secs,
+    }
+}
+
+/// Path to the per-repo timestamp recording the last automatic GC run.
+fn last_run_path(owner: &str, repo: &str) -> Result<PathBuf> {
+    Ok(store::data_dir()?
+        .join("gc")
+        .join(owner)
+        .join(repo)
+        .join("last-run"))
+}
+
+/// The epoch-seconds timestamp of the last automatic GC for this repo, or `None`
+/// when there is no record (or it is unreadable or garbled — treated as
+/// "never run", so GC simply runs).
+fn read_last_run(owner: &str, repo: &str) -> Option<u64> {
+    let path = last_run_path(owner, repo).ok()?;
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Record `now` as the last automatic-GC time for this repo.
+fn stamp_last_run(owner: &str, repo: &str, now: u64) -> Result<()> {
+    let path = last_run_path(owner, repo)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, now.to_string())?;
     Ok(())
 }
 
@@ -315,7 +376,7 @@ fn execute(
 
 #[cfg(test)]
 mod tests {
-    use super::{classify, pick_merged_pr, BranchFacts, TreeStatus, Verdict, WorktreeFacts};
+    use super::{classify, is_due, pick_merged_pr, BranchFacts, TreeStatus, Verdict, WorktreeFacts};
     use crate::models::{BranchPr, Oid};
     use std::path::PathBuf;
 
@@ -356,6 +417,20 @@ mod tests {
 
     fn run_classify(facts: &BranchFacts, merge_landed: bool) -> Verdict {
         classify("branch", facts, MERGED_TIP, merge_landed)
+    }
+
+    #[test]
+    fn is_due_honours_the_interval() {
+        // Never run before: always due.
+        assert!(is_due(None, 1_000, 3600));
+        // Less than the interval has passed: not due.
+        assert!(!is_due(Some(1_000), 1_000 + 3599, 3600));
+        // Exactly at the interval: due.
+        assert!(is_due(Some(1_000), 1_000 + 3600, 3600));
+        // A zero interval disables the throttle.
+        assert!(is_due(Some(1_000), 1_000, 0));
+        // Clock skew (now before last): not due, never panics.
+        assert!(!is_due(Some(2_000), 1_000, 3600));
     }
 
     #[test]

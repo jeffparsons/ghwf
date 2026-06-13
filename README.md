@@ -196,6 +196,11 @@ left alone. Nothing is ever force-deleted. Branches with an open PR, or with
 no merged PR at all, are skipped silently. Pass `--dry-run` to see what would
 be collected without touching anything.
 
+This can also run automatically. Set `auto_collect_garbage = true` (off by
+default) and ghwf runs the same collection after a ticket's PR merges, at most
+once per `auto_collect_garbage_interval_hours` (default 24 — once per day). The
+same safety rails apply, and the manual command stays available and unthrottled.
+
 ## Waiting for approval and feedback
 
 `ghwf wait <issue>` blocks until something new happens on the issue or its PR,
@@ -343,6 +348,17 @@ permission_mode = "auto"
 # (dirty worktree, merge commits on the branch, the plan modified by a later
 # commit, a rejected push), and a no-op in --no-branch mode.
 delete_plan_on_approval = true
+# When true, ghwf automatically runs garbage collection (same as
+# `ghwf collect-garbage`) after a ticket's PR merges, at most once per
+# `auto_collect_garbage_interval_hours` (optional; default false). It deletes
+# merged branches and their fully-clean worktrees, with the same safety rails as
+# the manual command (never the main or current worktree, never a dirty one,
+# never a force-delete). The manual command stays available and unthrottled.
+auto_collect_garbage = true
+# Minimum hours between automatic garbage collections (optional; default 24 —
+# once per day). e.g. 12 for twice a day, 168 for weekly. Ignored when
+# auto_collect_garbage is off.
+auto_collect_garbage_interval_hours = 24
 # GitHub logins whose comments and 👍 reactions ghwf acts on, in addition to you
 # (the authenticated user, always accepted) and the repo's collaborators —
 # anyone with an OWNER / MEMBER / COLLABORATOR association (optional; empty by
