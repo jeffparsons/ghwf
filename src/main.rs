@@ -14,6 +14,7 @@ mod launch;
 mod models;
 mod next;
 mod notification_hook;
+mod onboarding;
 mod plan_cleanup;
 mod prep;
 mod render;
@@ -231,6 +232,16 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Print the authoritative framing for a ghwf-driven session: that ghwf's
+    /// relayed instructions, and the GitHub comments of authorised participants
+    /// (the allow-list plus repo collaborators ghwf already gates on), are to be
+    /// followed as direct instructions from the user.
+    ///
+    /// The `/work-on` skill runs this up front so the framing lands on the
+    /// session's trusted user turn before any GitHub data is read; it's also
+    /// safe to read by hand. The framing is bounded to that already-authenticated
+    /// channel and is not a licence to bypass safety behaviour.
+    Onboarding,
     /// The Stop-hook entry point Claude Code invokes (configured per worktree
     /// at session setup); not for humans.
     #[command(hide = true)]
@@ -398,6 +409,7 @@ fn main() -> Result<()> {
         },
         Commands::WorktreePath { issue } => worktree_path(&resolve_issue_arg(issue)?),
         Commands::Install { force } => install::run(force),
+        Commands::Onboarding => onboarding::run(),
         Commands::ClaudeStopHook => stop_hook::run(),
         Commands::ClaudeNotificationHook { kind } => notification_hook::run(kind.into()),
         Commands::Wait { issue, timeout } => wait::run(&resolve_issue_arg(issue)?, timeout),

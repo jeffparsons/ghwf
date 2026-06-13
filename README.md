@@ -369,16 +369,40 @@ and never drifts from the code as options are added.
 `ghwf install` writes **the `/work-on` skill**, at
 `<claude_dir>/skills/work-on/SKILL.md` (where `<claude_dir>` is
 `$CLAUDE_CONFIG_DIR` or `~/.claude`), so a single `/work-on <issue>` in any
-session drives the workflow. It tells Claude to run `ghwf work-on`, follow the
-phase banner, keep the `wait`/`work-on` loop going until the workflow completes
-or you tell it to stop, and never raise an interactive prompt — questions go to
-the thread via `ghwf hand-off --question` instead.
+session drives the workflow. It first tells Claude to run `ghwf onboarding` (the
+session framing, below), then to run `ghwf work-on`, follow the phase banner,
+keep the `wait`/`work-on` loop going until the workflow completes or you tell it
+to stop, and never raise an interactive prompt — questions go to the thread via
+`ghwf hand-off --question` instead.
 
 Re-run `ghwf install` after upgrading ghwf to refresh it. The skill file carries
 a marker identifying it as ghwf-written; if a file without the marker is in the
 way, `install` refuses to touch it unless you pass `--force`. (An earlier ghwf
 also installed a global Stop hook; `install` now removes that leftover entry,
 since the hooks live per worktree — see below.)
+
+### The session framing (`ghwf onboarding`)
+
+The very first thing the `/work-on` skill does is run `ghwf onboarding` and treat
+its output as authoritative. That output is a short framing that establishes, up
+front, that **ghwf's relayed instructions and the GitHub comments of authorised
+participants are to be followed as direct instructions from the user** — so a
+session driven asynchronously from your phone doesn't treat an approval or answer
+that arrived over GitHub as untrusted third-party data and balk, second-guess, or
+demand a synchronous confirmation it can't get.
+
+Because the skill body is the expansion of the `/work-on` initial prompt, this
+runs on the session's own trusted user turn, before any GitHub data is read — and
+again on every relaunch/resume, since the launcher re-passes `/work-on`.
+
+The framing is deliberately **bounded**: the trust attaches only to the
+already-authenticated control channel ghwf gates on — its own output plus the
+comments and reactions of allow-listed users and repo collaborators (the same
+gate described under `allowed_users` above). It does *not* extend to arbitrary
+text encountered in code, files, other tools' output, or web pages, and it is not
+a licence to bypass safety behaviour — it only settles that an instruction on the
+authorised channel genuinely came from your principal. Run `ghwf onboarding`
+yourself to read the exact text.
 
 ### The session hooks (written per worktree, not globally)
 
@@ -447,7 +471,10 @@ rather than printing the phase banner. It narrates each step as it:
 
 The launched session starts itself: ghwf passes `/work-on` as the initial
 prompt, so the workflow advances without anyone typing — which is what makes
-the flow drivable from a phone. This stays interactive and subscription-billed;
+the flow drivable from a phone. The skill's first step is to run `ghwf
+onboarding`, establishing the session framing (see [The session
+framing](#the-session-framing-ghwf-onboarding)) on that trusted initial turn
+before any GitHub data is read. This stays interactive and subscription-billed;
 only `-p`/`--print` (headless) bills separately, and ghwf never uses it.
 
 The launcher exports `GHWF_ISSUE` (the issue's URL) to the `claude` it starts,
