@@ -190,6 +190,22 @@ pub fn merge_ff_only(dir: &Path, target: &str) -> Result<()> {
     git(dir, &["merge", "--ff-only", target]).map(|_| ())
 }
 
+/// Merge `target` (e.g. `origin/main`) into `dir`'s checked-out branch, creating
+/// a merge commit. On failure (including a conflicted merge) the merge is aborted
+/// so the working tree is left clean before the error propagates. Callers only
+/// invoke this after proving the merge is clean (see [`would_conflict`]); the
+/// abort is a safety net.
+pub fn merge(dir: &Path, target: &str) -> Result<()> {
+    match git(dir, &["merge", "--no-edit", target]) {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            // Best-effort: undo a half-applied or conflicted merge.
+            let _ = git_ok(dir, &["merge", "--abort"]);
+            Err(err)
+        }
+    }
+}
+
 /// True if `relpath` has no pending changes (committed or absent).
 pub fn is_clean(dir: &Path, relpath: &str) -> Result<bool> {
     Ok(git(dir, &["status", "--porcelain", "--", relpath])?
@@ -383,8 +399,8 @@ pub mod tests {
         add_worktree_for_branch, branch_worktree, commit_that_added, default_remote_branch,
         delete_local_branch, delete_remote_branch, fetch, force_push_with_lease,
         has_untracked_files, is_ancestor, is_tree_clean, list_local_branches, list_remote_branches,
-        merge_ff_only, parse_worktree_list, path_touched_in_range, range_has_merges, rebase_onto,
-        remove_worktree, rev_parse_ok, would_conflict,
+        merge, merge_ff_only, parse_worktree_list, path_touched_in_range, range_has_merges,
+        rebase_onto, remove_worktree, rev_parse_ok, would_conflict,
     };
     use std::path::{Path, PathBuf};
 
@@ -771,6 +787,44 @@ pub mod tests {
 
         // A non-resolving base is an error, not a silent "no conflict".
         assert!(would_conflict(&root, "nonexistent").is_err());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn merge_creates_commit_or_aborts_on_conflict() {
+        let root = scratch("merge");
+        init_repo(&root);
+
+        // `clean` touches a different file; merging it into main is clean and
+        // produces a merge commit that contains both sides.
+        run_git(&root, &["checkout", "-b", "clean"]);
+        std::fs::write(root.join("other.txt"), "x\n").unwrap();
+        run_git(&root, &["add", "other.txt"]);
+        run_git(&root, &["commit", "-m", "add other"]);
+        run_git(&root, &["checkout", "main"]);
+        std::fs::write(root.join("file.txt"), "two\n").unwrap();
+        run_git(&root, &["commit", "-am", "main edit"]);
+
+        let before = rev_parse(&root, "HEAD");
+        merge(&root, "clean").unwrap();
+        // HEAD advanced and now contains the merged branch.
+        assert_ne!(rev_parse(&root, "HEAD"), before);
+        assert!(is_ancestor(&root, "clean", "HEAD"));
+        assert!(is_tree_clean(&root).unwrap());
+
+        // A conflicting merge errors and aborts, leaving the tree clean.
+        run_git(&root, &["checkout", "-b", "feat", "main"]);
+        std::fs::write(root.join("file.txt"), "feat\n").unwrap();
+        run_git(&root, &["commit", "-am", "feat edit"]);
+        run_git(&root, &["checkout", "main"]);
+        std::fs::write(root.join("file.txt"), "main-again\n").unwrap();
+        run_git(&root, &["commit", "-am", "main edit again"]);
+
+        let before_conflict = rev_parse(&root, "HEAD");
+        assert!(merge(&root, "feat").is_err());
+        assert_eq!(rev_parse(&root, "HEAD"), before_conflict);
+        assert!(is_tree_clean(&root).unwrap());
 
         std::fs::remove_dir_all(&root).unwrap();
     }

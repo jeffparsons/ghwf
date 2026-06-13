@@ -334,6 +334,18 @@ pub fn conflict_notice(base: &str, number: u64) -> String {
     )
 }
 
+/// The block shown above the phase body when ghwf has just auto-merged the base
+/// into a behind-but-clean branch (the `auto_merge_base` config). Informational,
+/// like [`conflict_notice`]: it leads the banner but is never posted to a thread.
+pub fn base_merged_notice(base: &str, number: u64) -> String {
+    format!(
+        "ℹ️ Brought the branch up to date with `origin/{base}`\n\n\
+         The base branch had moved on, so ghwf merged `origin/{base}` into the branch \
+         for issue #{number} (a clean merge) and pushed it. Nothing for you to do — \
+         carry on below."
+    )
+}
+
 /// A phase transition that fired this run, for banner reporting.
 pub struct Transition {
     pub from: Phase,

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::git;
 use crate::models::Issue;
@@ -78,17 +78,42 @@ pub fn review(
     review_body(&pr_url, pr_instructions)
 }
 
-/// Detect whether the open PR's branch conflicts with the freshly-fetched
-/// base. Returns `Some(base_branch_name)` when it does.
-///
-/// Best-effort: any failure (no worktree on disk, offline, a git error) logs a
-/// warning and returns `None` — conflict detection must never break a
-/// `work-on` run. Detection is local: a `git fetch` of the base ref plus an
-/// in-memory `git merge-tree`, with no GitHub API calls.
+/// How the open PR's branch stands against its freshly-fetched base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseSync {
+    /// HEAD already contains `origin/<base>`; nothing to do.
+    UpToDate,
+    /// The base advanced beyond the merge-base and a trial merge is clean.
+    BehindClean,
+    /// The base advanced and a trial merge conflicts.
+    Conflict,
+}
+
+/// Fetch, then classify the worktree's HEAD against `origin/<base>`. Returns the
+/// base branch name (so callers can name it) alongside the verdict. Local: a
+/// `git fetch` plus an in-memory `git merge-tree`, no GitHub API calls.
+pub fn base_sync(worktree: &Path) -> Result<(String, BaseSync)> {
+    git::fetch(worktree)?;
+    let base = git::default_remote_branch(worktree)?;
+    let base_ref = format!("origin/{base}");
+    let sync = if git::is_ancestor(worktree, &base_ref, "HEAD") {
+        BaseSync::UpToDate
+    } else if git::would_conflict(worktree, &base_ref)? {
+        BaseSync::Conflict
+    } else {
+        BaseSync::BehindClean
+    };
+    Ok((base, sync))
+}
+
+/// Check the open PR's branch against its base, guarding the branch-mode
+/// preconditions and swallowing errors. Returns `None` when there's nothing to
+/// check (no branch / no PR / no worktree on disk) or the check failed — this
+/// must never break a `work-on` run.
 ///
 /// The caller gates this on the workflow having an open PR (so `pr_number` is
 /// expected); here we re-check the branch-mode preconditions defensively.
-pub fn detect_conflict(prep: &PrepState) -> Option<String> {
+pub fn check_base(prep: &PrepState) -> Option<(String, BaseSync)> {
     if prep.no_branch || prep.pr_number.is_none() {
         return None;
     }
@@ -96,24 +121,91 @@ pub fn detect_conflict(prep: &PrepState) -> Option<String> {
     if !worktree.is_dir() {
         return None;
     }
-    match try_detect_conflict(worktree) {
-        Ok(result) => result,
+    match base_sync(worktree) {
+        Ok(result) => Some(result),
         Err(err) => {
-            eprintln!("warning: could not check for merge conflicts: {err:#}");
+            eprintln!("warning: could not check the branch against its base: {err:#}");
             None
         }
     }
 }
 
-/// The fallible mechanics of [`detect_conflict`].
-fn try_detect_conflict(worktree: &Path) -> Result<Option<String>> {
-    git::fetch(worktree)?;
-    let base = git::default_remote_branch(worktree)?;
-    if git::would_conflict(worktree, &format!("origin/{base}"))? {
-        Ok(Some(base))
-    } else {
-        Ok(None)
+/// Detect whether the open PR's branch conflicts with the freshly-fetched base.
+/// Returns `Some(base_branch_name)` only when a trial merge conflicts; a clean
+/// or up-to-date branch (or any precondition-unmet / error case) is `None`.
+pub fn detect_conflict(prep: &PrepState) -> Option<String> {
+    match check_base(prep)? {
+        (base, BaseSync::Conflict) => Some(base),
+        _ => None,
     }
+}
+
+/// The leading banner block for the implement/review phase body when the branch
+/// is behind its base, plus whether it represents a standing conflict (which
+/// keeps the ball with Claude) or just an informational auto-merge note.
+pub enum BaseBanner {
+    /// A conflict the agent must resolve before the work is done.
+    Conflict(String),
+    /// ghwf merged the base in for a clean behind-branch; nothing to do.
+    Merged(String),
+}
+
+impl BaseBanner {
+    /// The rendered banner text to lead the phase body with.
+    pub fn text(&self) -> &str {
+        match self {
+            BaseBanner::Conflict(text) | BaseBanner::Merged(text) => text,
+        }
+    }
+
+    /// Whether this is a standing conflict (vs. a done-and-dusted auto-merge).
+    pub fn is_conflict(&self) -> bool {
+        matches!(self, BaseBanner::Conflict(_))
+    }
+}
+
+/// Build the leading banner block for the implement/review phase body when the
+/// branch is behind its base. A conflict yields the resolve-it-now notice; a
+/// clean-but-behind branch, when `auto_merge` is on, is merged up to base and
+/// pushed (the notice confirms it); everything else (up to date, or auto-merge
+/// off, or any failure) yields `None`.
+///
+/// Best-effort throughout: a failed auto-merge warns and falls through to no
+/// banner rather than breaking the run — GitHub still squash-merges fine.
+pub fn base_banner(prep: &PrepState, number: u64, auto_merge: bool) -> Option<BaseBanner> {
+    match check_base(prep)? {
+        (_, BaseSync::UpToDate) => None,
+        (base, BaseSync::Conflict) => Some(BaseBanner::Conflict(crate::render::conflict_notice(
+            &base, number,
+        ))),
+        (base, BaseSync::BehindClean) => {
+            if !auto_merge {
+                return None;
+            }
+            match auto_merge_base(prep, &base) {
+                Ok(()) => Some(BaseBanner::Merged(crate::render::base_merged_notice(
+                    &base, number,
+                ))),
+                Err(err) => {
+                    eprintln!("warning: auto-merge of `origin/{base}` failed: {err:#}");
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Merge `origin/<base>` into the PR branch and push. Caller has already proven
+/// the merge is clean (a `BehindClean` verdict).
+fn auto_merge_base(prep: &PrepState, base: &str) -> Result<()> {
+    let worktree = prep
+        .worktree_path
+        .as_ref()
+        .context("no worktree path recorded")?;
+    let branch = prep.branch.as_ref().context("no branch recorded")?;
+    git::merge(worktree, &format!("origin/{base}"))?;
+    git::push(worktree, branch)?;
+    Ok(())
 }
 
 /// The "keep the PR title/body current" paragraph, pointing at the project's
@@ -329,5 +421,72 @@ mod tests {
                 "missing in: {body}"
             );
         }
+    }
+
+    #[test]
+    fn base_sync_classifies_against_origin() {
+        use super::{base_sync, BaseSync};
+        use crate::git::tests::{init_repo, run_git, scratch};
+
+        let root = scratch("base-sync");
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        run_git(&origin, &["init", "--bare", "-b", "main"]);
+
+        // The PR-branch worktree, wired to the bare origin with origin/HEAD set.
+        let wt = root.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        init_repo(&wt);
+        run_git(&wt, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        run_git(&wt, &["push", "origin", "main"]);
+        run_git(&wt, &["fetch", "origin"]);
+        run_git(
+            &wt,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+
+        // A PR branch with its own commit while the base hasn't moved: HEAD
+        // already contains origin/main, so it's up to date.
+        run_git(&wt, &["checkout", "-b", "feat"]);
+        std::fs::write(wt.join("feat.txt"), "f\n").unwrap();
+        run_git(&wt, &["add", "feat.txt"]);
+        run_git(&wt, &["commit", "-m", "feat work"]);
+        assert_eq!(
+            base_sync(&wt).unwrap(),
+            ("main".to_string(), BaseSync::UpToDate)
+        );
+
+        // Advance origin/main on a different file (via a second clone): the
+        // branch is now behind, but a trial merge is clean.
+        let up = root.join("up");
+        run_git(
+            &root,
+            &["clone", origin.to_str().unwrap(), up.to_str().unwrap()],
+        );
+        std::fs::write(up.join("other.txt"), "o\n").unwrap();
+        run_git(&up, &["add", "other.txt"]);
+        run_git(&up, &["commit", "-m", "upstream other"]);
+        run_git(&up, &["push", "origin", "main"]);
+        assert_eq!(
+            base_sync(&wt).unwrap(),
+            ("main".to_string(), BaseSync::BehindClean)
+        );
+
+        // Both sides now edit the same line of file.txt: a conflict.
+        std::fs::write(wt.join("file.txt"), "feat\n").unwrap();
+        run_git(&wt, &["commit", "-am", "feat edits file"]);
+        std::fs::write(up.join("file.txt"), "upstream\n").unwrap();
+        run_git(&up, &["commit", "-am", "upstream edits file"]);
+        run_git(&up, &["push", "origin", "main"]);
+        assert_eq!(
+            base_sync(&wt).unwrap(),
+            ("main".to_string(), BaseSync::Conflict)
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
