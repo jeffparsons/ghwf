@@ -13,10 +13,12 @@ mod labels;
 mod launch;
 mod models;
 mod next;
+mod notification_hook;
 mod plan_cleanup;
 mod prep;
 mod render;
 mod seen;
+mod session_binding;
 mod state;
 mod stop_hook;
 mod store;
@@ -27,7 +29,7 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context as _, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use render::{CommentView, ReviewCommentView};
 
@@ -221,17 +223,27 @@ enum Commands {
         issue: Option<String>,
     },
     /// Install (or update) ghwf's user-global Claude Code integration: the
-    /// `/work-on` skill and the Stop hook that keeps a session working an
-    /// issue until its workflow is done.
+    /// `/work-on` skill. (The Stop and Notification hooks that keep a session
+    /// working — and recover a stuck one — are written per worktree at session
+    /// setup, not globally.)
     Install {
         /// Overwrite an existing skill file even when ghwf didn't write it.
         #[arg(long)]
         force: bool,
     },
-    /// The Stop-hook entry point Claude Code invokes (configured by
-    /// `ghwf install`); not for humans.
+    /// The Stop-hook entry point Claude Code invokes (configured per worktree
+    /// at session setup); not for humans.
     #[command(hide = true)]
     ClaudeStopHook,
+    /// The Notification-hook entry point Claude Code invokes (configured per
+    /// worktree at session setup); not for humans. Records that the session has
+    /// gone idle or parked on a permission prompt, for the supervisor to act on.
+    #[command(hide = true)]
+    ClaudeNotificationHook {
+        /// Which notification fired, set per matcher in the installed settings.
+        #[arg(long, value_enum)]
+        kind: NotificationKindArg,
+    },
     /// Block until new activity appears on an issue (or its PR), or the timeout
     /// elapses.
     ///
@@ -287,6 +299,24 @@ enum Commands {
         #[arg(long)]
         id: u64,
     },
+}
+
+/// Which notification fired, as the installed Notification-hook entries pass it
+/// on the command line. Mirrors [`state::AlertKind`], kept separate so the state
+/// type doesn't take a clap dependency.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum NotificationKindArg {
+    Idle,
+    Permission,
+}
+
+impl From<NotificationKindArg> for state::AlertKind {
+    fn from(arg: NotificationKindArg) -> Self {
+        match arg {
+            NotificationKindArg::Idle => state::AlertKind::Idle,
+            NotificationKindArg::Permission => state::AlertKind::Permission,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -369,6 +399,7 @@ fn main() -> Result<()> {
         Commands::WorktreePath { issue } => worktree_path(&resolve_issue_arg(issue)?),
         Commands::Install { force } => install::run(force),
         Commands::ClaudeStopHook => stop_hook::run(),
+        Commands::ClaudeNotificationHook { kind } => notification_hook::run(kind.into()),
         Commands::Wait { issue, timeout } => wait::run(&resolve_issue_arg(issue)?, timeout),
         Commands::ShowPr { issue } => show_pr(&resolve_issue_arg(issue)?),
         Commands::UpdatePr { issue, title } => {
@@ -1083,6 +1114,10 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         || conflict_base.is_some();
     if activity {
         issue_state.stop_nudges = 0;
+        // The session is working again, so any idle/blocked alert the
+        // Notification hook left is stale — clear it so the supervisor doesn't
+        // act on a resolved one.
+        issue_state.session_alert = None;
     }
 
     // Settle the attention axis. Review leaves nothing for Claude; otherwise

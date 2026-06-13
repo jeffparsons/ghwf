@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-use crate::state::{self, IssueState};
-use crate::{config, git, github, labels, next, prep, render, store};
+use crate::state::{self, AlertKind, IssueState, SessionAlert};
+use crate::{config, git, github, install, labels, next, prep, render, stop_hook, store};
 
 /// Prepare to launch as a launcher would: no Claude session is present, so make
 /// sure the issue's worktree exists and gather everything needed to spawn an
@@ -140,9 +140,22 @@ pub fn prepare(issue_arg: &str, no_branch: bool) -> Result<Option<Launch>> {
             });
             state::save(&owner, &repo, number, &issue_state)?;
         }
+        // No worktree to anchor to, but the session still launches in a real
+        // checkout: write the local hooks into the current directory so a
+        // --no-branch session is hardened too. Best-effort.
+        if let Ok(cwd) = std::env::current_dir() {
+            if let Err(err) = install::write_local_session_settings(&cwd) {
+                eprintln!(
+                    "warning: couldn't write local session hooks to `{}`: {err:#}",
+                    cwd.display()
+                );
+            }
+        }
         return Ok(Some(Launch {
             owner,
             repo,
+            code_owner,
+            code_repo,
             number,
             issue_url,
             permission_mode,
@@ -178,6 +191,11 @@ pub fn prepare(issue_arg: &str, no_branch: bool) -> Result<Option<Launch>> {
             // to keep the local default-branch checkout fresh. The default
             // branch is the code repo's, where the worktree lives.
             refresh_main_repo(&code_owner, &code_repo);
+            // Refresh the local hooks so a worktree created by an older binary
+            // (or before the hooks existed) picks them up on its next launch.
+            if let Err(err) = install::write_local_session_settings(&path) {
+                eprintln!("warning: couldn't refresh local session hooks: {err:#}");
+            }
             path
         }
         None => {
@@ -226,6 +244,8 @@ pub fn prepare(issue_arg: &str, no_branch: bool) -> Result<Option<Launch>> {
     Ok(Some(Launch {
         owner,
         repo,
+        code_owner,
+        code_repo,
         number,
         issue_url,
         permission_mode,
@@ -456,6 +476,10 @@ pub struct Launch {
     /// (which may differ from the code repo holding the worktree/PR).
     owner: String,
     repo: String,
+    /// The code repo (worktree/branch/PR), for label syncs during recovery —
+    /// the configured `main_repo`, which may differ from the issue's repo.
+    code_owner: String,
+    code_repo: String,
     number: u64,
     /// Exported as $GHWF_ISSUE so ghwf commands inside the session default to it.
     issue_url: String,
@@ -493,6 +517,14 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const DOUBLE_SIGINT_GAP: Duration = Duration::from_millis(400);
 /// How long to wait for each shutdown step to take effect before escalating.
 const SHUTDOWN_STEP: Duration = Duration::from_secs(5);
+/// How long an *ambiguous* stuck state (a plain idle, or a permission prompt a
+/// human might be about to clear) must persist before the supervisor recovers it
+/// automatically — leaving a generous window for the user, who's already been
+/// notified, to step in first. Unambiguous lockups don't wait.
+const RECOVERY_GRACE: Duration = Duration::from_secs(10 * 60);
+/// How many times the supervisor auto-resumes a session before giving up and
+/// parking the issue on the user.
+const MAX_AUTO_RESTARTS: u32 = 2;
 
 /// Prepare an issue's worktree and run a single interactive Claude session in
 /// it, exiting with the session's status code when it ends.
@@ -503,24 +535,24 @@ const SHUTDOWN_STEP: Duration = Duration::from_secs(5);
 /// session. From the user's point of view this is identical to the old exec:
 /// quitting Claude returns them to the shell that ran ghwf.
 pub fn run(issue_arg: &str, no_branch: bool) -> Result<()> {
-    let Some(launch) = prepare(issue_arg, no_branch)? else {
+    let Some(mut launch) = prepare(issue_arg, no_branch)? else {
         return Ok(());
     };
-    let mut child = spawn(&launch)?;
-    let status = with_job_control_ignored(|| child.wait())
-        .context("failed waiting for the `claude` session")?;
+    // Supervise (with auto-recovery) just like the `forever` worker, so a
+    // foreground session also un-sticks itself rather than wedging the terminal.
+    with_job_control_ignored(|| supervise(&mut launch))?;
     // `std::process::exit` skips destructors, so release the lease explicitly.
     drop(launch);
-    std::process::exit(status.code().unwrap_or(1));
+    std::process::exit(0);
 }
 
 /// Spawn a supervised session for an already-prepared launch and watch it until
-/// it ends. Returns [`Outcome::Completed`] once the workflow concludes (the
-/// supervisor brings the session down), or [`Outcome::UserQuit`] if the session
-/// exits first — the user quit an unfinished one.
-pub fn supervise_once(launch: &Launch) -> Result<Outcome> {
-    let mut child = spawn(launch)?;
-    with_job_control_ignored(|| monitor(launch, &mut child))
+/// it ends, auto-recovering from crashes and wedged/idle states along the way.
+/// Returns [`Outcome::Completed`] once the workflow concludes (the supervisor
+/// brings the session down), or [`Outcome::UserQuit`] if the user quit an
+/// unfinished one (or recovery was exhausted).
+pub fn supervise_once(launch: &mut Launch) -> Result<Outcome> {
+    with_job_control_ignored(|| supervise(launch))
 }
 
 /// The argument list for `claude`, in order: resume, permission mode, model,
@@ -598,42 +630,247 @@ fn spawn(launch: &Launch) -> Result<Child> {
         .context("failed to launch `claude` — is it installed and on PATH?")
 }
 
-/// Watch a running session: poll the issue's state, and when the workflow
-/// concludes send the shutdown gesture and report [`Outcome::Completed`]. If the
-/// session exits on its own first, report [`Outcome::UserQuit`].
+/// Run a session to a terminal outcome, re-spawning to recover from a crash or a
+/// wedged/idle state per the recovery policy. Returns once the workflow concludes
+/// ([`Outcome::Completed`]), the user quits cleanly, or auto-recovery is
+/// exhausted (both [`Outcome::UserQuit`]).
+fn supervise(launch: &mut Launch) -> Result<Outcome> {
+    // Recoveries performed this run, capped so a deterministically-broken
+    // session can't thrash.
+    let mut restarts: u32 = 0;
+    loop {
+        let mut child = spawn(launch)?;
+        match monitor_child(launch, &mut child)? {
+            Disposition::Concluded => {
+                println!(
+                    "Issue #{}'s workflow has concluded; bringing the session down.",
+                    launch.number
+                );
+                shutdown(&mut child)?;
+                return Ok(Outcome::Completed);
+            }
+            Disposition::UserQuit => return Ok(Outcome::UserQuit),
+            Disposition::Recover(reason) => {
+                ensure_down(&mut child)?;
+                restarts += 1;
+                if restarts > MAX_AUTO_RESTARTS {
+                    println!(
+                        "Issue #{}: auto-recovery exhausted after {MAX_AUTO_RESTARTS} attempt(s); \
+                         leaving the session with the user.",
+                        launch.number
+                    );
+                    park_on_user(launch, MAX_AUTO_RESTARTS);
+                    return Ok(Outcome::UserQuit);
+                }
+                println!(
+                    "Issue #{}: {reason}; resuming (attempt {restarts}/{MAX_AUTO_RESTARTS}).",
+                    launch.number
+                );
+                // The session is being restarted, so its alert is spent; clear
+                // it and recompute the resume target before re-spawning.
+                clear_alert(launch);
+                recompute_resume(launch);
+            }
+        }
+    }
+}
+
+/// Why [`monitor_child`] wants the session brought down and tried again, or how
+/// else it ended.
+enum Disposition {
+    /// The workflow concluded; the caller sends the shutdown gesture.
+    Concluded,
+    /// The child exited cleanly before conclusion — a genuine user quit.
+    UserQuit,
+    /// The session crashed or wedged; the caller recovers it. Carries a short
+    /// human-readable reason.
+    Recover(&'static str),
+}
+
+/// Watch one spawned child: poll the issue's state for conclusion, the child for
+/// exit, and the Notification-hook alert for a wedged/idle session. Surfaces a
+/// new stuck state to GitHub immediately, and returns a [`Disposition`] once the
+/// session has ended or needs recovering.
 ///
 /// Polling the local state file is safe against truncating Claude's final
 /// actions: `work-on` posts the concluding comment *before* it persists the
 /// terminal outcome, so by the time the state reads concluded the durable
 /// artifact is already on GitHub.
-fn monitor(launch: &Launch, child: &mut Child) -> Result<Outcome> {
+fn monitor_child(launch: &Launch, child: &mut Child) -> Result<Disposition> {
+    // Whether we've already surfaced the current stuck episode to GitHub. Reset
+    // when the alert clears, so each new episode is announced once.
+    let mut announced = false;
     loop {
-        if child
+        if let Some(status) = child
             .try_wait()
             .context("failed polling the `claude` session")?
-            .is_some()
         {
-            return Ok(Outcome::UserQuit);
+            // A clean exit is the user quitting; anything else is a crash we
+            // recover from.
+            return Ok(if status.success() {
+                Disposition::UserQuit
+            } else {
+                eprintln!(
+                    "The `claude` session for issue #{} exited unexpectedly ({status}).",
+                    launch.number
+                );
+                Disposition::Recover("the session crashed")
+            });
         }
-        if concluded(launch) {
-            println!(
-                "Issue #{}'s workflow has concluded; bringing the session down.",
-                launch.number
-            );
-            shutdown(child)?;
-            return Ok(Outcome::Completed);
+
+        let state = state::load_if_exists(&launch.owner, &launch.repo, launch.number)
+            .ok()
+            .flatten();
+        if let Some(state) = &state {
+            if state.is_concluded() {
+                return Ok(Disposition::Concluded);
+            }
+            match current_alert(state) {
+                Some(alert) => {
+                    if !announced {
+                        announce_stuck(launch, alert.kind);
+                        announced = true;
+                    }
+                    let idle = state::now_epoch().saturating_sub(alert.at);
+                    if matches!(
+                        classify_alert(alert.kind, state.stop_nudges, idle),
+                        AlertAction::Recover
+                    ) {
+                        return Ok(Disposition::Recover("the session is stuck"));
+                    }
+                }
+                // The alert cleared (the session is working again); ready to
+                // announce a fresh episode if one arises.
+                None => announced = false,
+            }
         }
         std::thread::sleep(POLL_INTERVAL);
     }
 }
 
-/// Whether the issue's recorded state shows the workflow concluded. Best-effort:
-/// an absent or unreadable state file reads as "not yet".
-fn concluded(launch: &Launch) -> bool {
-    state::load_if_exists(&launch.owner, &launch.repo, launch.number)
-        .ok()
-        .flatten()
-        .is_some_and(|state| state.is_concluded())
+/// Whether to recover now or keep waiting for an outstanding alert.
+#[derive(Debug, PartialEq, Eq)]
+enum AlertAction {
+    Wait,
+    Recover,
+}
+
+/// Decide what to do about an outstanding alert. An *unambiguous* lockup — the
+/// Stop hook has given up (`stop_nudges >= NUDGE_CAP`) and the session is idle,
+/// so the loop is definitively broken — is recovered at once. Anything
+/// ambiguous (a plain idle that might be a real pause, or a permission prompt a
+/// human could be about to clear) waits out the grace window first.
+fn classify_alert(kind: AlertKind, stop_nudges: u32, idle_secs: u64) -> AlertAction {
+    if kind == AlertKind::Idle && stop_nudges >= stop_hook::NUDGE_CAP {
+        return AlertAction::Recover;
+    }
+    if idle_secs >= RECOVERY_GRACE.as_secs() {
+        AlertAction::Recover
+    } else {
+        AlertAction::Wait
+    }
+}
+
+/// The outstanding alert, but only when it's about the session actually running
+/// now — i.e. it matches the worktree's recorded session id. Guards against
+/// acting on a stale signal a prior session left behind.
+fn current_alert(state: &IssueState) -> Option<&SessionAlert> {
+    let alert = state.session_alert.as_ref()?;
+    let recorded = state
+        .prep
+        .as_ref()
+        .and_then(|p| p.worktree_session_id.as_deref())?;
+    (alert.session_id == recorded).then_some(alert)
+}
+
+/// Wait for the child to exit if it already has, otherwise bring it down with
+/// the shutdown gesture. Used before a recovery re-spawn: a crashed child is
+/// already reaped (skip signalling), an idle one needs taking down.
+fn ensure_down(child: &mut Child) -> Result<()> {
+    if child
+        .try_wait()
+        .context("failed polling the `claude` session")?
+        .is_some()
+    {
+        return Ok(());
+    }
+    shutdown(child)
+}
+
+/// Drop a spent alert from the issue state before a recovery re-spawn, so the
+/// supervisor doesn't immediately re-trigger on it. Best-effort.
+fn clear_alert(launch: &Launch) {
+    if let Ok(Some(mut state)) = state::load_if_exists(&launch.owner, &launch.repo, launch.number) {
+        if state.session_alert.is_some() {
+            state.session_alert = None;
+            let _ = state::save(&launch.owner, &launch.repo, launch.number, &state);
+        }
+    }
+}
+
+/// Recompute the launch's `--resume` target from the latest recorded state, so a
+/// recovery re-spawn resumes the worktree's session. `--no-branch` sessions
+/// aren't worktree-resumable, so a fresh `/work-on` re-enters the loop instead.
+fn recompute_resume(launch: &mut Launch) {
+    let Some(dir) = launch.dir.clone() else {
+        launch.resume = None;
+        return;
+    };
+    let Ok(claude_dir) = store::claude_dir() else {
+        return;
+    };
+    if let Ok(Some(state)) = state::load_if_exists(&launch.owner, &launch.repo, launch.number) {
+        launch.resume = resumable_session(&claude_dir, &state, &dir);
+    }
+}
+
+/// Post a one-time heads-up that the session looks stuck, and flip the issue to
+/// "needs you" so it reaches the user quickly — recovery may yet fix it, but
+/// communicate first.
+fn announce_stuck(launch: &Launch, kind: AlertKind) {
+    let what = match kind {
+        AlertKind::Idle => "appears to have gone idle — it dropped out of the wait/work-on loop",
+        AlertKind::Permission => "is parked on a permission prompt",
+    };
+    let body = render::build_status_comment_body(&format!(
+        "Heads up: the Claude session for this issue {what}. ghwf will try to recover it \
+         automatically; if it can't, it'll leave the session with you."
+    ));
+    post_and_flag(launch, &body);
+}
+
+/// Post that auto-recovery has been exhausted and the session is now the user's
+/// to deal with, flipping the issue to "needs you".
+fn park_on_user(launch: &Launch, attempts: u32) {
+    let body = render::build_status_comment_body(&format!(
+        "ghwf tried to recover this issue's Claude session {attempts} time(s) but it kept \
+         getting stuck, so it's leaving the session with you. Resume it on the machine \
+         running ghwf, or re-launch with `ghwf work-on`."
+    ));
+    post_and_flag(launch, &body);
+}
+
+/// Post a status comment to the issue and flip it to waiting-on-user (state +
+/// labels). Best-effort throughout: a failed post or sync is a warning, never
+/// fatal to the supervisor.
+fn post_and_flag(launch: &Launch, body: &str) {
+    if let Err(err) = github::post_issue_comment(&launch.issue_url, body, None) {
+        eprintln!("warning: couldn't post the session-recovery notice: {err:#}");
+    }
+    let Ok(Some(mut state)) = state::load_if_exists(&launch.owner, &launch.repo, launch.number)
+    else {
+        return;
+    };
+    state.attention = state::Attention::WaitingOnUser;
+    let pr_number = state.prep.as_ref().and_then(|p| p.pr_number);
+    labels::sync(
+        &(launch.owner.clone(), launch.repo.clone()),
+        &(launch.code_owner.clone(), launch.code_repo.clone()),
+        launch.number,
+        pr_number,
+        &mut state,
+    );
+    let _ = state::save(&launch.owner, &launch.repo, launch.number, &state);
 }
 
 /// Bring the session down with the exit gesture, escalating if it lingers:
@@ -722,11 +959,87 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        claude_args, munge, parse_model, resumable_session, transcript_path, ModelProblem,
-        ModelSelection,
+        classify_alert, claude_args, current_alert, munge, parse_model, resumable_session,
+        transcript_path, AlertAction, ModelProblem, ModelSelection,
     };
-    use crate::state::{IssueState, PrepState};
+    use crate::state::{AlertKind, IssueState, PrepState, SessionAlert};
+    use crate::stop_hook::NUDGE_CAP;
     use std::path::{Path, PathBuf};
+
+    const GRACE: u64 = super::RECOVERY_GRACE.as_secs();
+
+    #[test]
+    fn unambiguous_idle_recovers_immediately() {
+        // Stop hook exhausted and the session is idle: the loop is definitively
+        // broken, so recover at once — no grace wait.
+        assert_eq!(
+            classify_alert(AlertKind::Idle, NUDGE_CAP, 0),
+            AlertAction::Recover
+        );
+    }
+
+    #[test]
+    fn ambiguous_idle_waits_out_the_grace() {
+        // Idle but the Stop hook hasn't given up: hold off until the grace passes.
+        assert_eq!(
+            classify_alert(AlertKind::Idle, NUDGE_CAP - 1, 0),
+            AlertAction::Wait
+        );
+        assert_eq!(
+            classify_alert(AlertKind::Idle, NUDGE_CAP - 1, GRACE - 1),
+            AlertAction::Wait
+        );
+        assert_eq!(
+            classify_alert(AlertKind::Idle, NUDGE_CAP - 1, GRACE),
+            AlertAction::Recover
+        );
+    }
+
+    #[test]
+    fn permission_is_always_ambiguous() {
+        // A permission prompt never counts as an unambiguous lockup, even with
+        // the Stop hook exhausted — a human may be about to clear it.
+        assert_eq!(
+            classify_alert(AlertKind::Permission, NUDGE_CAP, 0),
+            AlertAction::Wait
+        );
+        assert_eq!(
+            classify_alert(AlertKind::Permission, NUDGE_CAP, GRACE),
+            AlertAction::Recover
+        );
+    }
+
+    /// Issue state carrying an alert for `alert_session`, recorded against
+    /// `recorded_session` as the worktree's live session.
+    fn state_with_alert(recorded_session: &str, alert_session: &str) -> IssueState {
+        IssueState {
+            prep: Some(PrepState {
+                worktree_session_id: Some(recorded_session.to_string()),
+                ..Default::default()
+            }),
+            session_alert: Some(SessionAlert {
+                kind: AlertKind::Idle,
+                session_id: alert_session.to_string(),
+                at: 0,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn current_alert_matches_the_running_session() {
+        let state = state_with_alert("live", "live");
+        assert!(current_alert(&state).is_some());
+    }
+
+    #[test]
+    fn current_alert_ignores_a_stale_session() {
+        // An alert left by a prior session (different id) isn't acted on.
+        let state = state_with_alert("live", "old");
+        assert!(current_alert(&state).is_none());
+        // No alert, or no recorded session, is also nothing to act on.
+        assert!(current_alert(&IssueState::default()).is_none());
+    }
 
     #[test]
     fn no_model_line_is_default() {
