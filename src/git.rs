@@ -110,6 +110,19 @@ pub fn is_ignored(repo: &Path, relpath: &str) -> bool {
     git_ok(repo, &["check-ignore", "-q", relpath])
 }
 
+/// Resolve a path within the git metadata directory for `dir`, e.g.
+/// `info/exclude`. Handles linked worktrees correctly (where `.git` is a file),
+/// returning an absolute path.
+pub fn git_path(dir: &Path, relative: &str) -> Result<PathBuf> {
+    let raw = git(dir, &["rev-parse", "--git-path", relative])?;
+    let path = PathBuf::from(raw.trim());
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        dir.join(path)
+    })
+}
+
 /// The URL of the repo's `origin` remote.
 pub fn remote_url(repo: &Path) -> Result<String> {
     Ok(git(repo, &["remote", "get-url", "origin"])?

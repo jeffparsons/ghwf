@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::models::Issue;
 use crate::state::{self, IssueState, PrepState};
-use crate::{config, git, github};
+use crate::{config, git, github, install};
 
 /// Ensure the issue's branch + worktree exist, creating `state.prep` (in branch
 /// mode) if needed. Returns `(worktree_path, branch)`.
@@ -51,6 +51,14 @@ pub fn ensure_worktree(
 
     let worktree = prep.worktree_path.clone().expect("worktree path set above");
     let branch = prep.branch.clone().expect("branch set above");
+
+    // Write (and refresh) the local Claude Code hooks into the worktree at
+    // setup, so a session launched here keeps itself in the loop and signals
+    // when it's stuck. Best-effort: a failure must not block prep.
+    if let Err(err) = install::write_local_session_settings(&worktree) {
+        eprintln!("warning: couldn't write local session hooks to the worktree: {err:#}");
+    }
+
     Ok((worktree, branch))
 }
 

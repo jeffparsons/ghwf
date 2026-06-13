@@ -366,43 +366,71 @@ and never drifts from the code as options are added.
 
 ## Installing the Claude Code integration
 
-`ghwf install` writes ghwf's user-global Claude Code pieces, so a single
-`/work-on <issue>` in any session drives the workflow:
+`ghwf install` writes **the `/work-on` skill**, at
+`<claude_dir>/skills/work-on/SKILL.md` (where `<claude_dir>` is
+`$CLAUDE_CONFIG_DIR` or `~/.claude`), so a single `/work-on <issue>` in any
+session drives the workflow. It tells Claude to run `ghwf work-on`, follow the
+phase banner, keep the `wait`/`work-on` loop going until the workflow completes
+or you tell it to stop, and never raise an interactive prompt — questions go to
+the thread via `ghwf hand-off --question` instead.
 
-- **The `/work-on` skill**, at `<claude_dir>/skills/work-on/SKILL.md` (where
-  `<claude_dir>` is `$CLAUDE_CONFIG_DIR` or `~/.claude`). It tells Claude to
-  run `ghwf work-on`, follow the phase banner, keep the `wait`/`work-on` loop
-  going until the workflow completes or you tell it to stop, and never raise an
-  interactive prompt — questions go to the thread via `ghwf hand-off --question`
-  instead.
-- **A Stop hook** in `<claude_dir>/settings.json`, pointing at
-  `ghwf claude-stop-hook`.
+Re-run `ghwf install` after upgrading ghwf to refresh it. The skill file carries
+a marker identifying it as ghwf-written; if a file without the marker is in the
+way, `install` refuses to touch it unless you pass `--force`. (An earlier ghwf
+also installed a global Stop hook; `install` now removes that leftover entry,
+since the hooks live per worktree — see below.)
 
-Re-run `ghwf install` after upgrading ghwf to refresh both. The skill file
-carries a marker identifying it as ghwf-written; if a file without the marker
-is in the way, `install` refuses to touch it unless you pass `--force`. The
-settings merge is surgical (only our `hooks.Stop` entry is ever added) and
-idempotent, and anything unexpected about the file is an error, never an
-overwrite.
+### The session hooks (written per worktree, not globally)
 
-### How the Stop hook keeps a session working
+The hooks that keep a session on the rails are **not** global — they'd affect
+every Claude session you run. Instead ghwf writes them into a worktree-local
+`.claude/settings.local.json` when it sets the session's directory up (the
+worktree in branch mode, the current directory in `--no-branch`), refreshing
+them from the current binary on every launch so a worktree always carries the
+latest. That file is machine-local: ghwf adds it to the worktree's git exclude,
+so it never lands in a commit or a PR diff. The merge is surgical (only our
+entries are added) and idempotent, and anything unexpected about the file is an
+error, never an overwrite. Two hooks are installed:
 
-Claude Code runs the hook whenever Claude tries to finish responding. The hook
-consults only ghwf's local state: if the session is bound to an issue (it ran
-`work-on` in that issue's worktree) whose workflow is still active, the hook
-blocks the stop and tells Claude to resume the `wait`/`work-on` loop. It lets
-go when:
+**A Stop hook** (`ghwf claude-stop-hook`) keeps a session working. Claude Code
+runs it whenever Claude tries to finish responding; it consults only ghwf's
+local state and, if the session is bound to an issue (it ran `work-on` in that
+issue's worktree) whose workflow is still active, blocks the stop and tells
+Claude to resume the `wait`/`work-on` loop. It lets go when:
 
 - the issue is closed, or the PR was merged or closed without merging
   (recorded by the last `work-on` run);
 - it has nudged 3 times in a row with nothing new arriving — Claude is stuck
   or you've asked it to stop, so the hook stops fighting (any new activity
   observed by `work-on` resets the count); or
-- the session isn't bound to any issue (including all `--no-branch` work) —
-  the hook stays out of the way of every other Claude session.
+- the session isn't bound to any issue — the hook stays out of the way.
 
-The hook never touches the network and fails open: any error means the stop
-is allowed.
+**A Notification hook** (`ghwf claude-notification-hook`) records when a session
+goes idle or parks on a permission prompt, so the supervisor that launched it
+can recover it (see below). Like the Stop hook it only reads local state, never
+touches the network, and fails open.
+
+### Recovering a stuck session
+
+When ghwf launched the session (via `work-on` outside Claude, or `ghwf
+forever`), the launcher stays on as a thin supervisor and can un-stick a session
+without anyone returning to the machine. It watches for three things: the child
+process exiting, the workflow concluding, and the Notification hook's
+idle/permission signal. The moment a session looks stuck or exits unexpectedly
+it posts a heads-up to the issue and flips it to "needs you", so it reaches you
+quickly. Then:
+
+- an **unambiguous** lockup — the Stop hook has given up and the session is
+  sitting idle, or the process crashed — is recovered at once by bringing the
+  session down and resuming it (`claude --resume`, which re-runs `/work-on` and
+  drops back into the loop);
+- an **ambiguous** one — a plain idle that might be a real pause, or a
+  permission prompt you may be about to clear — is left alone for ten minutes
+  first, so you have a chance to step in before ghwf resumes it.
+
+Recovery is capped: after a couple of resumes that don't take, ghwf stops and
+leaves the session parked on you. A genuine clean quit is always respected — it
+ends the session rather than being recovered.
 
 ## Running `work-on` outside Claude
 

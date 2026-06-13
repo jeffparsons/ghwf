@@ -187,7 +187,7 @@ pub fn run_forever(no_branch: bool) -> Result<()> {
     let mut skip: BTreeSet<u64> = BTreeSet::new();
     loop {
         let number = wait_for_pick_excluding(None, &skip)?;
-        let launch = match launch::prepare(&number.to_string(), no_branch) {
+        let mut launch = match launch::prepare(&number.to_string(), no_branch) {
             Ok(Some(launch)) => launch,
             // A live session already holds it (leased between selection and now).
             Ok(None) => continue,
@@ -205,7 +205,7 @@ pub fn run_forever(no_branch: bool) -> Result<()> {
                 continue;
             }
         };
-        match launch::supervise_once(&launch)? {
+        match launch::supervise_once(&mut launch)? {
             launch::Outcome::Completed => {
                 println!("Issue #{number} concluded; looking for the next one.");
             }

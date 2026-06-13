@@ -292,6 +292,13 @@ pub struct IssueState {
     // at a cap, so a stuck session isn't fought forever.
     #[serde(default)]
     pub stop_nudges: u32,
+    // Set by the Notification hook when a launched session goes idle or parks on
+    // a permission prompt. Read (and cleared) by the supervisor to drive
+    // recovery, and cleared by `work-on` whenever it observes new activity, so a
+    // session that's working again starts clean. `None` means no outstanding
+    // alert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_alert: Option<SessionAlert>,
     // The most recent comment ghwf itself posted to either thread. Lives here
     // rather than on `WaitState` because `work-on` rebuilds that wholesale
     // when recording a baseline, and a status update posted mid-run must
@@ -315,6 +322,34 @@ impl IssueState {
 pub struct PostedRef {
     pub id: u64,
     pub created_at: String,
+}
+
+/// What kind of stuck state a [`SessionAlert`] reports — distinguished because
+/// the supervisor treats them differently (see the recovery policy).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AlertKind {
+    /// Claude went idle, waiting for input (Notification `idle_prompt`).
+    Idle,
+    /// A permission dialog appeared (Notification `permission_prompt`).
+    Permission,
+}
+
+/// A signal recorded by the Notification hook that a launched session has gone
+/// idle or parked on a permission prompt. The supervisor reads it to drive
+/// recovery; `work-on` clears it once the session is working again.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SessionAlert {
+    /// Which stuck state fired.
+    pub kind: AlertKind,
+    /// The session the alert is about, so a stale signal left by a prior
+    /// session is ignored.
+    pub session_id: String,
+    /// Epoch seconds the episode began. Held stable while the same kind of
+    /// alert for the same session keeps re-firing, so the supervisor's grace
+    /// window measures from when the session first got stuck, not the latest
+    /// notification.
+    pub at: u64,
 }
 
 /// What the last label sync applied: the inputs the desired label set is
@@ -690,7 +725,7 @@ pub enum Liveness {
 }
 
 /// Epoch seconds now, or 0 if the clock is somehow before the epoch.
-fn now_epoch() -> u64 {
+pub fn now_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
