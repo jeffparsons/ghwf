@@ -78,6 +78,13 @@ pub struct Config {
     /// day, 168 for weekly. Ignored when `auto_collect_garbage` is off.
     #[serde(default = "default_auto_collect_garbage_interval_hours")]
     pub auto_collect_garbage_interval_hours: u64,
+    /// When true, ghwf automatically merges the base branch into a PR branch that
+    /// has fallen behind it whenever the merge is clean, then pushes — keeping the
+    /// open PR current with the base branch and its CI fresh. ghwf never
+    /// auto-resolves an actual conflict; those are still surfaced for you or Claude
+    /// to handle. Off by default.
+    #[serde(default)]
+    pub auto_merge_base: bool,
     /// GitHub logins whose comments and 👍 reactions ghwf acts on, in addition
     /// to the always-accepted authenticated user and the repo's collaborators
     /// (anyone with an OWNER / MEMBER / COLLABORATOR association). Everyone

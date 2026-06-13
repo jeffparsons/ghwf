@@ -201,6 +201,25 @@ default) and ghwf runs the same collection after a ticket's PR merges, at most
 once per `auto_collect_garbage_interval_hours` (default 24 — once per day). The
 same safety rails apply, and the manual command stays available and unthrottled.
 
+## Staying current with the base branch
+
+The base branch moves while a PR is open, so ghwf checks the branch against a
+freshly-fetched `origin/<base>` at the moments that matter — entering the
+implement and review phases, and again at hand-off — using a local trial merge
+(`git merge-tree`, no GitHub API). When the branch conflicts, ghwf leads the
+phase banner with a resolve-it-now instruction and **blocks the
+ready-for-review hand-off** until the merge is pushed, so a known-conflicting
+branch is never announced as ready. While a PR sits idle in review, `ghwf wait`
+keeps probing on a slow cadence and wakes the agent the moment `main` moves
+under it and introduces a conflict — ghwf notices, rather than leaving it for
+you to spot at merge time.
+
+For the clean case, set `auto_merge_base = true` (off by default): when the
+branch has fallen behind but the merge is clean, ghwf merges `origin/<base>` in
+and pushes, keeping the open PR current with the base branch and its CI fresh.
+Conflicts are never auto-resolved — those are always surfaced for you or Claude
+to handle.
+
 ## Waiting for approval and feedback
 
 `ghwf wait <issue>` blocks until something new happens on the issue or its PR,
@@ -376,6 +395,11 @@ auto_collect_garbage = true
 # once per day). e.g. 12 for twice a day, 168 for weekly. Ignored when
 # auto_collect_garbage is off.
 auto_collect_garbage_interval_hours = 24
+# When true, ghwf merges the base branch into a PR branch that has fallen behind
+# it whenever the merge is clean, then pushes — keeping the open PR current with
+# the base branch and its CI fresh (optional; default false). Conflicts are
+# never auto-resolved; they are still surfaced for you or Claude to handle.
+auto_merge_base = true
 # GitHub logins whose comments and 👍 reactions ghwf acts on, in addition to you
 # (the authenticated user, always accepted) and the repo's collaborators —
 # anyone with an OWNER / MEMBER / COLLABORATOR association (optional; empty by

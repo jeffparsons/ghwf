@@ -257,6 +257,21 @@ pub fn run() -> Result<()> {
         }
     }
 
+    if !doc.contains_key("auto_merge_base")
+        && prompt(
+            Confirm::new(
+                "Automatically merge the base branch into a PR branch that has \
+                 fallen behind, when the merge is clean? (keeps the PR current; \
+                 conflicts are still surfaced, never auto-resolved)",
+            )
+            .with_default(false)
+            .prompt(),
+        )?
+    {
+        set_auto_merge_base(&mut doc);
+        doc_changed = true;
+    }
+
     if !doc.contains_key("only_assigned_to_me")
         && prompt(
             Confirm::new(
@@ -607,6 +622,20 @@ fn set_auto_collect_garbage_interval_hours(doc: &mut DocumentMut, hours: u64) {
     );
 }
 
+/// Write the `auto_merge_base` key (only ever set to `true` — the wizard offers
+/// it only when absent, and the default is `false`).
+fn set_auto_merge_base(doc: &mut DocumentMut) {
+    insert_with_comment(
+        doc,
+        "auto_merge_base",
+        toml_edit::value(true),
+        "When true, ghwf merges the base branch into a PR branch that has fallen\n\
+         behind it whenever the merge is clean, then pushes — keeping the open PR\n\
+         current with the base branch. Conflicts are never auto-resolved; they are\n\
+         still surfaced for you or Claude to handle.",
+    );
+}
+
 /// Write the `only_assigned_to_me` key (only ever set to `true` — the wizard
 /// offers it only when absent, and the default is `false`).
 fn set_only_assigned_to_me(doc: &mut DocumentMut) {
@@ -709,8 +738,9 @@ fn append_line(path: &Path, line: &str) -> Result<()> {
 mod tests {
     use super::{
         parse_issue_repos, parse_priority_labels, set_auto_collect_garbage,
-        set_auto_collect_garbage_interval_hours, set_blocked_label, set_delete_plan_on_approval,
-        set_essentials, set_only_assigned_to_me, set_permission_mode, set_priority_labels, PR_STUB,
+        set_auto_collect_garbage_interval_hours, set_auto_merge_base, set_blocked_label,
+        set_delete_plan_on_approval, set_essentials, set_only_assigned_to_me, set_permission_mode,
+        set_priority_labels, PR_STUB,
     };
     use crate::config::Config;
     use std::path::PathBuf;
@@ -801,6 +831,15 @@ pre-plan = \"a\"
         let config: Config = toml::from_str(&doc.to_string()).unwrap();
         assert!(config.auto_collect_garbage);
         assert_eq!(config.auto_collect_garbage_interval_hours, 12);
+    }
+
+    #[test]
+    fn auto_merge_base_round_trips() {
+        let mut doc = DocumentMut::new();
+        set_essentials(&mut doc, None, "worktrees");
+        set_auto_merge_base(&mut doc);
+        let config: Config = toml::from_str(&doc.to_string()).unwrap();
+        assert!(config.auto_merge_base);
     }
 
     #[test]

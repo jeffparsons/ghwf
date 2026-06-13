@@ -20,6 +20,9 @@ const BACKOFF_FLOOR: Duration = Duration::from_secs(5);
 const BACKOFF_CAP: Duration = Duration::from_secs(60);
 /// In feed mode, a full direct cycle runs this often as the lag backstop.
 const FEED_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+/// Slowest cadence at which a review-phase wait probes the branch for a freshly
+/// introduced base conflict (a local fetch + merge-tree, never on the hot path).
+const CONFLICT_PROBE_INTERVAL: Duration = Duration::from_secs(300);
 /// Feed cadence floor; raised by the `X-Poll-Interval` header when larger.
 const FEED_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// This many consecutive failed cycles aborts the wait.
@@ -108,7 +111,35 @@ pub fn run(issue: &str, timeout_secs: u64) -> Result<()> {
     // so the gate isn't re-fetched every cycle at the cap.
     let mut feed_distrusted = false;
 
+    // While a PR idles in the review phase, the events feed is structurally blind
+    // to `main` advancing under it, so probe the branch locally on a slow cadence
+    // (item 2 of #107). Only the review phase is probed — implement-phase
+    // conflicts are caught by the next `work-on`. The probe stays read-only; a
+    // fresh conflict wakes the session, and `work-on` then surfaces and resolves
+    // it. `detect_conflict` re-checks the branch/PR/worktree preconditions, so a
+    // non-branch or worktree-less workflow probes to a cheap no-op.
+    let probe_eligible = issue_state.phase == state::Phase::Review;
+    // Skip the first interval: `work-on` already checked conflicts entering the
+    // review phase, so the soonest a fresh one matters is one interval out.
+    let mut last_probe = Instant::now();
+
     loop {
+        if probe_eligible && last_probe.elapsed() >= CONFLICT_PROBE_INTERVAL {
+            last_probe = Instant::now();
+            let conflict = issue_state
+                .prep
+                .as_ref()
+                .and_then(crate::implement::detect_conflict);
+            let (reason, seen) =
+                conflict_wake(conflict.as_deref(), number, wait_state.conflict_seen);
+            wait_state.conflict_seen = seen;
+            if let Some(reason) = reason {
+                persist(&owner, &repo, number, &mut issue_state, &wait_state);
+                println!("{reason}");
+                return Ok(());
+            }
+        }
+
         // One cycle in the current mode; its result decides reasons and pace.
         let cycle = match &mut mode {
             Mode::Direct => direct_cycle(&endpoints, &mut wait_state, my_token.as_deref(), &access),
@@ -875,6 +906,24 @@ fn feed_trusted(events: &[FeedEvent], last_posted: Option<&PostedRef>) -> bool {
 
 /// Persist the wait state (ETags) back onto the issue state, best-effort: a
 /// failed write only costs the next invocation a few uncached polls.
+/// Decide whether a conflict probe result should wake the session, given the
+/// previously-seen state. A conflict wakes only on the clean->conflict edge; a
+/// persistent conflict stays quiet (so we don't re-wake every cycle), and a
+/// clean result resets the flag so a later re-conflict wakes again. Returns the
+/// optional wake reason and the new `conflict_seen` flag.
+fn conflict_wake(conflict: Option<&str>, number: u64, seen: bool) -> (Option<String>, bool) {
+    match conflict {
+        Some(base) if !seen => (
+            Some(format!(
+                "`origin/{base}` moved on and PR #{number} now conflicts with it."
+            )),
+            true,
+        ),
+        Some(_) => (None, true),
+        None => (None, false),
+    }
+}
+
 fn persist(
     owner: &str,
     repo: &str,
@@ -891,8 +940,9 @@ fn persist(
 #[cfg(test)]
 mod tests {
     use super::{
-        comment_reasons, evaluate_fresh, feed_interval, feed_trusted, feed_wake_reasons, Endpoint,
-        EndpointKind, FeedComment, FeedEvent, FeedPayload, FeedSubject,
+        comment_reasons, conflict_wake, evaluate_fresh, feed_interval, feed_trusted,
+        feed_wake_reasons, Endpoint, EndpointKind, FeedComment, FeedEvent, FeedPayload,
+        FeedSubject,
     };
     use crate::access::AccessList;
     use crate::models::{Comment, User};
@@ -1499,5 +1549,25 @@ mod tests {
         assert_eq!(feed_interval(None), Duration::from_secs(60));
         assert_eq!(feed_interval(Some(30)), Duration::from_secs(60));
         assert_eq!(feed_interval(Some(120)), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn conflict_wake_fires_only_on_the_clean_to_conflict_edge() {
+        // A fresh conflict wakes and records that it was seen.
+        let (reason, seen) = conflict_wake(Some("main"), 7, false);
+        assert!(reason
+            .as_deref()
+            .is_some_and(|r| r.contains("PR #7") && r.contains("`origin/main`")));
+        assert!(seen);
+
+        // A persistent conflict stays quiet but keeps the flag set.
+        let (reason, seen) = conflict_wake(Some("main"), 7, true);
+        assert!(reason.is_none());
+        assert!(seen);
+
+        // Clearing the conflict resets the flag so a later one wakes again.
+        let (reason, seen) = conflict_wake(None, 7, true);
+        assert!(reason.is_none());
+        assert!(!seen);
     }
 }

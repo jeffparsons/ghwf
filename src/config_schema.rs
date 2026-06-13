@@ -183,6 +183,7 @@ fn example_covers_every_field(
         allowed_users,
         auto_collect_garbage,
         auto_collect_garbage_interval_hours,
+        auto_merge_base,
     } = config;
     let LabelsConfig {
         phase: _,
@@ -230,6 +231,7 @@ fn render_example() -> String {
         "auto_collect_garbage_interval_hours",
         toml_edit::value(24),
     );
+    insert(&mut doc, "auto_merge_base", toml_edit::value(true));
     insert(&mut doc, "only_assigned_to_me", toml_edit::value(true));
     insert(&mut doc, "blocked_label", toml_edit::value("blocked"));
 
