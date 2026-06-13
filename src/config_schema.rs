@@ -181,6 +181,8 @@ fn example_covers_every_field(
         blocked_label,
         issue_repos,
         allowed_users,
+        auto_collect_garbage,
+        auto_collect_garbage_interval_hours,
     } = config;
     let LabelsConfig {
         phase: _,
@@ -222,6 +224,12 @@ fn render_example() -> String {
     );
     insert(&mut doc, "permission_mode", toml_edit::value("auto"));
     insert(&mut doc, "delete_plan_on_approval", toml_edit::value(true));
+    insert(&mut doc, "auto_collect_garbage", toml_edit::value(true));
+    insert(
+        &mut doc,
+        "auto_collect_garbage_interval_hours",
+        toml_edit::value(24),
+    );
     insert(&mut doc, "only_assigned_to_me", toml_edit::value(true));
     insert(&mut doc, "blocked_label", toml_edit::value("blocked"));
 

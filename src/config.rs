@@ -65,6 +65,19 @@ pub struct Config {
     /// plain `"owner/repo"` string or a table with an optional `branch_prefix`.
     #[serde(default)]
     pub issue_repos: Vec<IssueRepo>,
+    /// When true, ghwf automatically runs garbage collection (the same work as
+    /// `ghwf collect-garbage`) after a ticket's workflow finishes — i.e. when its
+    /// PR is observed merged — at most once per `auto_collect_garbage_interval_hours`.
+    /// Off by default: opt in to let ghwf delete merged branches and their clean
+    /// worktrees on your behalf. The manual `ghwf collect-garbage` command is
+    /// unaffected by this setting (always available, never throttled).
+    #[serde(default)]
+    pub auto_collect_garbage: bool,
+    /// Minimum hours between automatic garbage collections (see
+    /// `auto_collect_garbage`). Defaults to 24 (once per day); e.g. 12 for twice a
+    /// day, 168 for weekly. Ignored when `auto_collect_garbage` is off.
+    #[serde(default = "default_auto_collect_garbage_interval_hours")]
+    pub auto_collect_garbage_interval_hours: u64,
     /// GitHub logins whose comments and 👍 reactions ghwf acts on, in addition
     /// to the always-accepted authenticated user and the repo's collaborators
     /// (anyone with an OWNER / MEMBER / COLLABORATOR association). Everyone
@@ -140,6 +153,11 @@ fn parse_owner_repo_spec(spec: &str) -> Result<(String, String)> {
 /// run without a `ghwf.toml` (where there is no `Config` to read it from).
 pub fn default_blocked_label() -> String {
     "blocked".to_string()
+}
+
+/// The default for [`Config::auto_collect_garbage_interval_hours`]: once a day.
+fn default_auto_collect_garbage_interval_hours() -> u64 {
+    24
 }
 
 impl Config {
@@ -407,6 +425,28 @@ mod tests {
         // Pre-existing configs without the key keep loading.
         let config: Config = toml::from_str(r#"worktrees_dir = "worktrees""#).unwrap();
         assert!(!config.delete_plan_on_approval);
+    }
+
+    #[test]
+    fn auto_collect_garbage_parses() {
+        let config: Config = toml::from_str(
+            r#"
+            worktrees_dir = "worktrees"
+            auto_collect_garbage = true
+            auto_collect_garbage_interval_hours = 12
+            "#,
+        )
+        .unwrap();
+        assert!(config.auto_collect_garbage);
+        assert_eq!(config.auto_collect_garbage_interval_hours, 12);
+    }
+
+    #[test]
+    fn auto_collect_garbage_defaults() {
+        // Pre-existing configs without the keys keep loading: off, daily.
+        let config: Config = toml::from_str(r#"worktrees_dir = "worktrees""#).unwrap();
+        assert!(!config.auto_collect_garbage);
+        assert_eq!(config.auto_collect_garbage_interval_hours, 24);
     }
 
     #[test]

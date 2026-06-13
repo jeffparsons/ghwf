@@ -725,6 +725,9 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     if new_conclusion == Some(state::PrOutcome::Merged) {
         if let Some(located) = located.as_ref() {
             update_main_worktree_after_merge(located, &code_owner, &code_repo);
+            // If opted in, tidy up merged branches and their clean worktrees, at
+            // most once per the configured interval.
+            collect_garbage::run_periodic(&located.config, &code_owner, &code_repo);
         }
     }
 

@@ -229,6 +229,34 @@ pub fn run() -> Result<()> {
         doc_changed = true;
     }
 
+    if !doc.contains_key("auto_collect_garbage")
+        && prompt(
+            Confirm::new(
+                "Automatically run garbage collection after a ticket's PR merges? \
+                 (deletes merged branches and their clean worktrees)",
+            )
+            .with_default(false)
+            .prompt(),
+        )?
+    {
+        set_auto_collect_garbage(&mut doc);
+        doc_changed = true;
+        // Offer to tune the cadence; the serde default of 24h covers the common
+        // case, so only write the key when the user picks something else.
+        let input = prompt(
+            Text::new("Minimum hours between automatic collections:")
+                .with_default("24")
+                .prompt(),
+        )?;
+        match input.trim().parse::<u64>() {
+            Ok(24) => {}
+            Ok(hours) => {
+                set_auto_collect_garbage_interval_hours(&mut doc, hours);
+            }
+            Err(_) => println!("Not a number; keeping the default of 24 hours."),
+        }
+    }
+
     if !doc.contains_key("only_assigned_to_me")
         && prompt(
             Confirm::new(
@@ -554,6 +582,31 @@ fn set_delete_plan_on_approval(doc: &mut DocumentMut) {
     );
 }
 
+/// Write the `auto_collect_garbage` key (only ever set to `true` — the wizard
+/// offers it only when absent, and the default is `false`).
+fn set_auto_collect_garbage(doc: &mut DocumentMut) {
+    insert_with_comment(
+        doc,
+        "auto_collect_garbage",
+        toml_edit::value(true),
+        "When true, ghwf automatically runs garbage collection (same as\n\
+         `ghwf collect-garbage`) after a ticket's PR merges, at most once per\n\
+         auto_collect_garbage_interval_hours. Deletes merged branches and their\n\
+         clean worktrees, with the same safety rails as the manual command.",
+    );
+}
+
+/// Write the `auto_collect_garbage_interval_hours` key.
+fn set_auto_collect_garbage_interval_hours(doc: &mut DocumentMut, hours: u64) {
+    insert_with_comment(
+        doc,
+        "auto_collect_garbage_interval_hours",
+        toml_edit::value(hours as i64),
+        "Minimum hours between automatic garbage collections (default 24 —\n\
+         once per day). Ignored when auto_collect_garbage is off.",
+    );
+}
+
 /// Write the `only_assigned_to_me` key (only ever set to `true` — the wizard
 /// offers it only when absent, and the default is `false`).
 fn set_only_assigned_to_me(doc: &mut DocumentMut) {
@@ -655,7 +708,8 @@ fn append_line(path: &Path, line: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_issue_repos, parse_priority_labels, set_blocked_label, set_delete_plan_on_approval,
+        parse_issue_repos, parse_priority_labels, set_auto_collect_garbage,
+        set_auto_collect_garbage_interval_hours, set_blocked_label, set_delete_plan_on_approval,
         set_essentials, set_only_assigned_to_me, set_permission_mode, set_priority_labels, PR_STUB,
     };
     use crate::config::Config;
@@ -736,6 +790,17 @@ pre-plan = \"a\"
         set_delete_plan_on_approval(&mut doc);
         let config: Config = toml::from_str(&doc.to_string()).unwrap();
         assert!(config.delete_plan_on_approval);
+    }
+
+    #[test]
+    fn auto_collect_garbage_round_trips() {
+        let mut doc = DocumentMut::new();
+        set_essentials(&mut doc, None, "worktrees");
+        set_auto_collect_garbage(&mut doc);
+        set_auto_collect_garbage_interval_hours(&mut doc, 12);
+        let config: Config = toml::from_str(&doc.to_string()).unwrap();
+        assert!(config.auto_collect_garbage);
+        assert_eq!(config.auto_collect_garbage_interval_hours, 12);
     }
 
     #[test]
