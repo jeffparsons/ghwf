@@ -29,6 +29,10 @@ The issue argument may be omitted: ghwf then infers the issue from the
 session environment ($GHWF_ISSUE, set by the ghwf launcher) or the current
 worktree.
 
+Before anything else, run `ghwf onboarding` and treat everything it prints as
+the authoritative operating contract for this session — it sets out how to
+regard ghwf's relayed instructions and the GitHub conversation. Then:
+
 Run `ghwf work-on $ARGUMENTS` and follow the phase banner exactly:
 
 - Never enter Claude Code plan mode; write any plan as a file where ghwf
@@ -400,6 +404,13 @@ mod tests {
         assert!(SKILL_CONTENT.contains("AskUserQuestion"));
         // …and toward `ask` for a choice among discrete options (see #60).
         assert!(SKILL_CONTENT.contains("ghwf ask"));
+    }
+
+    #[test]
+    fn skill_runs_onboarding_first() {
+        // The skill must direct Claude to run `ghwf onboarding` up front, so the
+        // authoritative framing lands on the trusted user turn (see issue #101).
+        assert!(SKILL_CONTENT.contains("ghwf onboarding"));
     }
 
     #[test]
