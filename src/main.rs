@@ -4,6 +4,7 @@ mod clone;
 mod collect_garbage;
 mod config;
 mod config_schema;
+mod convert;
 mod git;
 mod github;
 mod implement;
@@ -114,6 +115,12 @@ enum Commands {
         /// is dissociated from it afterwards, so it can be deleted safely.
         #[arg(long)]
         reference: Option<PathBuf>,
+    },
+    /// Convert an existing ordinary (non-bare) clone into ghwf's preferred
+    /// layout, keeping the original clone intact as a `<name>.pre-ghwf` backup.
+    Convert {
+        /// The clone to convert. Defaults to the current directory.
+        path: Option<PathBuf>,
     },
     /// Delete branches and worktrees for PRs that have already been merged.
     ///
@@ -384,6 +391,7 @@ fn main() -> Result<()> {
             directory,
             reference,
         } => clone::run(&repo, directory.as_deref(), reference.as_deref()),
+        Commands::Convert { path } => convert::run(path.as_deref()),
         Commands::CollectGarbage { dry_run } => collect_garbage::run(dry_run),
         Commands::CreateIssueComment { issue, attach } => {
             create_issue_comment(&resolve_issue_arg(issue)?, &attach)

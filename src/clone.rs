@@ -90,7 +90,9 @@ fn create_container(container: &Path) -> Result<bool> {
 /// Everything after URL resolution: clone the bare repo, make its remote
 /// behave like a normal clone's, and generate the config and worktrees
 /// directory. Returns the default branch when its worktree was created.
-fn populate(
+///
+/// Shared with `convert`, which builds the same layout from an existing clone.
+pub(crate) fn populate(
     container: &Path,
     name: &str,
     url: &str,
