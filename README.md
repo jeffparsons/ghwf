@@ -160,6 +160,12 @@ concludes (the usual Ctrl-C-twice or `/exit`); ghwf reads that as you stepping i
 and stops the loop rather than picking the next issue. (`ghwf next --forever`
 remains as a hidden alias for `ghwf forever` during a transitional period.)
 
+To wind a worker down *without* interrupting it, run `ghwf stop`: each running
+`forever` worker finishes the issue it's currently on and then exits instead of
+picking another. The request is recorded under ghwf's data dir and reaches every
+forever worker on the machine; a worker you start afterwards ignores it, so it's
+safe to `ghwf stop` and then launch a fresh worker.
+
 A `forever` worker also rides out a launch that fails for a transient reason
 (say a network blip while fetching the issue or creating the worktree): it logs
 the failure, leaves the issue pickable rather than locking it, and moves on to
