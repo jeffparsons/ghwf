@@ -65,13 +65,30 @@ pub fn pick() -> Result<u64> {
 /// endpoint is polled per cycle, so even at the cap a worker costs ~60 req/hr —
 /// no events-feed idle mode is needed.
 pub fn wait_for_pick(timeout_secs: Option<u64>) -> Result<u64> {
-    wait_for_pick_excluding(timeout_secs, &BTreeSet::new())
+    match wait_for_pick_excluding(timeout_secs, &BTreeSet::new(), || false)? {
+        WaitOutcome::Picked(number) => Ok(number),
+        // The abort check never fires for this caller (it's always `|| false`).
+        WaitOutcome::Aborted => unreachable!("wait_for_pick never aborts"),
+    }
+}
+
+/// How a wait for a pick ended: a claimed issue, or an abort the caller's
+/// `abort` check asked for (a `forever` worker that's been told to stop).
+enum WaitOutcome {
+    Picked(u64),
+    Aborted,
 }
 
 /// [`wait_for_pick`], but with a set of issue numbers the caller has already
 /// given up on this run (a `forever` worker's launch failures), excluded from
-/// selection so they can't be re-picked in a loop.
-fn wait_for_pick_excluding(timeout_secs: Option<u64>, skip: &BTreeSet<u64>) -> Result<u64> {
+/// selection so they can't be re-picked in a loop, and an `abort` check
+/// consulted each poll cycle so a parked worker can bow out promptly (returning
+/// [`WaitOutcome::Aborted`]) rather than waiting for the next eligible issue.
+fn wait_for_pick_excluding(
+    timeout_secs: Option<u64>,
+    skip: &BTreeSet<u64>,
+    abort: impl Fn() -> bool,
+) -> Result<WaitOutcome> {
     let (priority_labels, only_assigned_to_me, allowed_users) = config_selection_settings()?;
     let (owner, repo) = github::repo_or_cwd()?;
     let me = github::authenticated_user()?;
@@ -91,6 +108,11 @@ fn wait_for_pick_excluding(timeout_secs: Option<u64>, skip: &BTreeSet<u64>) -> R
     let mut consecutive_failures: u32 = 0;
 
     loop {
+        // Bow out before spending another poll cycle if the caller has been
+        // told to stop (a `forever` worker that's received `ghwf stop`).
+        if abort() {
+            return Ok(WaitOutcome::Aborted);
+        }
         match github::gh_api_conditional(&endpoint, etag.as_deref()) {
             Ok(Conditional::NotModified { .. }) => {
                 consecutive_failures = 0;
@@ -119,7 +141,7 @@ fn wait_for_pick_excluding(timeout_secs: Option<u64>, skip: &BTreeSet<u64>) -> R
                 if let Some(number) =
                     announce_pick(&selection, &me, &priority_labels, &owner, &repo)
                 {
-                    return Ok(number);
+                    return Ok(WaitOutcome::Picked(number));
                 }
                 // The listing changed but held nothing to claim; poll eagerly
                 // again in case more lands.
@@ -167,9 +189,11 @@ fn wait_for_pick_excluding(timeout_secs: Option<u64>, skip: &BTreeSet<u64>) -> R
 /// down, and pick again — indefinitely.
 ///
 /// Each round waits (with no timeout) for an eligible issue, so an empty queue
-/// parks the worker rather than ending it. The loop stops only when the user
-/// quits a session before its workflow concludes — read as "the user has stepped
-/// in and wants out" (re-run the command to resume). While a session runs the
+/// parks the worker rather than ending it. The loop stops when the user quits a
+/// session before its workflow concludes — read as "the user has stepped in and
+/// wants out" (re-run the command to resume) — or when a graceful shutdown has
+/// been requested with `ghwf stop`: the in-flight issue finishes normally and
+/// the worker then exits without picking another. While a session runs the
 /// supervisor ignores terminal Ctrl-C (Claude handles its own); between sessions
 /// (waiting for a pick) Ctrl-C stops the worker as usual.
 ///
@@ -181,12 +205,24 @@ pub fn run_forever(no_branch: bool) -> Result<()> {
     // The issue repo selection works against, resolved once so a launch failure
     // can release the matching claim.
     let (owner, repo) = github::repo_or_cwd()?;
+    // When this worker started, so a `ghwf stop` issued from now on stops it
+    // while one from before it began (a stale flag) is ignored.
+    let started = state::now_epoch_millis();
+    // A graceful shutdown has been requested since this worker started. An
+    // unreadable flag reads as "no stop" so an I/O hiccup never wedges the loop.
+    let stop_requested = || state::stop_requested_since(started).unwrap_or(false);
     // Issues this worker has failed to launch this run, excluded from further
     // picks so a deterministic failure (e.g. an unusable `Model:` line) can't
     // loop. They're left for a fresh worker (or a manual `ghwf work-on`).
     let mut skip: BTreeSet<u64> = BTreeSet::new();
     loop {
-        let number = wait_for_pick_excluding(None, &skip)?;
+        let number = match wait_for_pick_excluding(None, &skip, stop_requested)? {
+            WaitOutcome::Picked(number) => number,
+            WaitOutcome::Aborted => {
+                println!("Stop requested; the forever worker is exiting.");
+                return Ok(());
+            }
+        };
         let mut launch = match launch::prepare(&number.to_string(), no_branch) {
             Ok(Some(launch)) => launch,
             // A live session already holds it (leased between selection and now).
@@ -207,6 +243,15 @@ pub fn run_forever(no_branch: bool) -> Result<()> {
         };
         match launch::supervise_once(&mut launch)? {
             launch::Outcome::Completed => {
+                // A stop requested while this issue ran is honoured now that it's
+                // safely concluded — finish the in-flight work, then bow out.
+                if stop_requested() {
+                    println!(
+                        "Issue #{number} concluded; stop was requested, so the forever \
+                         worker is exiting."
+                    );
+                    return Ok(());
+                }
                 println!("Issue #{number} concluded; looking for the next one.");
             }
             launch::Outcome::UserQuit => {

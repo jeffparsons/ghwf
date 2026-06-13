@@ -737,6 +737,50 @@ pub fn now_epoch() -> u64 {
         .unwrap_or(0)
 }
 
+/// The current time as Unix epoch milliseconds, the resolution the
+/// graceful-shutdown flag is stamped with. Millisecond granularity (rather than
+/// the seconds [`now_epoch`] uses) keeps a freshly started worker from ever
+/// mistaking a same-second stale flag for a fresh stop request.
+pub fn now_epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Write `at_millis` as the flag's contents under `dir`, recording when a stop
+/// was requested. Split out from [`request_stop`] so it's testable without the
+/// real data dir.
+fn write_stop_flag_in(dir: &Path, at_millis: u64) -> Result<()> {
+    let path = dir.join("forever-stop");
+    fs::write(&path, at_millis.to_string())
+        .with_context(|| format!("failed to write stop flag {}", path.display()))
+}
+
+/// Read the stop flag under `dir`, returning the request timestamp it holds, or
+/// `None` when the flag is absent or its contents don't parse. Split out from
+/// [`stop_requested_since`] so it's testable without the real data dir.
+fn stop_flag_at(dir: &Path) -> Option<u64> {
+    let contents = fs::read_to_string(dir.join("forever-stop")).ok()?;
+    contents.trim().parse().ok()
+}
+
+/// Request a graceful shutdown of every running `forever` worker by stamping the
+/// flag with the current time. A worker honours it only if it started before
+/// this request (see [`stop_requested_since`]), so a worker launched afterwards
+/// ignores the now-stale flag and the file can be left in place.
+pub fn request_stop() -> Result<()> {
+    write_stop_flag_in(&store::data_dir()?, now_epoch_millis())
+}
+
+/// Whether a graceful shutdown has been requested since a worker that started at
+/// `worker_start_millis`. True only when the flag exists and its timestamp is
+/// strictly newer than the worker's start, so a stale flag from before this
+/// worker began never stops it. An absent or unparseable flag reads as no stop.
+pub fn stop_requested_since(worker_start_millis: u64) -> Result<bool> {
+    Ok(stop_flag_at(&store::data_dir()?).is_some_and(|at| at > worker_start_millis))
+}
+
 /// Whether a lease is live: its process still exists and its heartbeat is
 /// recent. The pid check catches a crashed launcher immediately; the heartbeat
 /// bound catches the rare recycled-pid case after [`LEASE_TTL`].
@@ -934,8 +978,9 @@ mod tests {
     use super::{
         acquire_lease_at, branch_and_slug, find_issue_for_dir, is_live, is_unstarted,
         issue_fingerprint, load_lease, parse_directive, parse_prompted_directive, pr_outcome,
-        process_alive, Attention, Directive, IssueState, OptionsWatch, Phase, PostedRef, PrOutcome,
-        PrepState, ReactionWatch, SessionLease, WaitState,
+        process_alive, stop_flag_at, write_stop_flag_in, Attention, Directive, IssueState,
+        OptionsWatch, Phase, PostedRef, PrOutcome, PrepState, ReactionWatch, SessionLease,
+        WaitState,
     };
     use crate::models::PullRequest;
     use std::path::{Path, PathBuf};
@@ -1498,5 +1543,34 @@ mod tests {
             ..Default::default()
         };
         assert!(!is_unstarted(&parked));
+    }
+
+    #[test]
+    fn stop_flag_round_trips_and_ignores_garbage() {
+        let dir = scratch("stop-flag");
+        // No flag yet.
+        assert_eq!(stop_flag_at(&dir), None);
+        // A written timestamp reads back exactly.
+        write_stop_flag_in(&dir, 1_700_000_000_123).unwrap();
+        assert_eq!(stop_flag_at(&dir), Some(1_700_000_000_123));
+        // Unparseable contents read as "no stop", not an error.
+        std::fs::write(dir.join("forever-stop"), "not a number").unwrap();
+        assert_eq!(stop_flag_at(&dir), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stop_flag_gate_is_strictly_newer_than_worker_start() {
+        let dir = scratch("stop-gate");
+        // Helper mirroring `stop_requested_since`'s comparison against the flag.
+        let requested_since = |start: u64| stop_flag_at(&dir).is_some_and(|at| at > start);
+
+        write_stop_flag_in(&dir, 1_000).unwrap();
+        // A worker started before the request honours it.
+        assert!(requested_since(999));
+        // One started at the same millisecond or later treats it as stale.
+        assert!(!requested_since(1_000));
+        assert!(!requested_since(1_001));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -100,6 +100,14 @@ enum Commands {
         #[arg(long)]
         no_branch: bool,
     },
+    /// Ask running `ghwf forever` workers to shut down gracefully: each finishes
+    /// the issue it's currently working, then exits instead of picking another.
+    ///
+    /// The request is recorded as a flag under ghwf's data dir and reaches every
+    /// forever worker on this machine. A worker started after `ghwf stop` ignores
+    /// the request, so it's safe to run when nothing is working (it just records
+    /// the flag) and to start a fresh worker afterwards.
+    Stop,
     /// Clone a GitHub repo into ghwf's preferred layout: a container
     /// directory holding the bare repo (as `<name>.git`), a generated
     /// `ghwf.toml`, and an empty worktrees directory.
@@ -386,6 +394,14 @@ fn main() -> Result<()> {
             work_on(&number.to_string(), no_branch)
         }
         Commands::Forever { no_branch } => next::run_forever(no_branch),
+        Commands::Stop => {
+            state::request_stop()?;
+            println!(
+                "Stop requested. Any running `ghwf forever` worker will finish its \
+                 current issue and then exit."
+            );
+            Ok(())
+        }
         Commands::Clone {
             repo,
             directory,
@@ -2440,6 +2456,14 @@ mod tests {
         // …but it takes no `--wait`/`--timeout` (forever-mode already waits).
         assert!(Cli::try_parse_from(["ghwf", "forever", "--wait"]).is_err());
         assert!(Cli::try_parse_from(["ghwf", "forever", "--timeout", "30"]).is_err());
+    }
+
+    #[test]
+    fn stop_subcommand_parses_without_args() {
+        // `ghwf stop` parses on its own…
+        assert!(Cli::try_parse_from(["ghwf", "stop"]).is_ok());
+        // …and takes no arguments.
+        assert!(Cli::try_parse_from(["ghwf", "stop", "--anything"]).is_err());
     }
 
     #[test]
