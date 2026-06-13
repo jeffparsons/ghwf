@@ -426,7 +426,10 @@ demand a synchronous confirmation it can't get.
 
 Because the skill body is the expansion of the `/work-on` initial prompt, this
 runs on the session's own trusted user turn, before any GitHub data is read — and
-again on every relaunch/resume, since the launcher re-passes `/work-on`.
+again on every relaunch/resume, since the launcher re-passes `/work-on`. It is
+also re-asserted after a mid-session context compaction, via a SessionStart hook
+(see below), so the framing survives long sessions rather than being lost when the
+original turn is summarised away.
 
 The framing is deliberately **bounded**: the trust attaches only to the
 already-authenticated control channel ghwf gates on — its own output plus the
@@ -447,7 +450,7 @@ them from the current binary on every launch so a worktree always carries the
 latest. That file is machine-local: ghwf adds it to the worktree's git exclude,
 so it never lands in a commit or a PR diff. The merge is surgical (only our
 entries are added) and idempotent, and anything unexpected about the file is an
-error, never an overwrite. Two hooks are installed:
+error, never an overwrite. Three hooks are installed:
 
 **A Stop hook** (`ghwf claude-stop-hook`) keeps a session working. Claude Code
 runs it whenever Claude tries to finish responding; it consults only ghwf's
@@ -466,6 +469,15 @@ Claude to resume the `wait`/`work-on` loop. It lets go when:
 goes idle or parks on a permission prompt, so the supervisor that launched it
 can recover it (see below). Like the Stop hook it only reads local state, never
 touches the network, and fails open.
+
+**A SessionStart hook** (`ghwf onboarding`, scoped to the `compact` source) keeps
+the session framing alive across a long session. When Claude Code compacts the
+context, it runs this hook and injects its output into the fresh context, so the
+authoritative framing (see [The session
+framing](#the-session-framing-ghwf-onboarding)) is re-established rather than lost
+with the summarised-away turn that first set it. It's scoped to compaction only —
+startup and launcher-driven resume already run `ghwf onboarding` through the
+`/work-on` skill, so firing on those too would just duplicate it.
 
 ### Recovering a stuck session
 

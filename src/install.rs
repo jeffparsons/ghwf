@@ -98,6 +98,13 @@ const NOTIFICATION_HOOKS: &[(&str, &str)] = &[
     ),
 ];
 
+/// The SessionStart hook we install: on a compaction Claude Code re-runs this and
+/// injects its stdout into the fresh context, so the authoritative `ghwf
+/// onboarding` framing is re-established rather than being lost when the original
+/// turn is summarised away. Scoped to the `compact` source — startup and
+/// launcher-driven resume already run onboarding via the `/work-on` skill.
+const SESSION_START_HOOK: (&str, &str) = ("compact", "ghwf onboarding");
+
 /// Install (or update) the user-global Claude Code integration: the `/work-on`
 /// skill.
 ///
@@ -265,6 +272,11 @@ fn merged_settings(existing: &str) -> Result<Option<String>> {
         if ensure_hook(hooks, "Notification", Some(matcher), command)? {
             changed = true;
         }
+    }
+    // The SessionStart hook, scoped to the `compact` source.
+    let (matcher, command) = SESSION_START_HOOK;
+    if ensure_hook(hooks, "SessionStart", Some(matcher), command)? {
+        changed = true;
     }
 
     if !changed {
@@ -475,6 +487,19 @@ mod tests {
     }
 
     #[test]
+    fn merge_into_empty_settings_installs_session_start() {
+        // The SessionStart hook re-runs `ghwf onboarding` after a compaction, so
+        // the authoritative framing is re-injected on the fresh context (see #104).
+        let merged = merged_settings("").unwrap().unwrap();
+        let parsed: Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(parsed["hooks"]["SessionStart"][0]["matcher"], "compact");
+        assert_eq!(
+            parsed["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            "ghwf onboarding"
+        );
+    }
+
+    #[test]
     fn merge_preserves_unrelated_settings() {
         let existing = r#"{
             "model": "opus",
@@ -528,6 +553,8 @@ mod tests {
         assert!(merged_settings(r#"{"hooks": "nope"}"#).is_err());
         assert!(merged_settings(r#"{"hooks": {"Stop": {}}}"#).is_err());
         assert!(merged_settings(r#"{"hooks": {"Notification": {}}}"#).is_err());
+        // Stop and Notification merge fine, then the malformed SessionStart bails.
+        assert!(merged_settings(r#"{"hooks": {"SessionStart": "nope"}}"#).is_err());
     }
 
     #[test]
@@ -544,6 +571,9 @@ mod tests {
                 "Notification": [
                     {"matcher": "idle_prompt", "hooks": [{"type": "command", "command": "ghwf claude-notification-hook --kind idle"}]},
                     {"matcher": "permission_prompt", "hooks": [{"type": "command", "command": "ghwf claude-notification-hook --kind permission"}]}
+                ],
+                "SessionStart": [
+                    {"matcher": "compact", "hooks": [{"type": "command", "command": "ghwf onboarding"}]}
                 ]
             }
         })
@@ -608,6 +638,7 @@ mod tests {
         let settings = std::fs::read_to_string(repo.join(super::LOCAL_SETTINGS_REL)).unwrap();
         assert!(settings.contains("ghwf claude-stop-hook"));
         assert!(settings.contains("ghwf claude-notification-hook --kind idle"));
+        assert!(settings.contains("ghwf onboarding"));
         // The file is git-ignored via the repo's exclude, not a tracked file.
         assert!(crate::git::is_ignored(&repo, super::LOCAL_SETTINGS_REL));
         let exclude = crate::git::git_path(&repo, "info/exclude").unwrap();
