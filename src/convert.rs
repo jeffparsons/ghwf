@@ -113,6 +113,14 @@ fn build_and_swap(plan: &Plan) -> Result<Option<String>> {
         }
     };
     swap_into_place(plan)?;
+    if let Some(default) = &default {
+        // `git worktree add` baked the scratch path into the worktree's admin
+        // files; the swap moved those files but not the paths they record, so
+        // relink them to the worktree's final location.
+        let bare = plan.top.join(format!("{}.git", plan.name));
+        let worktree = plan.top.join("worktrees").join(default);
+        git::repair_worktree(&bare, &worktree)?;
+    }
     Ok(default)
 }
 
@@ -222,6 +230,19 @@ mod tests {
         // The default branch is checked out under `worktrees/`.
         let default_worktree = clone.join("worktrees").join("main");
         assert!(default_worktree.join("file.txt").is_file());
+        // …and its worktree links survived the build-in-scratch-then-rename: git
+        // operations work *inside* it (rather than failing with "not a git
+        // repository" because the admin files still point at the scratch dir),
+        // and the bare repo no longer reports it as prunable.
+        assert_eq!(
+            git_stdout(&default_worktree, &["rev-parse", "--is-inside-work-tree"]),
+            "true"
+        );
+        let worktrees = git_stdout(&bare, &["worktree", "list", "--porcelain"]);
+        assert!(
+            !worktrees.lines().any(|line| line == "prunable"),
+            "default worktree left prunable: {worktrees}"
+        );
 
         // The original clone is preserved, intact and non-bare, as the backup.
         let backup = root.join("myrepo.pre-ghwf");
