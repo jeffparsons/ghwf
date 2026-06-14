@@ -727,6 +727,43 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         issue_state.phase = state::Phase::Finished;
     }
 
+    // Acknowledge consumed approvals the instant they register, before the
+    // (possibly slow) phase body runs, so the user sees their directive/👍
+    // landed without re-posting. Best-effort: a failed reaction warns but never
+    // breaks the run, and is attempted once (the event is already consumed).
+    for target in &outcome.react_targets {
+        let (o, r) = if target.source == "PR" {
+            &code_repo_ref
+        } else {
+            &issue_repo_ref
+        };
+        if let Err(err) = github::add_comment_reaction(o, r, target.comment_id, "eyes") {
+            eprintln!(
+                "warning: failed to react to comment {}: {err:#}",
+                target.comment_id
+            );
+        }
+    }
+    // A 👍 approval can't be reacted-to; flip the label to claude-working now
+    // (not just at end of run) as its acknowledgement. Skip for a concluded
+    // workflow (waits on nobody) and for Review (which settles to the user),
+    // mirroring the end-of-run settle. The end-of-run `labels::sync` is
+    // idempotent, so it no-ops when this already applied it.
+    if outcome.thumb_consumed
+        && issue_state.pr_outcome.is_none()
+        && issue_state.phase != state::Phase::Review
+    {
+        issue_state.attention = state::Attention::WaitingOnClaude;
+        let pr_number = issue_state.prep.as_ref().and_then(|p| p.pr_number);
+        labels::sync(
+            &issue_repo_ref,
+            &code_repo_ref,
+            number,
+            pr_number,
+            &mut issue_state,
+        );
+    }
+
     // The phase-specific banner body. Prep-and-plan does real work here (and
     // hard-errors if it needs a config that's missing); implement/review are light.
     // A concluded PR replaces the phase body wholesale: the workflow is over,
@@ -1446,6 +1483,20 @@ struct AdvanceOutcome {
     // collected separately by the digest layer; both render together in the
     // banner.
     ignored: Vec<render::IgnoredInput>,
+    // Directive comments consumed this run (from allow-listed authors) that
+    // should get an instant 👀 reaction — advancing or misfiring alike.
+    react_targets: Vec<AckTarget>,
+    // Whether any 👍 reaction was consumed this run (advancing or misfiring),
+    // triggering the early `claude-working` label flip — a 👍 can't be
+    // reacted-to, so the label is its acknowledgement.
+    thumb_consumed: bool,
+}
+
+/// A consumed directive comment to acknowledge with a reaction, plus the thread
+/// it lives on so the caller reacts in the right repo.
+struct AckTarget {
+    source: &'static str,
+    comment_id: u64,
 }
 
 /// A ghwf-authored approval prompt comment with the reactions currently on it,
@@ -1585,6 +1636,12 @@ fn advance_phase(
                 if !access.accepts_comment(&comment.user.login, &comment.author_association) {
                     continue;
                 }
+                // Acknowledge it the instant it registers, whether or not it
+                // advances the phase below.
+                outcome.react_targets.push(AckTarget {
+                    source,
+                    comment_id: comment.id,
+                });
                 (directive, &comment.user.login, source, false)
             }
             ApprovalEvent::Thumb {
@@ -1610,6 +1667,8 @@ fn advance_phase(
                     });
                     continue;
                 }
+                // A 👍 can't be reacted-to; the early label flip is its ack.
+                outcome.thumb_consumed = true;
                 (directive, &reaction.user.login, source, true)
             }
         };
@@ -2587,6 +2646,12 @@ mod tests {
         );
         assert!(state.consumed_directives.contains(&1));
         assert!(outcome.notes.is_empty());
+        // The consumed directive comment is queued for an instant 👀 reaction;
+        // a typed comment isn't a 👍, so no early label flip.
+        assert_eq!(outcome.react_targets.len(), 1);
+        assert_eq!(outcome.react_targets[0].comment_id, 1);
+        assert_eq!(outcome.react_targets[0].source, "issue");
+        assert!(!outcome.thumb_consumed);
     }
 
     #[test]
@@ -2605,6 +2670,11 @@ mod tests {
         assert_eq!(state.phase, Phase::Implement);
         assert_eq!(outcome.transitions.len(), 1);
         assert_eq!(directive_parts(&outcome.transitions[0]).1, "user");
+        // A PR-thread directive is reacted to in the code repo, so its ack
+        // target carries the "PR" source.
+        assert_eq!(outcome.react_targets.len(), 1);
+        assert_eq!(outcome.react_targets[0].comment_id, 2);
+        assert_eq!(outcome.react_targets[0].source, "PR");
     }
 
     #[test]
@@ -2647,6 +2717,9 @@ mod tests {
         assert!(matches!(outcome.notes[0].kind, NoteKind::Premature));
         // Consumed: it must never fire later once the phase catches up.
         assert!(state.consumed_directives.contains(&1));
+        // A misfire is still acknowledged — the user gets a "seen it" 👀.
+        assert_eq!(outcome.react_targets.len(), 1);
+        assert_eq!(outcome.react_targets[0].comment_id, 1);
     }
 
     #[test]
@@ -2912,6 +2985,9 @@ mod tests {
         assert_eq!(command, "/approve-pre-plan");
         assert_eq!(by, "reactor");
         assert!(state.consumed_reactions.contains(&100));
+        // A 👍 can't be reacted-to: it gets the early label flip, not a 👀.
+        assert!(outcome.thumb_consumed);
+        assert!(outcome.react_targets.is_empty());
         // Re-running with the same reaction is a no-op.
         let outcome = advance_phase(
             &mut state,
@@ -2925,6 +3001,8 @@ mod tests {
         assert_eq!(state.phase, Phase::PrepAndPlan);
         assert!(outcome.transitions.is_empty());
         assert!(outcome.notes.is_empty());
+        // Nothing consumed this run, so nothing to acknowledge.
+        assert!(!outcome.thumb_consumed);
     }
 
     #[test]
@@ -2976,6 +3054,8 @@ mod tests {
         // Consumed, so adding the author to the allow-list later can't make this
         // old comment fire retroactively.
         assert!(state.consumed_directives.contains(&1));
+        // Ignored input is never acknowledged.
+        assert!(outcome.react_targets.is_empty());
     }
 
     #[test]
@@ -3002,6 +3082,8 @@ mod tests {
         assert_eq!(outcome.ignored.len(), 1);
         assert_eq!(outcome.ignored[0].by, "reactor");
         assert!(state.consumed_reactions.contains(&100));
+        // Ignored input is never acknowledged.
+        assert!(!outcome.thumb_consumed);
     }
 
     #[test]
@@ -3025,6 +3107,8 @@ mod tests {
         assert!(outcome.transitions.is_empty());
         assert!(matches!(outcome.notes[0].kind, NoteKind::Premature));
         assert!(state.consumed_reactions.contains(&100));
+        // A misfiring 👍 is still acknowledged via the early label flip.
+        assert!(outcome.thumb_consumed);
     }
 
     #[test]
