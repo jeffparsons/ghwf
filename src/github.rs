@@ -72,6 +72,16 @@ pub fn fetch_comment_reactions(owner: &str, repo: &str, comment_id: u64) -> Resu
     serde_json::from_str(&json).context("failed to parse reactions JSON from `gh api`")
 }
 
+/// Add a reaction (e.g. "eyes", "+1") to a conversation comment. Issue and PR
+/// conversation comments share the issue-comments id namespace, so one endpoint
+/// form serves both threads. GitHub treats a repeated (user, content) reaction
+/// as a no-op, so this is safe to call more than once.
+pub fn add_comment_reaction(owner: &str, repo: &str, comment_id: u64, content: &str) -> Result<()> {
+    let endpoint = format!("repos/{owner}/{repo}/issues/comments/{comment_id}/reactions");
+    let payload = serde_json::json!({ "content": content }).to_string();
+    gh_api_stdin(&["--method", "POST", &endpoint, "--input", "-"], &payload).map(|_| ())
+}
+
 /// Post a comment to an issue's (or PR's) conversation thread.
 pub fn post_issue_comment(
     issue: &str,
