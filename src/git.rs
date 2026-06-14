@@ -150,6 +150,16 @@ pub fn add_worktree_for_branch(repo: &Path, path: &Path, branch: &str) -> Result
     git(repo, &["worktree", "add", path, branch]).map(|_| ())
 }
 
+/// Repair the administrative files linking the worktree at `path` to `repo`
+/// (and back), after the worktree or the repo has moved on disk. `git worktree
+/// add` records absolute paths, so a layout that is built in one directory and
+/// then renamed needs this to relink — passing the worktree's new path repairs
+/// both directions of the pointer.
+pub fn repair_worktree(repo: &Path, path: &Path) -> Result<()> {
+    let path = path.to_str().context("worktree path is not valid UTF-8")?;
+    git(repo, &["worktree", "repair", path]).map(|_| ())
+}
+
 /// Path of the worktree (main or linked) that has `branch` checked out, if
 /// any. Git allows at most one worktree per branch.
 pub fn branch_worktree(repo: &Path, branch: &str) -> Result<Option<PathBuf>> {
