@@ -522,6 +522,19 @@ with the summarised-away turn that first set it. It's scoped to compaction only 
 startup and launcher-driven resume already run `ghwf onboarding` through the
 `/work-on` skill, so firing on those too would just duplicate it.
 
+The same file also carries a **`Bash(ghwf:*)` permission rule** in
+`permissions.allow`, added by the same surgical merge. This is what makes ghwf's
+own state-changing subcommands — `create-issue`, `hand-off`,
+`create-issue-comment`, `ask`, `update-pr`, `reply-review-comment` — reliably run
+mid-session in *any* target repo without stalling on a permission prompt, so a
+deferral or hand-off never quietly waits on the human (see issue #111). Two
+separate guards could otherwise block such a call, and ghwf addresses both: a
+permission *prompt* is pre-empted by this allow rule (belt-and-suspenders with the
+`/work-on` skill's own `allowed-tools`, which doesn't depend on per-repo settings),
+and the model's own reluctance to make an "external write it initiated on its own"
+is settled by the onboarding framing, which names running ghwf's own subcommands as
+the sanctioned, pre-authorised way to act on the workflow.
+
 ### Recovering a stuck session
 
 When ghwf launched the session (via `work-on` outside Claude, or `ghwf
