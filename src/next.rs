@@ -184,6 +184,47 @@ fn wait_for_pick_excluding(
     std::process::exit(wait::EXIT_TIMEOUT);
 }
 
+/// SHA-256 (hex) of this executable's own bytes, or `None` if the path can't be
+/// resolved or the file can't be read. A `forever` worker hashes itself at
+/// startup and again between workflows to notice an in-place rebuild of `ghwf`
+/// (#139). A read failure deliberately yields `None` rather than an error: it
+/// must never trigger a relaunch on its own.
+#[cfg(unix)]
+fn self_exe_hash() -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let path = std::env::current_exe().ok()?;
+    let bytes = std::fs::read(path).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Some(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Whether a `forever` worker should relaunch into a new build, given the hash
+/// it recorded at startup and the one read now. Only a baseline *and* a current
+/// hash that *differ* says yes; any `None` (we couldn't read the binary then or
+/// now) means no, so a transient read failure never causes a spurious relaunch.
+#[cfg(unix)]
+fn should_relaunch(baseline: Option<&str>, current: Option<&str>) -> bool {
+    matches!((baseline, current), (Some(b), Some(c)) if b != c)
+}
+
+/// Re-exec the current binary in place with the original arguments, so a
+/// freshly-built `ghwf forever` continues the loop on the new code. On success
+/// this never returns (the process image is replaced); it returns the error
+/// only if resolving the path or the `exec` itself fails, leaving the caller to
+/// carry on with the current binary.
+#[cfg(unix)]
+fn relaunch_self() -> std::io::Error {
+    use std::os::unix::process::CommandExt as _;
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => return err,
+    };
+    std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .exec()
+}
+
 /// Work issues one after another as a supervised pool worker (`ghwf forever`):
 /// claim the next eligible issue, run its Claude session to conclusion, bring it
 /// down, and pick again — indefinitely.
@@ -201,6 +242,10 @@ fn wait_for_pick_excluding(
 /// logged, a bare claim with nothing behind it is released back to the pool, and
 /// the loop picks again. A pick another worker has leased in the meantime is
 /// skipped the same way.
+///
+/// Between workflows the worker also notices when the `ghwf` binary itself has
+/// been rebuilt and relaunches into the new build (#139); see
+/// [`should_relaunch`] and [`relaunch_self`].
 pub fn run_forever(no_branch: bool) -> Result<()> {
     // The issue repo selection works against, resolved once so a launch failure
     // can release the matching claim.
@@ -211,6 +256,18 @@ pub fn run_forever(no_branch: bool) -> Result<()> {
     // A graceful shutdown has been requested since this worker started. An
     // unreadable flag reads as "no stop" so an I/O hiccup never wedges the loop.
     let stop_requested = || state::stop_requested_since(started).unwrap_or(false);
+    // The hash of our own binary at startup. Between workflows we re-check it and
+    // relaunch into a rebuilt `ghwf` (#139). `None` (we couldn't read ourselves)
+    // disables auto-relaunch for this run rather than risking a spurious one.
+    #[cfg(unix)]
+    let baseline_hash = self_exe_hash();
+    #[cfg(unix)]
+    if baseline_hash.is_none() {
+        eprintln!(
+            "warning: couldn't hash the ghwf binary at startup; auto-relaunch on \
+             rebuild is disabled for this worker."
+        );
+    }
     // Issues this worker has failed to launch this run, excluded from further
     // picks so a deterministic failure (e.g. an unusable `Model:` line) can't
     // loop. They're left for a fresh worker (or a manual `ghwf work-on`).
@@ -251,6 +308,22 @@ pub fn run_forever(no_branch: bool) -> Result<()> {
                          worker is exiting."
                     );
                     return Ok(());
+                }
+                // A rebuilt `ghwf` since we started? Relaunch into it now, at this
+                // clean between-workflows boundary, so the new code picks up the
+                // next issue (#139). A failed exec falls through and we carry on
+                // with the current binary.
+                #[cfg(unix)]
+                if should_relaunch(baseline_hash.as_deref(), self_exe_hash().as_deref()) {
+                    println!(
+                        "Issue #{number} concluded; the ghwf binary changed, relaunching \
+                         to pick up the new build."
+                    );
+                    let err = relaunch_self();
+                    eprintln!(
+                        "warning: failed to relaunch ghwf, continuing on the current \
+                         binary: {err}"
+                    );
                 }
                 println!("Issue #{number} concluded; looking for the next one.");
             }
@@ -1332,5 +1405,32 @@ mod tests {
         let children = vec![blocked(3, 1), blocked(4, 2)];
         let result = pick_workable_leaf(1, children, "me", &[], &no_children, &|_| false);
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn self_exe_hash_is_some_and_stable() {
+        // Hashing the test binary itself succeeds and is deterministic, so an
+        // unchanged binary reads identically across the start/end-of-workflow
+        // checks (and thus never spuriously relaunches).
+        let first = super::self_exe_hash();
+        assert!(first.is_some());
+        assert_eq!(first, super::self_exe_hash());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_relaunch_only_when_both_present_and_differ() {
+        use super::should_relaunch;
+        // Differing hashes: a rebuild happened, so relaunch.
+        assert!(should_relaunch(Some("aaa"), Some("bbb")));
+        // Identical hashes: nothing changed.
+        assert!(!should_relaunch(Some("aaa"), Some("aaa")));
+        // No baseline (couldn't read ourselves at startup): never relaunch.
+        assert!(!should_relaunch(None, Some("bbb")));
+        // Couldn't re-read just now: treat as unchanged rather than relaunch.
+        assert!(!should_relaunch(Some("aaa"), None));
+        // Neither readable: never relaunch.
+        assert!(!should_relaunch(None, None));
     }
 }
