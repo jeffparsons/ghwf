@@ -604,6 +604,30 @@ pub fn find_issue_for_branch(owner: &str, repo: &str, branch: &str) -> Result<Op
     Ok(None)
 }
 
+/// Every issue number with a recorded state file under `owner/repo`, in
+/// directory-walk order. An absent or unreadable directory yields an empty
+/// list; non-numeric filenames (e.g. the `<n>.lease.json` siblings) are
+/// skipped.
+pub fn issue_numbers(owner: &str, repo: &str) -> Vec<u64> {
+    let Ok(dir) = store::data_dir().map(|d| d.join("issues").join(owner).join(repo)) else {
+        return Vec::new();
+    };
+    let mut numbers = Vec::new();
+    for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        // A `<n>.lease.json` sibling has the stem `<n>.lease`, which doesn't
+        // parse as a number, so it's skipped here.
+        if let Some(number) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            numbers.push(number);
+        }
+    }
+    numbers
+}
+
 /// Remove an issue's state file. Absence is not an error.
 pub fn delete(owner: &str, repo: &str, number: u64) -> Result<()> {
     let path = state_path(owner, repo, number)?;
@@ -831,6 +855,26 @@ pub fn lease_liveness(owner: &str, repo: &str, number: u64) -> Liveness {
     }
 }
 
+/// Whether an issue's lease file exists but is not live — the signature of a
+/// crashed or killed session, as distinct from an absent lease (no session has
+/// started, or one exited cleanly and removed it). An absent or unreadable
+/// lease reads as `false`: only a lease left behind by a dead process counts.
+pub fn lease_is_stale(owner: &str, repo: &str, number: u64) -> bool {
+    let Ok(path) = lease_path(owner, repo, number) else {
+        return false;
+    };
+    lease_is_stale_at(&path, now_epoch())
+}
+
+/// Whether the lease at a concrete `path` exists but is not live as of `now`.
+/// Split from [`lease_is_stale`] so tests can drive a scratch path.
+fn lease_is_stale_at(path: &Path, now: u64) -> bool {
+    match load_lease(path) {
+        Some(lease) => !is_live(&lease, now),
+        None => false,
+    }
+}
+
 /// Exclusively create a lease file and write `lease` into it in one shot (the
 /// content lands within the `O_EXCL` create, so there's no empty window another
 /// acquirer could mistake for a stale lease). Returns `false` without touching
@@ -977,10 +1021,10 @@ fn write_lease(path: &Path, lease: &SessionLease) -> Result<()> {
 mod tests {
     use super::{
         acquire_lease_at, branch_and_slug, find_issue_for_dir, is_live, is_unstarted,
-        issue_fingerprint, load_lease, parse_directive, parse_prompted_directive, pr_outcome,
-        process_alive, stop_flag_at, write_stop_flag_in, Attention, Directive, IssueState,
-        OptionsWatch, Phase, PostedRef, PrOutcome, PrepState, ReactionWatch, SessionLease,
-        WaitState,
+        issue_fingerprint, lease_is_stale_at, load_lease, parse_directive,
+        parse_prompted_directive, pr_outcome, process_alive, stop_flag_at, write_stop_flag_in,
+        Attention, Directive, IssueState, OptionsWatch, Phase, PostedRef, PrOutcome, PrepState,
+        ReactionWatch, SessionLease, WaitState,
     };
     use crate::models::PullRequest;
     use std::path::{Path, PathBuf};
@@ -1448,6 +1492,44 @@ mod tests {
         };
         assert!(!process_alive(DEAD_PID));
         assert!(!is_live(&lease, 1_000));
+    }
+
+    #[test]
+    fn lease_is_stale_distinguishes_absent_live_and_dead() {
+        let path = lease_scratch("stale-check");
+        let _ = std::fs::remove_file(&path);
+
+        // No lease file: not a crash signature.
+        assert!(!lease_is_stale_at(&path, 1_000));
+
+        // A live lease (our own pid, fresh heartbeat): not stale.
+        std::fs::write(
+            &path,
+            serde_json::to_string(&SessionLease {
+                pid: std::process::id(),
+                heartbeat: 1_000,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!lease_is_stale_at(&path, 1_010));
+
+        // The same live pid but a heartbeat past the TTL: stale.
+        assert!(lease_is_stale_at(&path, 1_000 + super::LEASE_TTL + 1));
+
+        // A dead pid, as a crashed launcher would leave behind: stale.
+        std::fs::write(
+            &path,
+            serde_json::to_string(&SessionLease {
+                pid: DEAD_PID,
+                heartbeat: 1_000,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(lease_is_stale_at(&path, 1_000));
+
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
