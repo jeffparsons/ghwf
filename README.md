@@ -64,10 +64,12 @@ Both comment-posting commands — `ghwf create-issue-comment` and `ghwf hand-off
 diagram, a log). GitHub has no token-authenticated API for the inline-attachment
 CDN its web UI uses, so each file is instead committed into the repo on a
 dedicated `ghwf-attachments` branch (its own orphan history, so it never touches
-your code branches or a PR diff) and referenced from the comment. Images on a
-**public** repo embed inline; on a **private** repo — where blob links are
-auth-gated and GitHub's image proxy can't fetch them — every attachment, images
-included, renders as a clickable link instead.
+your code branches or a PR diff) and referenced from the comment. On a
+**public** repo, images and videos embed inline (videos via an HTML `<video>`
+player); audio and other files render as clickable links, since GitHub has no
+inline form for them. On a **private** repo — where blob links are auth-gated
+and GitHub's image proxy can't fetch them — every attachment, images included,
+renders as a clickable link instead.
 
 Pass `--no-branch` to skip the branch/worktree/PR entirely and just write the plan
 file — handy for trivial tasks or when you're already on a feature branch. The
