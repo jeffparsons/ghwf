@@ -105,6 +105,13 @@ const NOTIFICATION_HOOKS: &[(&str, &str)] = &[
 /// launcher-driven resume already run onboarding via the `/work-on` skill.
 const SESSION_START_HOOK: (&str, &str) = ("compact", "ghwf onboarding");
 
+/// The permission rule we add to a session worktree's `permissions.allow`, so
+/// ghwf's own subcommands run without a prompt regardless of how the `/work-on`
+/// skill's own `allowed-tools` grant is scoped. Mirrors the `Bash(ghwf:*)` rule
+/// the ghwf repo carries in its committed `.claude/settings.json`, but here it's
+/// written per worktree (and git-excluded) so it covers every target repo.
+const GHWF_PERMISSION: &str = "Bash(ghwf:*)";
+
 /// Install (or update) the user-global Claude Code integration: the `/work-on`
 /// skill.
 ///
@@ -239,13 +246,13 @@ fn exclude_from_git(dir: &Path) {
     let _ = fs::write(&exclude, updated);
 }
 
-/// Merge our Stop and Notification hooks into a settings JSON body, preserving
-/// everything else in the document. Returns `None` when every hook is already
-/// present (nothing to write).
+/// Merge our hooks and the `Bash(ghwf:*)` permission rule into a settings JSON
+/// body, preserving everything else in the document. Returns `None` when
+/// everything we'd add is already present (nothing to write).
 ///
 /// The settings file may be user-owned, so anything unexpected about the parts
-/// we'd touch (`hooks` and the per-event arrays) is a hard error, never an
-/// overwrite.
+/// we'd touch (`hooks` and the per-event arrays, `permissions.allow`) is a hard
+/// error, never an overwrite.
 fn merged_settings(existing: &str) -> Result<Option<String>> {
     let mut root: Value = if existing.trim().is_empty() {
         json!({})
@@ -276,6 +283,12 @@ fn merged_settings(existing: &str) -> Result<Option<String>> {
     // The SessionStart hook, scoped to the `compact` source.
     let (matcher, command) = SESSION_START_HOOK;
     if ensure_hook(hooks, "SessionStart", Some(matcher), command)? {
+        changed = true;
+    }
+
+    // The `Bash(ghwf:*)` permission rule, so ghwf's own write subcommands never
+    // stall on a permission prompt mid-session.
+    if ensure_permission_allow(settings, GHWF_PERMISSION)? {
         changed = true;
     }
 
@@ -311,6 +324,30 @@ fn ensure_hook(
         entry["matcher"] = json!(matcher);
     }
     array.push(entry);
+    Ok(true)
+}
+
+/// Ensure `permissions.allow` contains `rule`, creating the `permissions` object
+/// and its `allow` array as needed and appending `rule` if absent. Returns
+/// whether it added anything. Additive only — existing entries are preserved.
+/// Errors if `permissions` exists but isn't an object, or `permissions.allow`
+/// exists but isn't an array.
+fn ensure_permission_allow(
+    settings: &mut serde_json::Map<String, Value>,
+    rule: &str,
+) -> Result<bool> {
+    let permissions = settings.entry("permissions").or_insert_with(|| json!({}));
+    let Some(permissions) = permissions.as_object_mut() else {
+        bail!("`permissions` in settings.local.json is not an object");
+    };
+    let allow = permissions.entry("allow").or_insert_with(|| json!([]));
+    let Some(allow) = allow.as_array_mut() else {
+        bail!("`permissions.allow` in settings.local.json is not an array");
+    };
+    if allow.iter().any(|entry| entry.as_str() == Some(rule)) {
+        return Ok(false);
+    }
+    allow.push(json!(rule));
     Ok(true)
 }
 
@@ -500,6 +537,49 @@ mod tests {
     }
 
     #[test]
+    fn merge_into_empty_settings_allows_ghwf() {
+        // ghwf's own write subcommands must run without a permission prompt, so a
+        // deferral or hand-off never stalls on the human (see issue #111).
+        let merged = merged_settings("").unwrap().unwrap();
+        let parsed: Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(parsed["permissions"]["allow"], json!(["Bash(ghwf:*)"]));
+    }
+
+    #[test]
+    fn merge_preserves_unrelated_permissions() {
+        // Existing allow entries (and a deny list) survive; ours is appended.
+        let existing = json!({
+            "permissions": {"allow": ["Bash(ls:*)"], "deny": ["Bash(rm:*)"]}
+        })
+        .to_string();
+        let merged = merged_settings(&existing).unwrap().unwrap();
+        let parsed: Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(
+            parsed["permissions"]["allow"],
+            json!(["Bash(ls:*)", "Bash(ghwf:*)"])
+        );
+        assert_eq!(parsed["permissions"]["deny"], json!(["Bash(rm:*)"]));
+    }
+
+    #[test]
+    fn merge_does_not_duplicate_permission() {
+        // A document that already allows ghwf, with everything else in place, is a
+        // no-op rather than re-appending the rule.
+        let merged = merged_settings("").unwrap().unwrap();
+        let parsed: Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(parsed["permissions"]["allow"].as_array().unwrap().len(), 1);
+        assert!(merged_settings(&merged).unwrap().is_none());
+    }
+
+    #[test]
+    fn merge_rejects_wrong_permission_shapes() {
+        // Hooks merge fine, then the malformed permissions shape bails — never an
+        // overwrite of a user-owned document.
+        assert!(merged_settings(r#"{"permissions": "nope"}"#).is_err());
+        assert!(merged_settings(r#"{"permissions": {"allow": "nope"}}"#).is_err());
+    }
+
+    #[test]
     fn merge_preserves_unrelated_settings() {
         let existing = r#"{
             "model": "opus",
@@ -575,7 +655,8 @@ mod tests {
                 "SessionStart": [
                     {"matcher": "compact", "hooks": [{"type": "command", "command": "ghwf onboarding"}]}
                 ]
-            }
+            },
+            "permissions": {"allow": ["Bash(ghwf:*)"]}
         })
         .to_string();
         assert!(merged_settings(&existing).unwrap().is_none());
