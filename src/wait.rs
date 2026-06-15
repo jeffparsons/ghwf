@@ -7,7 +7,7 @@ use serde::Deserialize;
 use crate::github::{self, Conditional, RepoRef};
 use crate::models::{Comment, Issue, PullRequest, Reaction, ReviewComment, User};
 use crate::state::{self, OptionsWatch, PostedRef, ReactionWatch, WaitState};
-use crate::{access, config, render, store};
+use crate::{access, config, labels, render, store};
 
 /// Exit code when the timeout elapses with nothing new (exit 0 = activity
 /// detected, exit 1 = error).
@@ -181,6 +181,14 @@ pub fn run(issue: &str, timeout_secs: u64) -> Result<()> {
             Ok(outcome) => {
                 consecutive_failures = 0;
                 if !outcome.reasons.is_empty() {
+                    normalize_on_conclusion(
+                        &issue_repo,
+                        &code_repo,
+                        number,
+                        pr_number,
+                        outcome.conclusion,
+                        &mut issue_state,
+                    );
                     persist(&owner, &repo, number, &mut issue_state, &wait_state);
                     for reason in &outcome.reasons {
                         println!("{reason}");
@@ -229,7 +237,18 @@ pub fn run(issue: &str, timeout_secs: u64) -> Result<()> {
                 my_token.as_deref(),
                 &access,
             ) {
-                Ok(FeedEntry::Wake(reasons)) => {
+                Ok(FeedEntry::Wake {
+                    reasons,
+                    conclusion,
+                }) => {
+                    normalize_on_conclusion(
+                        &issue_repo,
+                        &code_repo,
+                        number,
+                        pr_number,
+                        conclusion,
+                        &mut issue_state,
+                    );
                     persist(&owner, &repo, number, &mut issue_state, &wait_state);
                     for reason in &reasons {
                         println!("{reason}");
@@ -298,12 +317,20 @@ struct CycleOutcome {
     reasons: Vec<String>,
     /// Whether any endpoint returned a fresh (200) response.
     fresh: bool,
+    /// The PR conclusion this cycle detected, if any, so the caller can
+    /// normalize labels before returning (the merge/close may have no
+    /// follow-up `work-on` to do it).
+    conclusion: Option<state::PrOutcome>,
 }
 
 /// The outcome of attempting to enter feed mode.
 enum FeedEntry {
-    /// The entry fetch itself found something to wake on.
-    Wake(Vec<String>),
+    /// The entry fetch itself found something to wake on, with any PR
+    /// conclusion it detected (so labels can be normalized before returning).
+    Wake {
+        reasons: Vec<String>,
+        conclusion: Option<state::PrOutcome>,
+    },
     /// The feed passed the trust gate; poll it at this cadence.
     Trusted(Duration),
     /// Our own recent post is missing from the feed — it is lagging.
@@ -480,6 +507,7 @@ fn direct_cycle(
                     my_token,
                     access,
                     &mut outcome.reasons,
+                    &mut outcome.conclusion,
                 )?;
             }
         }
@@ -496,6 +524,7 @@ fn evaluate_fresh(
     my_token: Option<&str>,
     access: &access::AccessList,
     reasons: &mut Vec<String>,
+    conclusion: &mut Option<state::PrOutcome>,
 ) -> Result<()> {
     match &endpoint.kind {
         EndpointKind::IssueObject => {
@@ -520,9 +549,11 @@ fn evaluate_fresh(
             // response is not a reason by itself.
             match state::pr_outcome(&pr) {
                 Some(state::PrOutcome::Merged) => {
+                    *conclusion = Some(state::PrOutcome::Merged);
                     reasons.push("The PR was merged.".to_string());
                 }
                 Some(state::PrOutcome::Closed) => {
+                    *conclusion = Some(state::PrOutcome::Closed);
                     reasons.push("The PR was closed without merging.".to_string());
                 }
                 // Still open: a draft flip wakes — ready-for-review is what
@@ -722,9 +753,21 @@ fn enter_feed_mode(
     let events: Vec<FeedEvent> =
         serde_json::from_str(&body).context("failed to parse events feed JSON")?;
 
-    let reasons = feed_wake_reasons(&events, number, pr, &wait.since, my_token, access);
+    let mut conclusion = None;
+    let reasons = feed_wake_reasons(
+        &events,
+        number,
+        pr,
+        &wait.since,
+        my_token,
+        access,
+        &mut conclusion,
+    );
     if !reasons.is_empty() {
-        return Ok(FeedEntry::Wake(reasons));
+        return Ok(FeedEntry::Wake {
+            reasons,
+            conclusion,
+        });
     }
     if !feed_trusted(&events, last_posted) {
         return Ok(FeedEntry::Lagging);
@@ -759,11 +802,22 @@ fn feed_cycle(
             }
             let events: Vec<FeedEvent> =
                 serde_json::from_str(&body).context("failed to parse events feed JSON")?;
+            let mut conclusion = None;
+            let reasons = feed_wake_reasons(
+                &events,
+                number,
+                pr,
+                &wait.since,
+                my_token,
+                access,
+                &mut conclusion,
+            );
             Ok(CycleOutcome {
-                reasons: feed_wake_reasons(&events, number, pr, &wait.since, my_token, access),
+                reasons,
                 // Fresh here means *some* repo activity, not necessarily ours;
                 // don't let unrelated churn reset the direct backoff.
                 fresh: false,
+                conclusion,
             })
         }
     }
@@ -785,6 +839,7 @@ fn feed_wake_reasons(
     since: &str,
     my_token: Option<&str>,
     access: &access::AccessList,
+    conclusion: &mut Option<state::PrOutcome>,
 ) -> Vec<String> {
     let ours = |subject: &Option<FeedSubject>| {
         subject
@@ -859,6 +914,11 @@ fn feed_wake_reasons(
                             .pull_request
                             .as_ref()
                             .is_some_and(|pr| pr.merged == Some(true));
+                        *conclusion = Some(if merged {
+                            state::PrOutcome::Merged
+                        } else {
+                            state::PrOutcome::Closed
+                        });
                         reasons.push(if merged {
                             "The PR was merged (via the events feed).".to_string()
                         } else {
@@ -924,6 +984,32 @@ fn conflict_wake(conflict: Option<&str>, number: u64, seen: bool) -> (Option<Str
     }
 }
 
+/// Normalize the workflow labels when a cycle detected a PR conclusion, so a
+/// merge or close that has no follow-up `work-on` still drops the stale
+/// phase/attention labels. Best-effort like all label work, and deliberately
+/// leaves `pr_outcome`/`phase` in the state untouched so a following `work-on`
+/// still treats the conclusion as new (and runs its once-per-merge side
+/// effects); see [`labels::sync_concluded`].
+fn normalize_on_conclusion(
+    issue_repo: &RepoRef,
+    code_repo: &RepoRef,
+    number: u64,
+    pr_number: Option<u64>,
+    conclusion: Option<state::PrOutcome>,
+    issue_state: &mut state::IssueState,
+) {
+    if let Some(conclusion) = conclusion {
+        labels::sync_concluded(
+            issue_repo,
+            code_repo,
+            number,
+            pr_number,
+            conclusion,
+            issue_state,
+        );
+    }
+}
+
 fn persist(
     owner: &str,
     repo: &str,
@@ -946,7 +1032,7 @@ mod tests {
     };
     use crate::access::AccessList;
     use crate::models::{Comment, User};
-    use crate::state::{PostedRef, ReactionWatch, WaitState};
+    use crate::state::{PostedRef, PrOutcome, ReactionWatch, WaitState};
     use std::collections::BTreeMap;
     use std::time::Duration;
 
@@ -1076,6 +1162,7 @@ mod tests {
             ..Default::default()
         };
         let mut reasons = Vec::new();
+        let mut conclusion = None;
         evaluate_fresh(
             &endpoint,
             &body.to_string(),
@@ -1083,6 +1170,7 @@ mod tests {
             Some("tok"),
             &access_all(),
             &mut reasons,
+            &mut conclusion,
         )
         .unwrap();
         reasons
@@ -1118,6 +1206,7 @@ mod tests {
         };
         let wait = WaitState::default();
         let mut reasons = Vec::new();
+        let mut conclusion = None;
         evaluate_fresh(
             &endpoint,
             &serde_json::json!([reaction_json(100, "+1")]).to_string(),
@@ -1125,6 +1214,7 @@ mod tests {
             Some("tok"),
             &AccessList::new("someone-else", &[]),
             &mut reasons,
+            &mut conclusion,
         )
         .unwrap();
         assert!(reasons.is_empty());
@@ -1173,6 +1263,7 @@ mod tests {
             "author_association": "OWNER",
         });
         let mut reasons = Vec::new();
+        let mut conclusion = None;
         evaluate_fresh(
             &endpoint,
             &body.to_string(),
@@ -1180,6 +1271,7 @@ mod tests {
             Some("tok"),
             &access_all(),
             &mut reasons,
+            &mut conclusion,
         )
         .unwrap();
         reasons
@@ -1219,8 +1311,8 @@ mod tests {
     }
 
     /// Run `evaluate_fresh` for the PR-object endpoint against a PR body in
-    /// the given state, returning the wake reasons.
-    fn pr_object_reasons(state: &str, merged: bool) -> Vec<String> {
+    /// the given state, returning the wake reasons and any detected conclusion.
+    fn pr_object_reasons(state: &str, merged: bool) -> (Vec<String>, Option<PrOutcome>) {
         let endpoint = Endpoint {
             key: "pr",
             url: "repos/o/r/pulls/18".to_string(),
@@ -1233,6 +1325,7 @@ mod tests {
             "html_url": "https://github.com/o/r/pull/18",
         });
         let mut reasons = Vec::new();
+        let mut conclusion = None;
         evaluate_fresh(
             &endpoint,
             &body.to_string(),
@@ -1240,26 +1333,32 @@ mod tests {
             Some("tok"),
             &access_all(),
             &mut reasons,
+            &mut conclusion,
         )
         .unwrap();
-        reasons
+        (reasons, conclusion)
     }
 
     #[test]
     fn merged_pr_wakes() {
-        let reasons = pr_object_reasons("closed", true);
+        let (reasons, conclusion) = pr_object_reasons("closed", true);
         assert_eq!(reasons, ["The PR was merged."]);
+        // The merge is surfaced so the caller can normalize labels to finished.
+        assert_eq!(conclusion, Some(PrOutcome::Merged));
     }
 
     #[test]
     fn closed_unmerged_pr_wakes() {
-        let reasons = pr_object_reasons("closed", false);
+        let (reasons, conclusion) = pr_object_reasons("closed", false);
         assert_eq!(reasons, ["The PR was closed without merging."]);
+        assert_eq!(conclusion, Some(PrOutcome::Closed));
     }
 
     #[test]
     fn open_pr_does_not_wake() {
-        assert!(pr_object_reasons("open", false).is_empty());
+        let (reasons, conclusion) = pr_object_reasons("open", false);
+        assert!(reasons.is_empty());
+        assert_eq!(conclusion, None);
     }
 
     /// Run `evaluate_fresh` for the PR-object endpoint with an open PR in the
@@ -1282,6 +1381,7 @@ mod tests {
             ..Default::default()
         };
         let mut reasons = Vec::new();
+        let mut conclusion = None;
         evaluate_fresh(
             &endpoint,
             &body.to_string(),
@@ -1289,6 +1389,7 @@ mod tests {
             Some("tok"),
             &access_all(),
             &mut reasons,
+            &mut conclusion,
         )
         .unwrap();
         reasons
@@ -1315,6 +1416,20 @@ mod tests {
         assert!(pr_draft_reasons(false, None).is_empty());
     }
 
+    /// Run `feed_wake_reasons` against the standard `SINCE` watermark,
+    /// discarding the detected conclusion (the dedicated conclusion tests
+    /// inspect it directly). Most feed tests only care about the reasons.
+    fn feed_reasons(
+        events: &[FeedEvent],
+        number: u64,
+        pr: Option<u64>,
+        my_token: Option<&str>,
+        access: &AccessList,
+    ) -> Vec<String> {
+        let mut conclusion = None;
+        feed_wake_reasons(events, number, pr, SINCE, my_token, access, &mut conclusion)
+    }
+
     fn feed_pr_event(pr: u64, action: &str, merged: bool, at: &str) -> FeedEvent {
         FeedEvent {
             kind: "PullRequestEvent".to_string(),
@@ -1333,15 +1448,38 @@ mod tests {
 
     #[test]
     fn feed_wakes_on_pr_closed_event() {
+        // A merge surfaces its conclusion alongside the wake reason, so the
+        // caller can normalize labels even with no follow-up `work-on`.
         let events = [feed_pr_event(18, "closed", true, "2026-06-06T13:00:00Z")];
-        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, None, &access_all());
+        let mut conclusion = None;
+        let reasons = feed_wake_reasons(
+            &events,
+            7,
+            Some(18),
+            SINCE,
+            None,
+            &access_all(),
+            &mut conclusion,
+        );
         assert_eq!(reasons, ["The PR was merged (via the events feed)."]);
+        assert_eq!(conclusion, Some(PrOutcome::Merged));
+
         let events = [feed_pr_event(18, "closed", false, "2026-06-06T13:00:00Z")];
-        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, None, &access_all());
+        let mut conclusion = None;
+        let reasons = feed_wake_reasons(
+            &events,
+            7,
+            Some(18),
+            SINCE,
+            None,
+            &access_all(),
+            &mut conclusion,
+        );
         assert_eq!(
             reasons,
             ["The PR was closed without merging (via the events feed)."]
         );
+        assert_eq!(conclusion, Some(PrOutcome::Closed));
     }
 
     #[test]
@@ -1352,7 +1490,7 @@ mod tests {
             false,
             "2026-06-06T13:00:00Z",
         )];
-        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, None, &access_all());
+        let reasons = feed_reasons(&events, 7, Some(18), None, &access_all());
         assert_eq!(
             reasons,
             ["The PR was marked ready for review (via the events feed)."]
@@ -1363,7 +1501,7 @@ mod tests {
             false,
             "2026-06-06T13:00:00Z",
         )];
-        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, None, &access_all());
+        let reasons = feed_reasons(&events, 7, Some(18), None, &access_all());
         assert_eq!(
             reasons,
             ["The PR was converted back to draft (via the events feed)."]
@@ -1381,7 +1519,7 @@ mod tests {
             // Ours and closed, but before the watermark.
             feed_pr_event(18, "closed", true, "2026-06-06T11:00:00Z"),
         ];
-        assert!(feed_wake_reasons(&events, 7, Some(18), SINCE, None, &access_all()).is_empty());
+        assert!(feed_reasons(&events, 7, Some(18), None, &access_all()).is_empty());
     }
 
     fn feed_comment_event(issue: u64, comment_id: u64, body: &str, at: &str) -> FeedEvent {
@@ -1412,12 +1550,12 @@ mod tests {
     #[test]
     fn feed_wakes_on_matching_comment_event() {
         let events = [feed_comment_event(7, 1, "hi", "2026-06-06T13:00:00Z")];
-        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, Some("tok"), &access_all());
+        let reasons = feed_reasons(&events, 7, Some(18), Some("tok"), &access_all());
         assert_eq!(reasons.len(), 1);
         assert!(reasons[0].contains("issue thread"));
         // The PR thread is named when the event is for the PR's number.
         let events = [feed_comment_event(18, 1, "hi", "2026-06-06T13:00:00Z")];
-        let reasons = feed_wake_reasons(&events, 7, Some(18), SINCE, Some("tok"), &access_all());
+        let reasons = feed_reasons(&events, 7, Some(18), Some("tok"), &access_all());
         assert!(reasons[0].contains("PR thread"));
     }
 
@@ -1432,9 +1570,7 @@ mod tests {
             // Ours and fresh, but our own post.
             feed_comment_event(7, 3, &own, "2026-06-06T13:00:00Z"),
         ];
-        assert!(
-            feed_wake_reasons(&events, 7, Some(18), SINCE, Some("tok"), &access_all()).is_empty()
-        );
+        assert!(feed_reasons(&events, 7, Some(18), Some("tok"), &access_all()).is_empty());
     }
 
     #[test]
@@ -1452,7 +1588,7 @@ mod tests {
                 comment: None,
             },
         }];
-        let reasons = feed_wake_reasons(&events, 7, None, SINCE, None, &access_all());
+        let reasons = feed_reasons(&events, 7, None, None, &access_all());
         assert_eq!(reasons.len(), 1);
         assert!(reasons[0].contains("closed"));
     }
@@ -1481,18 +1617,18 @@ mod tests {
             feed_issue_event(7, "unlabeled", "2026-06-06T13:00:01Z"),
             feed_issue_event(7, "assigned", "2026-06-06T13:00:02Z"),
         ];
-        assert!(feed_wake_reasons(&events, 7, None, SINCE, None, &access_all()).is_empty());
+        assert!(feed_reasons(&events, 7, None, None, &access_all()).is_empty());
     }
 
     #[test]
     fn feed_wakes_on_issue_edited_and_reopened() {
         let edited = [feed_issue_event(7, "edited", "2026-06-06T13:00:00Z")];
-        let reasons = feed_wake_reasons(&edited, 7, None, SINCE, None, &access_all());
+        let reasons = feed_reasons(&edited, 7, None, None, &access_all());
         assert_eq!(reasons.len(), 1);
         assert!(reasons[0].contains("edited"));
 
         let reopened = [feed_issue_event(7, "reopened", "2026-06-06T13:00:00Z")];
-        let reasons = feed_wake_reasons(&reopened, 7, None, SINCE, None, &access_all());
+        let reasons = feed_reasons(&reopened, 7, None, None, &access_all());
         assert_eq!(reasons.len(), 1);
         assert!(reasons[0].contains("reopened"));
     }
