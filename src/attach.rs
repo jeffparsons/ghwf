@@ -3,10 +3,11 @@
 //! GitHub has no token-authenticated API for the inline attachment CDN the web
 //! UI uses, so we commit each file into the repo (on a dedicated, orphan-history
 //! branch so it never touches the working branch or a PR diff) via the Git Data
-//! API and reference it from the comment body. Images on a public repo embed
-//! inline via a `?raw=true` blob link; everything else — including images on a
-//! private repo, whose blob links are auth-gated and so won't render inline — is
-//! a plain link.
+//! API and reference it from the comment body. On a public repo, images embed
+//! inline via a `?raw=true` blob link and videos via an HTML `<video>` tag
+//! pointing at the raw bytes. Audio and everything else — and every attachment
+//! on a private repo, whose blob links are auth-gated and so won't render
+//! inline — is a plain link.
 
 use std::collections::HashSet;
 use std::fs;
@@ -28,6 +29,22 @@ const MAX_BYTES: u64 = 25 * 1024 * 1024;
 
 /// Image extensions GitHub renders inline from a `?raw=true` blob link.
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "apng"];
+
+/// Video extensions GitHub plays inline from an HTML `<video>` tag. GitHub's
+/// markdown sanitizer keeps `<video controls src="…">` (verified against its
+/// `/markdown` API) but strips `<audio>`, so audio has no inline form and falls
+/// through to a link.
+const VIDEO_EXTS: &[&str] = &["mp4", "mov", "webm"];
+
+/// How an attachment can be presented in a comment, decided by file extension.
+enum MediaKind {
+    /// Embeds inline via `![](…?raw=true)` on a public repo.
+    Image,
+    /// Embeds inline via an HTML `<video>` tag on a public repo.
+    Video,
+    /// No inline form GitHub supports; always a plain link.
+    Other,
+}
 
 /// A file read and ready to upload.
 struct Prepared {
@@ -65,11 +82,15 @@ pub fn upload(owner: &str, repo: &str, issue: u64, paths: &[PathBuf]) -> Result<
     let lines: Vec<String> = prepared
         .iter()
         .map(|p| {
-            let url = format!(
+            let blob_url = format!(
                 "https://github.com/{owner}/{repo}/blob/{BRANCH}/{}",
                 p.repo_path
             );
-            attachment_markdown(&p.name, &url, is_image(&p.name), private)
+            let raw_url = format!(
+                "https://raw.githubusercontent.com/{owner}/{repo}/{BRANCH}/{}",
+                p.repo_path
+            );
+            attachment_markdown(&p.name, &blob_url, &raw_url, media_kind(&p.name), private)
         })
         .collect();
     Ok(Some(build_trailer(&lines)))
@@ -174,22 +195,34 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
-/// Whether a name's extension is one GitHub renders inline.
-fn is_image(name: &str) -> bool {
-    Path::new(name)
+/// Classify a name by extension into the way it can be presented.
+fn media_kind(name: &str) -> MediaKind {
+    let ext = Path::new(name)
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .is_some_and(|e| IMAGE_EXTS.contains(&e.as_str()))
+        .map(|e| e.to_ascii_lowercase());
+    match ext {
+        Some(e) if IMAGE_EXTS.contains(&e.as_str()) => MediaKind::Image,
+        Some(e) if VIDEO_EXTS.contains(&e.as_str()) => MediaKind::Video,
+        _ => MediaKind::Other,
+    }
 }
 
-/// One attachment's markdown: an inline image only when it's an image in a
-/// public repo (where the `?raw=true` blob link renders); otherwise a link.
-fn attachment_markdown(name: &str, url: &str, image: bool, private: bool) -> String {
-    if image && !private {
-        format!("![{name}]({url}?raw=true)")
-    } else {
-        format!("[{name}]({url})")
+/// One attachment's markdown. On a public repo an image embeds via the
+/// `?raw=true` blob link and a video via an HTML `<video>` tag pointing at the
+/// raw bytes (so the player can fetch and seek directly); everything else, and
+/// every kind on a private repo (where those URLs are auth-gated), is a link.
+fn attachment_markdown(
+    name: &str,
+    blob_url: &str,
+    raw_url: &str,
+    kind: MediaKind,
+    private: bool,
+) -> String {
+    match kind {
+        MediaKind::Image if !private => format!("![{name}]({blob_url}?raw=true)"),
+        MediaKind::Video if !private => format!("<video controls src=\"{raw_url}\"></video>"),
+        _ => format!("[{name}]({blob_url})"),
     }
 }
 
@@ -243,32 +276,58 @@ mod tests {
     }
 
     #[test]
-    fn is_image_matches_known_extensions() {
+    fn media_kind_matches_known_extensions() {
         for n in ["a.png", "b.JPG", "c.jpeg", "d.gif", "e.WEBP", "f.svg"] {
-            assert!(is_image(n), "{n} should be an image");
+            assert!(
+                matches!(media_kind(n), MediaKind::Image),
+                "{n} should be an image"
+            );
         }
-        for n in ["server.log", "patch.diff", "notes.txt", "noext"] {
-            assert!(!is_image(n), "{n} should not be an image");
+        for n in ["clip.mp4", "screen.MOV", "loop.webm"] {
+            assert!(
+                matches!(media_kind(n), MediaKind::Video),
+                "{n} should be a video"
+            );
+        }
+        // Audio has no inline form GitHub supports, so it classifies as Other.
+        for n in ["voice.mp3", "tone.wav", "server.log", "patch.diff", "noext"] {
+            assert!(
+                matches!(media_kind(n), MediaKind::Other),
+                "{n} should be other"
+            );
         }
     }
 
     #[test]
-    fn markdown_embeds_only_public_images() {
-        let url = "https://github.com/o/r/blob/ghwf-attachments/attachments/80/ab12cd34-shot.png";
-        // Image in a public repo: inline.
+    fn markdown_embeds_public_images_and_videos_only() {
+        let blob = "https://github.com/o/r/blob/ghwf-attachments/attachments/80/ab12cd34-shot.png";
+        let raw =
+            "https://raw.githubusercontent.com/o/r/ghwf-attachments/attachments/80/ab12cd34-shot.png";
+        // Image in a public repo: inline image.
         assert_eq!(
-            attachment_markdown("shot.png", url, true, false),
-            format!("![shot.png]({url}?raw=true)")
+            attachment_markdown("shot.png", blob, raw, MediaKind::Image, false),
+            format!("![shot.png]({blob}?raw=true)")
         );
         // Image in a private repo: link only (no `!`, no `?raw=true`).
         assert_eq!(
-            attachment_markdown("shot.png", url, true, true),
-            format!("[shot.png]({url})")
+            attachment_markdown("shot.png", blob, raw, MediaKind::Image, true),
+            format!("[shot.png]({blob})")
         );
-        // Non-image: link regardless of visibility.
+        // Video in a public repo: a `<video>` tag pointing at the raw bytes,
+        // never the blob page that broke playback.
         assert_eq!(
-            attachment_markdown("server.log", url, false, false),
-            format!("[server.log]({url})")
+            attachment_markdown("clip.mp4", blob, raw, MediaKind::Video, false),
+            format!("<video controls src=\"{raw}\"></video>")
+        );
+        // Video in a private repo: link only.
+        assert_eq!(
+            attachment_markdown("clip.mp4", blob, raw, MediaKind::Video, true),
+            format!("[clip.mp4]({blob})")
+        );
+        // Audio (Other): link even on a public repo — GitHub strips `<audio>`.
+        assert_eq!(
+            attachment_markdown("voice.mp3", blob, raw, MediaKind::Other, false),
+            format!("[voice.mp3]({blob})")
         );
     }
 
