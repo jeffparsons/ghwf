@@ -19,6 +19,7 @@ mod onboarding;
 mod plan_cleanup;
 mod prep;
 mod render;
+mod resync;
 mod seen;
 mod session_binding;
 mod state;
@@ -771,6 +772,18 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     // would fail against a merged or closed PR).
     let phase = issue_state.phase;
     let located = config::find()?;
+
+    // Surface any sibling issue whose session crashed or was killed: flip it to
+    // needs-you and re-sync its labels so a dead run doesn't leave the issue
+    // showing a frozen "machine is working" badge until a human re-enters it
+    // (#110). Best-effort maintenance, independent of this issue's own workflow;
+    // the current issue holds a live lease so it's never its own target.
+    if let Some(located) = located.as_ref() {
+        if let Err(err) = resync::sweep(located) {
+            eprintln!("warning: stale-session label resync failed: {err:#}");
+        }
+    }
+
     // The project's PR instructions file, when one exists; the implement and
     // review banners point Claude at it.
     let pr_instructions = located
