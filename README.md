@@ -166,6 +166,15 @@ picking another. The request is recorded under ghwf's data dir and reaches every
 forever worker on the machine; a worker you start afterwards ignores it, so it's
 safe to `ghwf stop` and then launch a fresh worker.
 
+A `forever` worker also picks up a rebuilt `ghwf` on its own: it hashes its own
+binary at startup, and when a workflow concludes it re-checks that hash. If the
+binary has changed — you've installed a new build — the worker relaunches itself
+in place (same terminal, same arguments) so the next issue runs on the new code.
+The relaunch only ever happens at this clean between-workflows boundary, never
+mid-issue, and a pending `ghwf stop` takes precedence (the worker exits rather
+than relaunching). This is Unix-only; if the binary can't be read, the worker
+just carries on rather than risking a spurious relaunch.
+
 A `forever` worker also rides out a launch that fails for a transient reason
 (say a network blip while fetching the issue or creating the worktree): it logs
 the failure, leaves the issue pickable rather than locking it, and moves on to
