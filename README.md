@@ -29,11 +29,13 @@ merge, `work-on` posts a final status update and tells Claude to stop the
 loop, and the session ends on its own. A merged issue moves to a terminal
 **finished** state, so (when workflow labels are configured) its phase and
 attention labels come off and it carries a single `ghwf:finished` label —
-making it obvious at a glance that ghwf regards the work as done. Closing the
-PR without merging halts the workflow the same way (with distinct wording, so
-Claude surfaces it) but is not "finished": it keeps its phase label as a record
-of how far the work got, and reopening the PR resumes the workflow on the next
-`work-on`.
+making it obvious at a glance that ghwf regards the work as done. `wait`
+normalizes these labels the moment it detects the merge, so they don't linger
+even when no further `work-on` follows (the loop has already stopped, say).
+Closing the PR without merging halts the workflow the same way (with distinct
+wording, so Claude surfaces it) but is not "finished": it keeps its phase label
+as a record of how far the work got (dropping only the attention label), and
+reopening the PR resumes the workflow on the next `work-on`.
 
 A command that doesn't match the current phase (or the retired generic
 `/proceed`) is consumed without advancing anything, and `work-on` reports what

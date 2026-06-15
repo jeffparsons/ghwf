@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::config::{self, LabelsConfig};
 use crate::github::{self, RepoRef};
-use crate::state::{Attention, IssueState, LabelSyncRecord, Phase};
+use crate::state::{Attention, IssueState, LabelSyncRecord, Phase, PrOutcome};
 
 /// Mirror the workflow state onto GitHub labels on the issue and (when one
 /// exists) its PR. Entirely best-effort decoration: every failure is a stderr
@@ -27,6 +27,65 @@ pub fn sync(
     pr_number: Option<u64>,
     state: &mut IssueState,
 ) {
+    // A concluded workflow waits on nobody: the phase label stays as a
+    // record of how far the work got, the attention label comes off.
+    let attention = state.pr_outcome.is_none().then_some(state.attention);
+    sync_with(
+        issue_repo,
+        code_repo,
+        number,
+        pr_number,
+        state.phase,
+        attention,
+        state,
+    );
+}
+
+/// Normalize labels for a freshly detected PR conclusion, without consulting or
+/// mutating `state.phase` / `state.pr_outcome`. This lets `wait` clean up the
+/// labels the instant it sees a merge (or a close) even when no `work-on`
+/// follows, while leaving the conclusion invisible in the state file so the next
+/// `work-on` still treats it as new and runs its once-per-merge side effects.
+///
+/// The `LabelSyncRecord` it writes is exactly the one `work-on`'s own end-of-run
+/// `sync` would write for the same conclusion — a merge collapses to the
+/// terminal `Finished` phase, a close keeps the phase it concluded from, and
+/// either way the attention label comes off — so a follow-up `work-on` sync
+/// no-ops rather than making duplicate API calls.
+pub fn sync_concluded(
+    issue_repo: &RepoRef,
+    code_repo: &RepoRef,
+    number: u64,
+    pr_number: Option<u64>,
+    conclusion: PrOutcome,
+    state: &mut IssueState,
+) {
+    let phase = concluded_phase(conclusion, state.phase);
+    sync_with(issue_repo, code_repo, number, pr_number, phase, None, state);
+}
+
+/// The phase a concluded workflow labels as: a merge collapses to the terminal
+/// `Finished`; a close keeps the phase it concluded from, as a record of how far
+/// the work got.
+fn concluded_phase(conclusion: PrOutcome, phase: Phase) -> Phase {
+    match conclusion {
+        PrOutcome::Merged => Phase::Finished,
+        PrOutcome::Closed => phase,
+    }
+}
+
+/// Apply the given phase/attention labels to the issue and (when one exists) its
+/// PR, recording the result in `state.labels_synced`. No-op when no `[labels]`
+/// section is configured, and when the last sync already applied the same inputs.
+fn sync_with(
+    issue_repo: &RepoRef,
+    code_repo: &RepoRef,
+    number: u64,
+    pr_number: Option<u64>,
+    phase: Phase,
+    attention: Option<Attention>,
+    state: &mut IssueState,
+) {
     let cfg = match config::find() {
         Ok(Some(located)) => match located.config.labels {
             Some(cfg) => cfg,
@@ -39,11 +98,8 @@ pub fn sync(
         }
     };
 
-    // A concluded workflow waits on nobody: the phase label stays as a
-    // record of how far the work got, the attention label comes off.
-    let attention = state.pr_outcome.is_none().then_some(state.attention);
     let record = LabelSyncRecord {
-        phase: state.phase,
+        phase,
         attention,
         pr_number,
     };
@@ -60,7 +116,7 @@ pub fn sync(
 
     let mut all_ok = true;
     for (repo, thread) in threads {
-        if let Err(err) = sync_thread(&cfg, &repo.0, &repo.1, thread, state.phase, attention) {
+        if let Err(err) = sync_thread(&cfg, &repo.0, &repo.1, thread, phase, attention) {
             eprintln!("warning: failed to sync workflow labels on #{thread}: {err:#}");
             all_ok = false;
         }
@@ -305,9 +361,11 @@ fn labels_section() -> String {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{desired_labels, labels_section, labels_to_create, DEFAULTS, PHASE_DEFAULTS};
+    use super::{
+        concluded_phase, desired_labels, labels_section, labels_to_create, DEFAULTS, PHASE_DEFAULTS,
+    };
     use crate::config::Config;
-    use crate::state::{Attention, Phase};
+    use crate::state::{Attention, Phase, PrOutcome};
 
     fn config_with_labels() -> Config {
         let toml = format!("worktrees_dir = \"worktrees\"\n{}", labels_section());
@@ -354,6 +412,28 @@ mod tests {
         let labels = config_with_labels().labels.unwrap();
         let desired = desired_labels(&labels, Phase::Finished, None);
         assert_eq!(desired.into_iter().collect::<Vec<_>>(), ["ghwf:finished"]);
+    }
+
+    #[test]
+    fn concluded_workflow_labels_collapse_correctly() {
+        // A merge collapses to the terminal label regardless of where it
+        // concluded from; a close keeps its phase but drops the attention label.
+        // These are exactly the label sets `sync_concluded` applies (it pairs
+        // `concluded_phase` with `desired_labels(.., None)`), and they match what
+        // `work-on`'s own end-of-run sync produces, so a follow-up sync no-ops.
+        let labels = config_with_labels().labels.unwrap();
+        let merged = desired_labels(
+            &labels,
+            concluded_phase(PrOutcome::Merged, Phase::Review),
+            None,
+        );
+        assert_eq!(merged.into_iter().collect::<Vec<_>>(), ["ghwf:finished"]);
+        let closed = desired_labels(
+            &labels,
+            concluded_phase(PrOutcome::Closed, Phase::Review),
+            None,
+        );
+        assert_eq!(closed.into_iter().collect::<Vec<_>>(), ["ghwf:review"]);
     }
 
     #[test]
