@@ -60,8 +60,9 @@ pub fn save(
         .expect("record path always has a parent directory");
     fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let json = serde_json::to_string_pretty(record).context("failed to serialize seen-record")?;
-    fs::write(&path, json)
-        .with_context(|| format!("failed to write seen-record {}", path.display()))
+    // Seen-records are written only by `work-on` (one writer), so atomicity is
+    // enough — no cross-writer lock is needed here, unlike issue state.
+    store::atomic_write(&path, json.as_bytes())
 }
 
 #[cfg(test)]

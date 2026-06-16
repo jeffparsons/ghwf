@@ -471,13 +471,7 @@ pub fn load(owner: &str, repo: &str, number: u64) -> Result<IssueState> {
 
 /// Load the state for an issue, or `None` if none has been recorded.
 pub fn load_if_exists(owner: &str, repo: &str, number: u64) -> Result<Option<IssueState>> {
-    let path = state_path(owner, repo, number)?;
-    match fs::read_to_string(&path) {
-        Ok(json) => serde_json::from_str(&json)
-            .map(Some)
-            .with_context(|| format!("failed to parse issue state {}", path.display())),
-        Err(_) => Ok(None),
-    }
+    read_state(&state_path(owner, repo, number)?)
 }
 
 /// Find the workflow issue a conversation thread belongs to: `number` itself
@@ -685,6 +679,11 @@ fn claim_file(path: &Path) -> Result<bool> {
 }
 
 /// Persist the state for an issue.
+///
+/// The write is atomic (temp + rename) and serialised against concurrent
+/// [`mutate`] calls through the per-issue lock, so a Stop/Notification hook
+/// bumping its own field can never interleave with this write and lose it (or
+/// clobber the fields written here).
 pub fn save(owner: &str, repo: &str, number: u64, state: &IssueState) -> Result<()> {
     let path = state_path(owner, repo, number)?;
     let dir = path
@@ -692,8 +691,97 @@ pub fn save(owner: &str, repo: &str, number: u64, state: &IssueState) -> Result<
         .expect("state path always has a parent directory");
     fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let json = serde_json::to_string_pretty(state).context("failed to serialize issue state")?;
-    fs::write(&path, json)
-        .with_context(|| format!("failed to write issue state {}", path.display()))
+    with_issue_lock(&path, || {
+        store::atomic_write(&path, json.as_bytes())
+            .with_context(|| format!("failed to write issue state {}", path.display()))
+    })
+}
+
+/// Read-modify-write an issue's state under the per-issue lock, so a narrow
+/// writer (a Stop/Notification hook, the supervisor) changes only the field it
+/// owns without clobbering a concurrent [`save`].
+///
+/// The latest file is re-read *inside* the lock, `f` is applied to it, and the
+/// result is written atomically — all while holding the lock. Because [`save`]
+/// also takes the same lock for its write, the two critical sections can't
+/// interleave: this either runs fully before a concurrent save (and that save's
+/// snapshot wins, dropping only this call's narrow field) or fully after it
+/// (re-reading the saved snapshot, so the save's phase/consumed-sets survive).
+///
+/// Does nothing when no state file exists yet: a narrow writer has nothing to
+/// update before the issue has been claimed.
+pub fn mutate(owner: &str, repo: &str, number: u64, f: impl FnOnce(&mut IssueState)) -> Result<()> {
+    let path = state_path(owner, repo, number)?;
+    let dir = path
+        .parent()
+        .expect("state path always has a parent directory");
+    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    mutate_at(&path, f)
+}
+
+/// Read-modify-write the state at a concrete `path`. Split from [`mutate`] so
+/// tests can drive a scratch path without a real data dir.
+fn mutate_at(path: &Path, f: impl FnOnce(&mut IssueState)) -> Result<()> {
+    with_issue_lock(path, || {
+        let Some(mut state) = read_state(path)? else {
+            return Ok(());
+        };
+        f(&mut state);
+        let json =
+            serde_json::to_string_pretty(&state).context("failed to serialize issue state")?;
+        store::atomic_write(path, json.as_bytes())
+            .with_context(|| format!("failed to write issue state {}", path.display()))
+    })
+}
+
+/// Read and parse the state file at `path`, or `None` when it doesn't exist.
+/// The path-based parse shared by [`load_if_exists`] and [`mutate`]'s
+/// re-read-under-lock.
+fn read_state(path: &Path) -> Result<Option<IssueState>> {
+    match fs::read_to_string(path) {
+        Ok(json) => serde_json::from_str(&json)
+            .map(Some)
+            .with_context(|| format!("failed to parse issue state {}", path.display())),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Hold an exclusive lock on an issue's lock file for the duration of `f`.
+///
+/// `state_file` is the issue's `<n>.json`; the lock lives on its `<n>.json.lock`
+/// sibling, which is never renamed (unlike the state file, replaced on every
+/// atomic write), so the whole-machine lock lives on a stable inode. The
+/// `.json.lock` suffix leaves the stem `<n>.json`, which doesn't parse as a
+/// number, so the state-dir scanners ([`state_files`], [`issue_numbers`], …)
+/// skip it just as they skip the `<n>.lease.json` lease sibling.
+///
+/// Uses the stdlib `File::lock` (blocking, exclusive); the lock releases when
+/// the file handle drops at the end of this function. A failure to open or lock
+/// the file is surfaced rather than silently skipped, so a caller's `Result`
+/// reflects it.
+fn with_issue_lock<T>(state_file: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let lock = lock_path(state_file);
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock)
+        .with_context(|| format!("failed to open lock file {}", lock.display()))?;
+    file.lock()
+        .with_context(|| format!("failed to lock {}", lock.display()))?;
+    let out = f();
+    // The lock releases on drop; dropping explicitly keeps the ordering obvious.
+    drop(file);
+    out
+}
+
+/// The lock-file sibling for a state file: `<n>.json` → `<n>.json.lock`.
+/// Appends (rather than replacing the extension) so the stem stays `<n>.json`
+/// and the state-dir scanners skip it.
+fn lock_path(state_file: &Path) -> PathBuf {
+    let mut name = state_file.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
 }
 
 /// Delete an issue's state file only when it represents a *bare claim* — a
@@ -1010,10 +1098,7 @@ fn heartbeat_loop(path: &Path, stop: &AtomicBool) {
 /// reader never sees a half-written lease.
 fn write_lease(path: &Path, lease: &SessionLease) -> Result<()> {
     let json = serde_json::to_string(lease).context("failed to serialize session lease")?;
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-    fs::write(&tmp, json.as_bytes())
-        .with_context(|| format!("failed to write session lease {}", tmp.display()))?;
-    fs::rename(&tmp, path)
+    store::atomic_write(path, json.as_bytes())
         .with_context(|| format!("failed to install session lease {}", path.display()))
 }
 
@@ -1021,10 +1106,10 @@ fn write_lease(path: &Path, lease: &SessionLease) -> Result<()> {
 mod tests {
     use super::{
         acquire_lease_at, branch_and_slug, find_issue_for_dir, is_live, is_unstarted,
-        issue_fingerprint, lease_is_stale_at, load_lease, parse_directive,
-        parse_prompted_directive, pr_outcome, process_alive, stop_flag_at, write_stop_flag_in,
-        Attention, Directive, IssueState, OptionsWatch, Phase, PostedRef, PrOutcome, PrepState,
-        ReactionWatch, SessionLease, WaitState,
+        issue_fingerprint, lease_is_stale_at, load_lease, mutate_at, parse_directive,
+        parse_prompted_directive, pr_outcome, process_alive, read_state, stop_flag_at,
+        write_stop_flag_in, Attention, Directive, IssueState, OptionsWatch, Phase, PostedRef,
+        PrOutcome, PrepState, ReactionWatch, SessionLease, WaitState,
     };
     use crate::models::PullRequest;
     use std::path::{Path, PathBuf};
@@ -1071,9 +1156,12 @@ mod tests {
         write_state(&issues_root, "o", "r", 7, Some(&worktree));
         // Another issue without a worktree must not interfere.
         write_state(&issues_root, "o", "r", 8, None);
-        // A lease file sits beside the state files; its numeric prefix must not
-        // make the walker mistake it for a state file (its stem isn't a number).
+        // A lease file and a lock file sit beside the state files; their numeric
+        // prefixes must not make the walker mistake them for state files (their
+        // stems, `7.lease` and `7.json`, aren't numbers). An empty lock file
+        // would also fail to parse as state if the walker picked it up.
         std::fs::write(issues_root.join("o").join("r").join("7.lease.json"), "{}").unwrap();
+        std::fs::write(issues_root.join("o").join("r").join("7.json.lock"), "").unwrap();
 
         let expected = Some(("o".to_string(), "r".to_string(), 7));
         assert_eq!(
@@ -1085,6 +1173,42 @@ mod tests {
             expected
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn mutate_at_applies_change_and_preserves_other_fields() {
+        let dir = scratch("mutate-apply");
+        let path = dir.join("5.json");
+        // Seed a state that a `work-on` save might have just written: a phase
+        // advance plus a consumed-set, and a non-zero nudge counter.
+        let mut seeded = IssueState {
+            phase: Phase::Review,
+            stop_nudges: 5,
+            ..Default::default()
+        };
+        seeded.consumed_directives.insert(42);
+        std::fs::write(&path, serde_json::to_string_pretty(&seeded).unwrap()).unwrap();
+
+        // A narrow writer bumps only its own field.
+        mutate_at(&path, |s| s.stop_nudges += 1).unwrap();
+
+        let after = read_state(&path).unwrap().expect("state still present");
+        assert_eq!(after.stop_nudges, 6, "the bump is applied");
+        // The fields the narrow writer doesn't own survive — it re-read the
+        // file rather than writing back a stale snapshot.
+        assert_eq!(after.phase, Phase::Review);
+        assert!(after.consumed_directives.contains(&42));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mutate_at_is_noop_when_no_state_exists() {
+        let dir = scratch("mutate-missing");
+        let path = dir.join("9.json");
+        // No state file yet: the closure must not run and nothing is created.
+        mutate_at(&path, |s| s.stop_nudges += 1).unwrap();
+        assert!(!path.exists(), "no state file is created");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

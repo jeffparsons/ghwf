@@ -40,7 +40,7 @@ pub fn run() -> Result<()> {
     if input.session_id.is_empty() {
         return Ok(());
     }
-    let Ok(Some(mut bound)) = find_bound_issue(&input.session_id) else {
+    let Ok(Some(bound)) = find_bound_issue(&input.session_id) else {
         return Ok(());
     };
 
@@ -49,9 +49,12 @@ pub fn run() -> Result<()> {
     }
 
     // Record the nudge before issuing it; a failure to persist means the cap
-    // can't count, so fail open rather than nudge unaccountably.
-    bound.state.stop_nudges += 1;
-    if state::save(&bound.owner, &bound.repo, bound.number, &bound.state).is_err() {
+    // can't count, so fail open rather than nudge unaccountably. The bump goes
+    // through `mutate` so it re-reads the latest state under the per-issue lock
+    // and touches only `stop_nudges` — a concurrent `work-on` save (phase
+    // advance, consumed-sets) is never clobbered out from under it.
+    let bumped = state::mutate(&bound.owner, &bound.repo, bound.number, |s| s.stop_nudges += 1);
+    if bumped.is_err() {
         return Ok(());
     }
 

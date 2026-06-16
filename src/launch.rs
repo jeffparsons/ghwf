@@ -798,14 +798,13 @@ fn ensure_down(child: &mut Child) -> Result<()> {
 }
 
 /// Drop a spent alert from the issue state before a recovery re-spawn, so the
-/// supervisor doesn't immediately re-trigger on it. Best-effort.
+/// supervisor doesn't immediately re-trigger on it. Best-effort. The clear goes
+/// through `mutate` so it touches only `session_alert` under the per-issue lock
+/// and can't clobber a concurrent `work-on` save.
 fn clear_alert(launch: &Launch) {
-    if let Ok(Some(mut state)) = state::load_if_exists(&launch.owner, &launch.repo, launch.number) {
-        if state.session_alert.is_some() {
-            state.session_alert = None;
-            let _ = state::save(&launch.owner, &launch.repo, launch.number, &state);
-        }
-    }
+    let _ = state::mutate(&launch.owner, &launch.repo, launch.number, |s| {
+        s.session_alert = None
+    });
 }
 
 /// Recompute the launch's `--resume` target from the latest recorded state, so a

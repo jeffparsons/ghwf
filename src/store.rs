@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
@@ -80,6 +80,17 @@ fn record_session(token: &str, session_id: &str) -> Result<()> {
         .with_context(|| format!("failed to record session mapping at {}", path.display()))
 }
 
+/// Atomically replace `path`'s contents by writing a sibling temp file and
+/// renaming it into place, so a concurrent reader — or a crash mid-write —
+/// never sees a half-written file. The temp name carries our pid so writers in
+/// different processes don't collide on it. `path`'s parent directory must
+/// already exist.
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    fs::write(&tmp, bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| format!("failed to install {}", path.display()))
+}
+
 /// A short content hash used to detect changes to an issue body or comment.
 ///
 /// 16 hex chars (64 bits) is plenty to detect edits; this is change-detection,
@@ -97,4 +108,40 @@ fn hex(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::atomic_write;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ghwf-store-test-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn atomic_write_replaces_contents() {
+        let dir = scratch("atomic-write");
+        let path = dir.join("v.json");
+        atomic_write(&path, b"first").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+        atomic_write(&path, b"second").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_temp_sibling() {
+        let dir = scratch("atomic-write-tmp");
+        let path = dir.join("w.json");
+        atomic_write(&path, b"payload").unwrap();
+        // The temp file is renamed into place, so only the target remains.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
+    }
 }

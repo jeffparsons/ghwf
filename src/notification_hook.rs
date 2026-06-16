@@ -35,7 +35,7 @@ pub fn run(kind: AlertKind) -> Result<()> {
     if input.session_id.is_empty() {
         return Ok(());
     }
-    let Ok(Some(mut bound)) = find_bound_issue(&input.session_id) else {
+    let Ok(Some(bound)) = find_bound_issue(&input.session_id) else {
         return Ok(());
     };
     // A concluded workflow has nothing left to recover.
@@ -49,13 +49,18 @@ pub fn run(kind: AlertKind) -> Result<()> {
         &input.session_id,
         state::now_epoch(),
     );
-    bound.state.session_alert = Some(SessionAlert {
+    let alert = SessionAlert {
         kind,
         session_id: input.session_id,
         at,
+    };
+    // The write goes through `mutate` so it re-reads the latest state under the
+    // per-issue lock and touches only `session_alert`, never clobbering a
+    // concurrent `work-on` save. Best-effort: a failed write just means no
+    // alert is recorded this time.
+    let _ = state::mutate(&bound.owner, &bound.repo, bound.number, |s| {
+        s.session_alert = Some(alert)
     });
-    // Best-effort: a failed save just means no alert is recorded this time.
-    let _ = state::save(&bound.owner, &bound.repo, bound.number, &bound.state);
     Ok(())
 }
 
