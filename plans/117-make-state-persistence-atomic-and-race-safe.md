@@ -55,16 +55,16 @@ filesystem ⇒ atomic `rename`). Reuse the existing `path.with_extension(format!
 ### 2. Per-issue lock + `mutate`
 
 Serialisation point: a dedicated lock file `<n>.lock` next to `<n>.json` under
-the issues dir, locked with `flock(2)` (`LOCK_EX`). We lock a *separate* file,
-not the state file itself, because the state file's inode is replaced on every
-atomic rename — an `flock` on the old inode wouldn't serialise against a writer
-that renamed a new inode into place.
+the issues dir, locked with the stdlib `std::fs::File::lock` (exclusive,
+blocking; stabilised in Rust 1.89, available on the project's toolchain). We
+lock a *separate* file, not the state file itself, because the state file's
+inode is replaced on every atomic rename — a lock on the old inode wouldn't
+serialise against a writer that renamed a new inode into place.
 
-`flock` is available via the existing `libc` dependency, which is already
-`[target.'cfg(unix)']`-only. On non-Unix the lock degrades to a no-op guard
-(atomic writes still prevent torn files; only the RMW serialisation is lost),
-keeping the crate buildable everywhere — consistent with the supervisor's
-existing `cfg(unix)` posture.
+`File::lock` is cross-platform (no `libc`/`cfg(unix)` gating, no `unsafe`) and
+the lock releases when the `File` is dropped (or via `File::unlock`). The lock
+file is created once with `OpenOptions::create(true)` and never renamed, so the
+lock always lives on a stable inode.
 
 New in `state.rs`:
 
@@ -72,9 +72,8 @@ New in `state.rs`:
 /// Path to the per-issue lock file: `<issues>/<owner>/<repo>/<n>.lock`.
 fn lock_path(owner, repo, number) -> Result<PathBuf>
 
-/// Open (creating) the issue's lock file and hold an exclusive flock for the
-/// closure's duration. The guard releases on drop. cfg(unix); a no-op guard
-/// elsewhere.
+/// Open (creating) the issue's lock file and hold an exclusive `File::lock`
+/// for the closure's duration; the lock releases when the file drops.
 fn with_issue_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T>
 
 /// Read-modify-write an issue's recorded state under the lock: re-read the
