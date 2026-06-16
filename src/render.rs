@@ -261,6 +261,27 @@ pub fn reply_where_asked_instruction() -> String {
         .to_string()
 }
 
+/// One banner line telling Claude which labels the project encourages it to
+/// apply when filing a follow-up with `ghwf create-issue` — currently the
+/// configured priority labels. `None` when none are configured, so the line is
+/// omitted entirely rather than shown empty.
+pub fn encouraged_labels_instruction(priority_labels: &[String]) -> Option<String> {
+    if priority_labels.is_empty() {
+        return None;
+    }
+    let list = priority_labels
+        .iter()
+        .map(|label| format!("`{label}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "When you file a follow-up with `ghwf create-issue`, attach labels with \
+         `--label <name>` (repeatable). This project's priority labels, most urgent \
+         first, are: {list}. Apply the one that matches the follow-up's urgency when \
+         it's clear; leave it off when it isn't."
+    ))
+}
+
 /// How Claude should wait for the next human response, appended to every
 /// banner body that ends in a waiting state.
 pub fn wait_instruction() -> String {
@@ -467,6 +488,7 @@ pub fn render_phase_banner(
     ignored: &[IgnoredInput],
     status_posted: bool,
     body: &str,
+    extra_instruction: Option<&str>,
 ) -> String {
     let mut out = format!("Phase: {}", phase.label());
 
@@ -490,6 +512,10 @@ pub fn render_phase_banner(
 
     out.push_str("\n\n");
     out.push_str(body);
+    if let Some(extra) = extra_instruction {
+        out.push_str("\n\n");
+        out.push_str(extra);
+    }
     out
 }
 
@@ -1044,7 +1070,15 @@ mod tests {
             Phase::Implement,
             "/approve-plan",
         )];
-        let out = render_phase_banner(Phase::Implement, &transitions, &[], &[], false, "body");
+        let out = render_phase_banner(
+            Phase::Implement,
+            &transitions,
+            &[],
+            &[],
+            false,
+            "body",
+            None,
+        );
         assert!(out.contains(
             "Phase advanced: prep-and-plan → implement (triggered by `/approve-plan` from user)."
         ));
@@ -1053,7 +1087,7 @@ mod tests {
     #[test]
     fn banner_premature_note_suggests_current_command() {
         let notes = [note(NoteKind::Premature, "/approve-plan", Phase::PrePlan)];
-        let out = render_phase_banner(Phase::PrePlan, &[], &notes, &[], false, "body");
+        let out = render_phase_banner(Phase::PrePlan, &[], &notes, &[], false, "body", None);
         assert!(out.contains("`/approve-plan` from user (on the PR) was ignored"));
         assert!(out.contains("only in the pre-plan phase"));
         assert!(out.contains("the command that advances it is `/approve-pre-plan`"));
@@ -1062,7 +1096,7 @@ mod tests {
     #[test]
     fn banner_retired_note_in_terminal_phase() {
         let notes = [note(NoteKind::Retired, "/proceed", Phase::Review)];
-        let out = render_phase_banner(Phase::Review, &[], &notes, &[], false, "body");
+        let out = render_phase_banner(Phase::Review, &[], &notes, &[], false, "body", None);
         assert!(out.contains("`/proceed` is retired"));
         assert!(out.contains("there is nothing further to approve"));
     }
@@ -1074,7 +1108,7 @@ mod tests {
             "/approve-implementation",
             Phase::Implement,
         )];
-        let out = render_phase_banner(Phase::Implement, &[], &notes, &[], false, "body");
+        let out = render_phase_banner(Phase::Implement, &[], &notes, &[], false, "body", None);
         assert!(out.contains("`/approve-implementation` is retired"));
         assert!(out.contains("marking the draft PR ready for review advances it"));
     }
@@ -1086,7 +1120,7 @@ mod tests {
             to: Phase::Review,
             trigger: Trigger::PrReady,
         }];
-        let out = render_phase_banner(Phase::Review, &transitions, &[], &[], false, "body");
+        let out = render_phase_banner(Phase::Review, &transitions, &[], &[], false, "body", None);
         assert!(out.contains(
             "Phase advanced: implement → review (triggered by the PR being marked ready \
              for review)."
@@ -1094,10 +1128,45 @@ mod tests {
     }
 
     #[test]
+    fn encouraged_labels_instruction_none_when_empty() {
+        assert!(super::encouraged_labels_instruction(&[]).is_none());
+    }
+
+    #[test]
+    fn encouraged_labels_instruction_names_labels_in_order() {
+        let labels = ["high-priority".to_string(), "medium-priority".to_string()];
+        let line = super::encouraged_labels_instruction(&labels).expect("some line");
+        assert!(line.contains("--label"));
+        // Named in order, most urgent first.
+        let hi = line.find("`high-priority`").expect("high-priority named");
+        let med = line
+            .find("`medium-priority`")
+            .expect("medium-priority named");
+        assert!(hi < med);
+    }
+
+    #[test]
+    fn banner_appends_extra_instruction_when_present() {
+        let out = render_phase_banner(
+            Phase::Implement,
+            &[],
+            &[],
+            &[],
+            false,
+            "body",
+            Some("extra line"),
+        );
+        assert!(out.ends_with("body\n\nextra line"));
+        // Omitted (and no trailing separator) when absent.
+        let out = render_phase_banner(Phase::Implement, &[], &[], &[], false, "body", None);
+        assert!(out.ends_with("body"));
+    }
+
+    #[test]
     fn banner_status_posted_line_only_when_posted() {
-        let out = render_phase_banner(Phase::Implement, &[], &[], &[], true, "body");
+        let out = render_phase_banner(Phase::Implement, &[], &[], &[], true, "body", None);
         assert!(out.contains("posted a status update"));
-        let out = render_phase_banner(Phase::Implement, &[], &[], &[], false, "body");
+        let out = render_phase_banner(Phase::Implement, &[], &[], &[], false, "body", None);
         assert!(!out.contains("posted a status update"));
     }
 
@@ -1112,7 +1181,15 @@ mod tests {
                 via_reaction: true,
             },
         }];
-        let out = render_phase_banner(Phase::PrepAndPlan, &transitions, &[], &[], false, "body");
+        let out = render_phase_banner(
+            Phase::PrepAndPlan,
+            &transitions,
+            &[],
+            &[],
+            false,
+            "body",
+            None,
+        );
         assert!(out.contains(
             "Phase advanced: pre-plan → prep-and-plan (triggered by a 👍 reaction from user, \
              equivalent to `/approve-pre-plan`)."
@@ -1127,7 +1204,7 @@ mod tests {
             Phase::PrepAndPlan,
         )];
         notes[0].via_reaction = true;
-        let out = render_phase_banner(Phase::PrepAndPlan, &[], &notes, &[], false, "body");
+        let out = render_phase_banner(Phase::PrepAndPlan, &[], &notes, &[], false, "body", None);
         assert!(out.contains(
             "Note: A 👍 reaction (equivalent to `/approve-pre-plan`) from user (on the PR) \
              was ignored"

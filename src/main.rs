@@ -1245,6 +1245,19 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         }
     }
 
+    // While the PR is still live, remind Claude of the project's encouraged
+    // (priority) labels so a follow-up it files can carry the right one. A
+    // concluded PR shows `concluded_body`, where filing follow-ups is moot.
+    let encouraged_labels = issue_state
+        .pr_outcome
+        .is_none()
+        .then(|| {
+            located.as_ref().and_then(|located| {
+                render::encouraged_labels_instruction(&located.config.priority_labels)
+            })
+        })
+        .flatten();
+
     println!(
         "{}",
         render::render_phase_banner(
@@ -1253,7 +1266,8 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
             &outcome.notes,
             &outcome.ignored,
             status_posted,
-            &body
+            &body,
+            encouraged_labels.as_deref(),
         )
     );
     println!();
