@@ -228,16 +228,21 @@ implement and review phases, and again at hand-off — using a local trial merge
 (`git merge-tree`, no GitHub API). When the branch conflicts, ghwf leads the
 phase banner with a resolve-it-now instruction and **blocks the
 ready-for-review hand-off** until the merge is pushed, so a known-conflicting
-branch is never announced as ready. While a PR sits idle in review, `ghwf wait`
-keeps probing on a slow cadence and wakes the agent the moment `main` moves
-under it and introduces a conflict — ghwf notices, rather than leaving it for
-you to spot at merge time.
+branch is never announced as ready.
 
-For the clean case, set `auto_merge_base = true` (off by default): when the
-branch has fallen behind but the merge is clean, ghwf merges `origin/<base>` in
-and pushes, keeping the open PR current with the base branch and its CI fresh.
-Conflicts are never auto-resolved — those are always surfaced for you or Claude
-to handle.
+Even when the base has moved on *cleanly*, the new commits can still bear on the
+work — a refactor to follow, work that supersedes the branch's, a new helper to
+reuse — so ghwf leads the banner with a heads-up that names the new commits and
+asks Claude to weigh them against its plan before integrating. While a PR sits
+idle in review, `ghwf wait` keeps probing on a slow cadence and wakes the agent
+the moment `main` moves under it — whether the advance is clean or conflicting —
+rather than leaving it for you to spot at merge time.
+
+For the clean case you can also set `auto_merge_base = true` (off by default):
+the branch is merged up to `origin/<base>` and pushed for you, keeping the open
+PR current with the base branch and its CI fresh; the banner then confirms the
+merge and still points Claude at the commits it brought in. Conflicts are never
+auto-resolved — those are always surfaced for you or Claude to handle.
 
 ## Waiting for approval and feedback
 

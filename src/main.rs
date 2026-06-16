@@ -885,20 +885,26 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
     // Check the branch against its moved-on base, for the implement and review
     // phases of an open PR. Detection is local (a git fetch plus an in-memory
     // merge-tree, no GitHub API). A conflict leads the banner with a
-    // resolve-it-now instruction; a behind-but-clean branch is merged up to base
-    // and pushed when `auto_merge_base` is on (and the banner confirms it). The
-    // banner is never posted to a thread and a conflict notice clears itself once
-    // Claude pushes the merge.
+    // resolve-it-now instruction; a clean advance leads it with a
+    // review-and-integrate prompt (or, when `auto_merge_base` is on, the base is
+    // merged up and pushed and the banner confirms it). The banner is never
+    // posted to a thread; a conflict notice clears itself once Claude pushes the
+    // merge, and the effective post-merge state seeds `wait`'s base probe.
     let auto_merge_base = located
         .as_ref()
         .is_some_and(|located| located.config.auto_merge_base);
-    let base_banner = match (issue_state.pr_outcome, phase) {
+    let base_status = match (issue_state.pr_outcome, phase) {
         (None, state::Phase::Implement | state::Phase::Review) => issue_state
             .prep
             .as_ref()
-            .and_then(|prep| implement::base_banner(prep, number, auto_merge_base)),
+            .and_then(|prep| implement::base_status(prep, number, auto_merge_base)),
         _ => None,
     };
+    // The branch's effective sync state after any auto-merge, to seed `wait`'s
+    // edge tracking so its first probe doesn't re-wake for an advance this run
+    // already surfaced.
+    let base_effective = base_status.as_ref().map(|status| status.effective);
+    let base_banner = base_status.and_then(|status| status.banner);
     let body = match &base_banner {
         Some(banner) => format!("{}\n\n{body}", banner.text()),
         None => body,
@@ -1036,6 +1042,9 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         // its baseline starts on the next run (it was just created as a
         // draft, so no flip can be missed).
         pr_draft: pr_object.as_ref().map(|pr| pr.draft),
+        // Seed the base-advance edge from the verdict this run surfaced, so
+        // `wait`'s first probe doesn't re-wake for it.
+        last_base_sync: base_effective.unwrap_or_default(),
         ..Default::default()
     };
     for comment in issue_comments
@@ -1204,8 +1213,9 @@ fn work_on(issue: &str, no_branch: bool) -> Result<()> {
         || !new_pr.is_empty()
         || !new_review.is_empty()
         || !submission_views.is_empty()
-        // A standing conflict keeps the ball with Claude until it's resolved.
-        || base_banner.as_ref().is_some_and(implement::BaseBanner::is_conflict);
+        // A standing conflict or an unintegrated clean advance keeps the ball
+        // with Claude until it's dealt with.
+        || base_banner.as_ref().is_some_and(implement::BaseBanner::keeps_ball);
     if activity {
         issue_state.stop_nudges = 0;
         // The session is working again, so any idle/blocked alert the

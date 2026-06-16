@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::git;
 use crate::models::Issue;
@@ -78,10 +79,13 @@ pub fn review(
     review_body(&pr_url, pr_instructions)
 }
 
-/// How the open PR's branch stands against its freshly-fetched base.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How the open PR's branch stands against its freshly-fetched base. Persisted
+/// in `WaitState` to edge-trigger base-advance wakes, hence the serde derives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BaseSync {
     /// HEAD already contains `origin/<base>`; nothing to do.
+    #[default]
     UpToDate,
     /// The base advanced beyond the merge-base and a trial merge is clean.
     BehindClean,
@@ -140,13 +144,16 @@ pub fn detect_conflict(prep: &PrepState) -> Option<String> {
     }
 }
 
-/// The leading banner block for the implement/review phase body when the branch
-/// is behind its base, plus whether it represents a standing conflict (which
-/// keeps the ball with Claude) or just an informational auto-merge note.
+/// The leading banner block for the implement/review phase body when the base
+/// has moved on, tagged by what it asks of Claude.
 pub enum BaseBanner {
     /// A conflict the agent must resolve before the work is done.
     Conflict(String),
-    /// ghwf merged the base in for a clean behind-branch; nothing to do.
+    /// The base moved on cleanly but auto-merge is off: the agent should review
+    /// the new commits and integrate them itself.
+    Behind(String),
+    /// ghwf merged the base in for a clean behind-branch; reviewing it is
+    /// optional.
     Merged(String),
 }
 
@@ -154,45 +161,69 @@ impl BaseBanner {
     /// The rendered banner text to lead the phase body with.
     pub fn text(&self) -> &str {
         match self {
-            BaseBanner::Conflict(text) | BaseBanner::Merged(text) => text,
+            BaseBanner::Conflict(text) | BaseBanner::Behind(text) | BaseBanner::Merged(text) => {
+                text
+            }
         }
     }
 
-    /// Whether this is a standing conflict (vs. a done-and-dusted auto-merge).
-    pub fn is_conflict(&self) -> bool {
-        matches!(self, BaseBanner::Conflict(_))
+    /// Whether this banner keeps the ball with Claude: a standing conflict, or a
+    /// clean advance it still has to integrate. The auto-merge note is purely
+    /// informational, so it doesn't.
+    pub fn keeps_ball(&self) -> bool {
+        matches!(self, BaseBanner::Conflict(_) | BaseBanner::Behind(_))
     }
 }
 
-/// Build the leading banner block for the implement/review phase body when the
-/// branch is behind its base. A conflict yields the resolve-it-now notice; a
-/// clean-but-behind branch, when `auto_merge` is on, is merged up to base and
-/// pushed (the notice confirms it); everything else (up to date, or auto-merge
-/// off, or any failure) yields `None`.
+/// The branch's status against its base for the implement/review phase: the
+/// optional leading banner, plus the branch's effective sync state after any
+/// auto-merge this call performed (so `work-on` can seed `wait`'s edge tracking).
+pub struct BaseStatus {
+    pub banner: Option<BaseBanner>,
+    pub effective: BaseSync,
+}
+
+/// Classify the branch against its base and build the leading banner block for
+/// the implement/review phase body. A conflict yields the resolve-it-now notice;
+/// a clean-but-behind branch yields the review-and-integrate notice, unless
+/// `auto_merge` is on, in which case the base is merged up and pushed and the
+/// notice confirms it; an up-to-date branch yields no banner. The `effective`
+/// field reports the sync state once any auto-merge has run (so a successful
+/// auto-merge reports `UpToDate`).
 ///
-/// Best-effort throughout: a failed auto-merge warns and falls through to no
-/// banner rather than breaking the run — GitHub still squash-merges fine.
-pub fn base_banner(prep: &PrepState, number: u64, auto_merge: bool) -> Option<BaseBanner> {
-    match check_base(prep)? {
-        (_, BaseSync::UpToDate) => None,
-        (base, BaseSync::Conflict) => Some(BaseBanner::Conflict(crate::render::conflict_notice(
-            &base, number,
-        ))),
-        (base, BaseSync::BehindClean) => {
-            if !auto_merge {
-                return None;
-            }
-            match auto_merge_base(prep, &base) {
-                Ok(()) => Some(BaseBanner::Merged(crate::render::base_merged_notice(
+/// `None` only when there's nothing to check (no branch / no PR / no worktree, or
+/// the check failed). Best-effort throughout: a failed auto-merge warns and falls
+/// through to no banner rather than breaking the run — GitHub still squash-merges
+/// fine.
+pub fn base_status(prep: &PrepState, number: u64, auto_merge: bool) -> Option<BaseStatus> {
+    let (banner, effective) = match check_base(prep)? {
+        (_, BaseSync::UpToDate) => (None, BaseSync::UpToDate),
+        (base, BaseSync::Conflict) => (
+            Some(BaseBanner::Conflict(crate::render::conflict_notice(
+                &base, number,
+            ))),
+            BaseSync::Conflict,
+        ),
+        (base, BaseSync::BehindClean) if !auto_merge => (
+            Some(BaseBanner::Behind(crate::render::base_behind_notice(
+                &base, number,
+            ))),
+            BaseSync::BehindClean,
+        ),
+        (base, BaseSync::BehindClean) => match auto_merge_base(prep, &base) {
+            Ok(()) => (
+                Some(BaseBanner::Merged(crate::render::base_merged_notice(
                     &base, number,
                 ))),
-                Err(err) => {
-                    eprintln!("warning: auto-merge of `origin/{base}` failed: {err:#}");
-                    None
-                }
+                BaseSync::UpToDate,
+            ),
+            Err(err) => {
+                eprintln!("warning: auto-merge of `origin/{base}` failed: {err:#}");
+                (None, BaseSync::BehindClean)
             }
-        }
-    }
+        },
+    };
+    Some(BaseStatus { banner, effective })
 }
 
 /// Merge `origin/<base>` into the PR branch and push. Caller has already proven
@@ -486,6 +517,96 @@ mod tests {
             base_sync(&wt).unwrap(),
             ("main".to_string(), BaseSync::Conflict)
         );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn keeps_ball_only_for_conflict_and_behind() {
+        use super::BaseBanner;
+        assert!(BaseBanner::Conflict("x".into()).keeps_ball());
+        assert!(BaseBanner::Behind("x".into()).keeps_ball());
+        // The auto-merge note is informational — Claude needn't act on it.
+        assert!(!BaseBanner::Merged("x".into()).keeps_ball());
+    }
+
+    #[test]
+    fn base_status_maps_each_verdict_to_banner_and_effective_state() {
+        use super::{base_status, BaseBanner, BaseSync};
+        use crate::git::tests::{init_repo, run_git, scratch};
+
+        let root = scratch("base-status");
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        run_git(&origin, &["init", "--bare", "-b", "main"]);
+
+        let wt = root.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        init_repo(&wt);
+        run_git(&wt, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        run_git(&wt, &["push", "origin", "main"]);
+        run_git(&wt, &["fetch", "origin"]);
+        run_git(
+            &wt,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        run_git(&wt, &["checkout", "-b", "feat"]);
+        std::fs::write(wt.join("feat.txt"), "f\n").unwrap();
+        run_git(&wt, &["add", "feat.txt"]);
+        run_git(&wt, &["commit", "-m", "feat work"]);
+
+        let prep = PrepState {
+            branch: Some("feat".to_string()),
+            pr_number: Some(1),
+            worktree_path: Some(wt.clone()),
+            ..Default::default()
+        };
+
+        // Up to date: no banner, effective stays UpToDate.
+        let status = base_status(&prep, 1, false).unwrap();
+        assert!(status.banner.is_none());
+        assert_eq!(status.effective, BaseSync::UpToDate);
+
+        // Advance origin/main cleanly via a second clone.
+        let up = root.join("up");
+        run_git(
+            &root,
+            &["clone", origin.to_str().unwrap(), up.to_str().unwrap()],
+        );
+        std::fs::write(up.join("other.txt"), "o\n").unwrap();
+        run_git(&up, &["add", "other.txt"]);
+        run_git(&up, &["commit", "-m", "upstream other"]);
+        run_git(&up, &["push", "origin", "main"]);
+
+        // Clean advance, auto-merge off: a Behind banner, left behind.
+        let status = base_status(&prep, 1, false).unwrap();
+        assert!(matches!(status.banner, Some(BaseBanner::Behind(_))));
+        assert_eq!(status.effective, BaseSync::BehindClean);
+
+        // Same state, auto-merge on: ghwf merges + pushes, reports up to date.
+        let status = base_status(&prep, 1, true).unwrap();
+        assert!(matches!(status.banner, Some(BaseBanner::Merged(_))));
+        assert_eq!(status.effective, BaseSync::UpToDate);
+        // The merge took: a follow-up check sees no banner.
+        let status = base_status(&prep, 1, false).unwrap();
+        assert!(status.banner.is_none());
+        assert_eq!(status.effective, BaseSync::UpToDate);
+
+        // Now diverge on the same line both sides: a conflict.
+        std::fs::write(wt.join("file.txt"), "feat\n").unwrap();
+        run_git(&wt, &["add", "file.txt"]);
+        run_git(&wt, &["commit", "-m", "feat edits file"]);
+        std::fs::write(up.join("file.txt"), "upstream\n").unwrap();
+        run_git(&up, &["add", "file.txt"]);
+        run_git(&up, &["commit", "-m", "upstream edits file"]);
+        run_git(&up, &["push", "origin", "main"]);
+        let status = base_status(&prep, 1, false).unwrap();
+        assert!(matches!(status.banner, Some(BaseBanner::Conflict(_))));
+        assert_eq!(status.effective, BaseSync::Conflict);
 
         std::fs::remove_dir_all(&root).unwrap();
     }
