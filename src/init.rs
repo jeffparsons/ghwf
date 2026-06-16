@@ -10,6 +10,7 @@ use toml_edit::DocumentMut;
 use crate::config;
 use crate::git;
 use crate::labels;
+use crate::priority_labels;
 
 /// The two `ghwf.toml` placements the wizard offers.
 const REPO_ROOT_LAYOUT: &str =
@@ -70,7 +71,9 @@ pub fn run() -> Result<()> {
     let mut gitignore_line: Option<String> = None;
     let mut pr_stub: Option<PathBuf> = None;
     let mut run_labels = false;
+    let mut run_priority_labels = false;
     let mut labels_pointer = false;
+    let mut priority_labels_pointer = false;
 
     // Essentials: `worktrees_dir` is the one required key.
     if !doc.contains_key("worktrees_dir") {
@@ -165,14 +168,24 @@ pub fn run() -> Result<()> {
                 .prompt(),
         )?
     {
-        let input =
-            prompt(Text::new("Priority labels, most urgent first (comma-separated):").prompt())?;
+        let input = prompt(
+            Text::new("Priority labels, most urgent first (comma-separated):")
+                .with_default("high-priority, medium-priority")
+                .prompt(),
+        )?;
         let priority_labels = parse_priority_labels(&input);
         if priority_labels.is_empty() {
             println!("No labels given; skipping.");
         } else {
             set_priority_labels(&mut doc, &priority_labels);
             doc_changed = true;
+            if prompt(
+                Confirm::new("Create these priority labels in the GitHub repo now?")
+                    .with_default(true)
+                    .prompt(),
+            )? {
+                run_priority_labels = true;
+            }
         }
     }
 
@@ -400,10 +413,13 @@ pub fn run() -> Result<()> {
             config_path.display()
         ));
     }
+    if run_priority_labels {
+        actions.push("create the priority labels in the GitHub repo".to_string());
+    }
     if actions.is_empty() {
         println!("Nothing to do — everything offered here is already configured.");
         if labels_pointer {
-            println!("Run `ghwf config labels` to set up workflow status labels.");
+            println!("Run `ghwf config state-labels` to set up workflow status labels.");
         }
         return Ok(());
     }
@@ -447,21 +463,36 @@ pub fn run() -> Result<()> {
             .with_context(|| format!("failed to write {}", path.display()))?;
         println!("Created {}; edit it to taste.", path.display());
     }
-    if run_labels {
+    // Label creation reads the just-saved config; build it once for whichever
+    // creation steps were chosen.
+    if run_labels || run_priority_labels {
         let located = config::Located {
             dir: config_dir,
             config: typed,
         };
-        // Best-effort from the wizard's point of view: the config is already
-        // saved, and `ghwf config labels` can pick up where this left off
-        // (it skips labels that already exist).
-        if let Err(err) = labels::configure_at(&located) {
-            eprintln!("warning: labels setup failed: {err:#}");
-            labels_pointer = true;
+        if run_labels {
+            // Best-effort from the wizard's point of view: the config is already
+            // saved, and `ghwf config state-labels` can pick up where this left
+            // off (it skips labels that already exist).
+            if let Err(err) = labels::configure_at(&located) {
+                eprintln!("warning: labels setup failed: {err:#}");
+                labels_pointer = true;
+            }
+        }
+        if run_priority_labels {
+            // Likewise best-effort: `ghwf config priority-labels` can finish the
+            // job later, adopting whatever already exists.
+            if let Err(err) = priority_labels::create_for(&located) {
+                eprintln!("warning: priority labels setup failed: {err:#}");
+                priority_labels_pointer = true;
+            }
         }
     }
     if labels_pointer {
-        println!("Run `ghwf config labels` to set up workflow status labels.");
+        println!("Run `ghwf config state-labels` to set up workflow status labels.");
+    }
+    if priority_labels_pointer {
+        println!("Run `ghwf config priority-labels` to create the priority labels.");
     }
     println!(
         "Done. If you haven't already, run `ghwf install` to set up the Claude Code integration."

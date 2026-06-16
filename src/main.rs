@@ -18,6 +18,7 @@ mod notification_hook;
 mod onboarding;
 mod plan_cleanup;
 mod prep;
+mod priority_labels;
 mod render;
 mod resync;
 mod seen;
@@ -354,7 +355,13 @@ enum ConfigCommands {
     /// Set up workflow status labels: create them in the GitHub repo and add
     /// a `[labels]` section to `ghwf.toml`. Re-run once the section exists to
     /// create any configured label still missing from the repo.
-    Labels,
+    #[command(alias = "labels")]
+    StateLabels,
+    /// Create the configured `priority_labels` in the GitHub repo (and every
+    /// `issue_repos` repo), adopting any that already exist. Recognised names
+    /// get a sensible colour; others get one derived from the name. Idempotent,
+    /// so it's also how you upsert the labels onto an existing repo or clone.
+    PriorityLabels,
     /// List the available config options, each with a one-line summary. Pass a
     /// dotted path (e.g. `labels.phase`) to list the options inside a nested
     /// table.
@@ -427,7 +434,8 @@ fn main() -> Result<()> {
         Commands::Ask { issue, options } => ask(&resolve_issue_arg(issue)?, &options),
         Commands::Config { command } => match command {
             ConfigCommands::Init => init::run(),
-            ConfigCommands::Labels => labels::configure(),
+            ConfigCommands::StateLabels => labels::configure(),
+            ConfigCommands::PriorityLabels => priority_labels::configure(),
             ConfigCommands::Ls { path } => config_schema::ls(path.as_deref()),
             ConfigCommands::Info { key } => config_schema::info(&key),
             ConfigCommands::Example => config_schema::example(),

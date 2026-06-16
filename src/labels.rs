@@ -173,7 +173,7 @@ fn desired_labels(
     desired
 }
 
-/// The default labels `ghwf config labels` sets up: config key, label name,
+/// The default labels `ghwf config state-labels` sets up: config key, label name,
 /// colour (GitHub's 6-hex form), and description. The phase ramp runs light
 /// to dark blue; attention colours signal whose move it is.
 const DEFAULTS: &[(&str, &str, &str, &str)] = &[
@@ -235,7 +235,7 @@ const DEFAULTS: &[(&str, &str, &str, &str)] = &[
 /// rest are `[labels.attention]`.
 const PHASE_DEFAULTS: usize = 5;
 
-/// `ghwf config labels`: on first run, create the default workflow labels in
+/// `ghwf config state-labels`: on first run, create the default workflow labels in
 /// the GitHub repo and append the `[labels]` section to `ghwf.toml` (rename
 /// afterwards by editing the file and the repo's labels together). On a re-run
 /// — once the section exists — it leaves the file alone and just creates any
@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn generated_section_parses_and_covers_every_state() {
-        // The section `ghwf config labels` writes must round-trip through the
+        // The section `ghwf config state-labels` writes must round-trip through the
         // config parser, with every phase and attention state mapped.
         let labels = config_with_labels().labels.unwrap();
         assert_eq!(labels.for_phase(Phase::PrePlan), "ghwf:pre-plan");
@@ -438,7 +438,7 @@ mod tests {
 
     #[test]
     fn reconcile_creates_only_missing_labels_with_default_metadata() {
-        // A re-run of `config labels` over a repo that already has every label
+        // A re-run of `config state-labels` over a repo that already has every label
         // but `ghwf:finished` creates exactly that one, with its slot's colour
         // and description.
         let labels = config_with_labels().labels.unwrap();
