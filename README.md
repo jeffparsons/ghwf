@@ -292,7 +292,10 @@ implement and review phases, so it can act on the PR without a permission prompt
   temporary label is removed again — the dependency is the durable, UI-visible
   truth (the label sticks around only if that dependency call fails).
   `--no-block` files a standalone issue; `--label` attaches extra labels. The
-  new issue is created unassigned and prints as JSON.
+  new issue is created unassigned and prints as JSON. To steer Claude's use of
+  `--label`, the `work-on` banner surfaces the project's configured
+  `priority_labels` as encouraged labels, so a follow-up it files can carry the
+  matching priority.
 
 The PR commands each resolve the issue argument the same way the other commands
 do, and error clearly when the issue has no PR yet.

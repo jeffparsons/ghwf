@@ -67,6 +67,9 @@ Run `ghwf work-on $ARGUMENTS` and follow the phase banner exactly:
 - When you decide to defer work or discover something out of scope, file it
   with `ghwf create-issue --title "..."` (body from stdin) instead of dropping
   it; by default the new issue is marked blocked by the one you're working on.
+  Attach labels with `--label <name>` (repeatable); the work-on banner lists the
+  project's encouraged (priority) labels — apply the matching one when the
+  follow-up's urgency is clear.
 - For the PR itself, use ghwf rather than `gh`: `ghwf show-pr` /
   `ghwf update-pr` (body from stdin, `--title` optional) to read and revise
   the title and body, `ghwf pr-checks` (`--log-failed` for logs) for CI
@@ -467,6 +470,9 @@ mod tests {
         // The skill must point Claude at `create-issue` for deferrals/discoveries
         // (see issue #54) rather than dropping them.
         assert!(SKILL_CONTENT.contains("ghwf create-issue"));
+        // …and make the `--label` option discoverable (see issue #156), pointing
+        // at the banner for the project's encouraged labels.
+        assert!(SKILL_CONTENT.contains("--label"));
     }
 
     #[test]
