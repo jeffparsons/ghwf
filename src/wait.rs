@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::github::{self, Conditional, RepoRef};
+use crate::implement::BaseSync;
 use crate::models::{Comment, Issue, PullRequest, Reaction, ReviewComment, User};
 use crate::state::{self, OptionsWatch, PostedRef, ReactionWatch, WaitState};
 use crate::{access, config, labels, render, store};
@@ -20,9 +21,10 @@ const BACKOFF_FLOOR: Duration = Duration::from_secs(5);
 const BACKOFF_CAP: Duration = Duration::from_secs(60);
 /// In feed mode, a full direct cycle runs this often as the lag backstop.
 const FEED_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
-/// Slowest cadence at which a review-phase wait probes the branch for a freshly
-/// introduced base conflict (a local fetch + merge-tree, never on the hot path).
-const CONFLICT_PROBE_INTERVAL: Duration = Duration::from_secs(300);
+/// Slowest cadence at which a review-phase wait probes the branch for the base
+/// having moved on — a clean advance or a fresh conflict (a local fetch +
+/// merge-tree, never on the hot path).
+const BASE_PROBE_INTERVAL: Duration = Duration::from_secs(300);
 /// Feed cadence floor; raised by the `X-Poll-Interval` header when larger.
 const FEED_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// This many consecutive failed cycles aborts the wait.
@@ -113,26 +115,27 @@ pub fn run(issue: &str, timeout_secs: u64) -> Result<()> {
 
     // While a PR idles in the review phase, the events feed is structurally blind
     // to `main` advancing under it, so probe the branch locally on a slow cadence
-    // (item 2 of #107). Only the review phase is probed — implement-phase
-    // conflicts are caught by the next `work-on`. The probe stays read-only; a
-    // fresh conflict wakes the session, and `work-on` then surfaces and resolves
-    // it. `detect_conflict` re-checks the branch/PR/worktree preconditions, so a
-    // non-branch or worktree-less workflow probes to a cheap no-op.
+    // (item 2 of #107, extended in #154 to clean advances). Only the review phase
+    // is probed — implement-phase movement is caught by the next `work-on`. The
+    // probe stays read-only; a fresh advance (clean or conflicting) wakes the
+    // session, and `work-on` then surfaces it. `check_base` re-checks the
+    // branch/PR/worktree preconditions, so a non-branch or worktree-less workflow
+    // probes to a cheap no-op.
     let probe_eligible = issue_state.phase == state::Phase::Review;
-    // Skip the first interval: `work-on` already checked conflicts entering the
-    // review phase, so the soonest a fresh one matters is one interval out.
+    // Skip the first interval: `work-on` already checked the base entering the
+    // review phase (and seeded `last_base_sync`), so the soonest a fresh advance
+    // matters is one interval out.
     let mut last_probe = Instant::now();
 
     loop {
-        if probe_eligible && last_probe.elapsed() >= CONFLICT_PROBE_INTERVAL {
+        if probe_eligible && last_probe.elapsed() >= BASE_PROBE_INTERVAL {
             last_probe = Instant::now();
-            let conflict = issue_state
+            let verdict = issue_state
                 .prep
                 .as_ref()
-                .and_then(crate::implement::detect_conflict);
-            let (reason, seen) =
-                conflict_wake(conflict.as_deref(), number, wait_state.conflict_seen);
-            wait_state.conflict_seen = seen;
+                .and_then(crate::implement::check_base);
+            let (reason, seen) = base_wake(verdict.as_ref(), number, wait_state.last_base_sync);
+            wait_state.last_base_sync = seen;
             if let Some(reason) = reason {
                 persist(&owner, &repo, number, &mut issue_state, &wait_state);
                 println!("{reason}");
@@ -964,24 +967,32 @@ fn feed_trusted(events: &[FeedEvent], last_posted: Option<&PostedRef>) -> bool {
     }
 }
 
-/// Persist the wait state (ETags) back onto the issue state, best-effort: a
-/// failed write only costs the next invocation a few uncached polls.
-/// Decide whether a conflict probe result should wake the session, given the
-/// previously-seen state. A conflict wakes only on the clean->conflict edge; a
-/// persistent conflict stays quiet (so we don't re-wake every cycle), and a
-/// clean result resets the flag so a later re-conflict wakes again. Returns the
-/// optional wake reason and the new `conflict_seen` flag.
-fn conflict_wake(conflict: Option<&str>, number: u64, seen: bool) -> (Option<String>, bool) {
-    match conflict {
-        Some(base) if !seen => (
-            Some(format!(
-                "`origin/{base}` moved on and PR #{number} now conflicts with it."
-            )),
-            true,
-        ),
-        Some(_) => (None, true),
-        None => (None, false),
-    }
+/// Decide whether a base probe should wake the session, given the verdict the
+/// previous probe saw. Wake on entering a new "behind" state — a clean advance or
+/// a conflict whose verdict differs from last probe's (so an escalation
+/// BehindClean->Conflict wakes too); a state unchanged from last time stays quiet
+/// (no per-cycle nagging), and `UpToDate` never wakes. Returns the optional wake
+/// reason and the new last-seen verdict to persist. A `None` verdict (no
+/// branch/PR/worktree on this probe) leaves the state untouched and doesn't wake.
+fn base_wake(
+    verdict: Option<&(String, BaseSync)>,
+    number: u64,
+    prev: BaseSync,
+) -> (Option<String>, BaseSync) {
+    let Some((base, cur)) = verdict else {
+        return (None, prev);
+    };
+    let reason = match cur {
+        BaseSync::UpToDate => None,
+        _ if *cur == prev => None,
+        BaseSync::Conflict => Some(format!(
+            "`origin/{base}` moved on and PR #{number} now conflicts with it."
+        )),
+        BaseSync::BehindClean => Some(format!(
+            "`origin/{base}` moved on; PR #{number} is now behind it."
+        )),
+    };
+    (reason, *cur)
 }
 
 /// Normalize the workflow labels when a cycle detected a PR conclusion, so a
@@ -1010,6 +1021,8 @@ fn normalize_on_conclusion(
     }
 }
 
+/// Persist the wait state (ETags) back onto the issue state, best-effort: a
+/// failed write only costs the next invocation a few uncached polls.
 fn persist(
     owner: &str,
     repo: &str,
@@ -1026,11 +1039,11 @@ fn persist(
 #[cfg(test)]
 mod tests {
     use super::{
-        comment_reasons, conflict_wake, evaluate_fresh, feed_interval, feed_trusted,
-        feed_wake_reasons, Endpoint, EndpointKind, FeedComment, FeedEvent, FeedPayload,
-        FeedSubject,
+        base_wake, comment_reasons, evaluate_fresh, feed_interval, feed_trusted, feed_wake_reasons,
+        Endpoint, EndpointKind, FeedComment, FeedEvent, FeedPayload, FeedSubject,
     };
     use crate::access::AccessList;
+    use crate::implement::BaseSync;
     use crate::models::{Comment, User};
     use crate::state::{PostedRef, PrOutcome, ReactionWatch, WaitState};
     use std::collections::BTreeMap;
@@ -1688,22 +1701,60 @@ mod tests {
     }
 
     #[test]
-    fn conflict_wake_fires_only_on_the_clean_to_conflict_edge() {
-        // A fresh conflict wakes and records that it was seen.
-        let (reason, seen) = conflict_wake(Some("main"), 7, false);
+    fn base_wake_fires_on_new_behind_edges() {
+        let verdict = |sync| Some(("main".to_string(), sync));
+
+        // A fresh clean advance wakes and records the new state.
+        let (reason, seen) = base_wake(
+            verdict(BaseSync::BehindClean).as_ref(),
+            7,
+            BaseSync::UpToDate,
+        );
         assert!(reason
             .as_deref()
-            .is_some_and(|r| r.contains("PR #7") && r.contains("`origin/main`")));
-        assert!(seen);
+            .is_some_and(|r| r.contains("PR #7") && r.contains("now behind")));
+        assert_eq!(seen, BaseSync::BehindClean);
 
-        // A persistent conflict stays quiet but keeps the flag set.
-        let (reason, seen) = conflict_wake(Some("main"), 7, true);
+        // The same clean state on the next probe stays quiet.
+        let (reason, seen) = base_wake(
+            verdict(BaseSync::BehindClean).as_ref(),
+            7,
+            BaseSync::BehindClean,
+        );
         assert!(reason.is_none());
-        assert!(seen);
+        assert_eq!(seen, BaseSync::BehindClean);
 
-        // Clearing the conflict resets the flag so a later one wakes again.
-        let (reason, seen) = conflict_wake(None, 7, true);
+        // Escalating from behind-clean to a conflict wakes.
+        let (reason, seen) = base_wake(
+            verdict(BaseSync::Conflict).as_ref(),
+            7,
+            BaseSync::BehindClean,
+        );
+        assert!(reason
+            .as_deref()
+            .is_some_and(|r| r.contains("PR #7") && r.contains("conflicts")));
+        assert_eq!(seen, BaseSync::Conflict);
+
+        // A fresh conflict straight from up-to-date wakes too.
+        let (reason, seen) = base_wake(verdict(BaseSync::Conflict).as_ref(), 7, BaseSync::UpToDate);
+        assert!(reason
+            .as_deref()
+            .is_some_and(|r| r.contains("`origin/main`")));
+        assert_eq!(seen, BaseSync::Conflict);
+
+        // A persistent conflict stays quiet but keeps the state.
+        let (reason, seen) = base_wake(verdict(BaseSync::Conflict).as_ref(), 7, BaseSync::Conflict);
         assert!(reason.is_none());
-        assert!(!seen);
+        assert_eq!(seen, BaseSync::Conflict);
+
+        // Returning to up-to-date never wakes and resets the state.
+        let (reason, seen) = base_wake(verdict(BaseSync::UpToDate).as_ref(), 7, BaseSync::Conflict);
+        assert!(reason.is_none());
+        assert_eq!(seen, BaseSync::UpToDate);
+
+        // No verdict (no branch/worktree on this probe): state untouched, no wake.
+        let (reason, seen) = base_wake(None, 7, BaseSync::BehindClean);
+        assert!(reason.is_none());
+        assert_eq!(seen, BaseSync::BehindClean);
     }
 }

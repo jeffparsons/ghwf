@@ -334,15 +334,37 @@ pub fn conflict_notice(base: &str, number: u64) -> String {
     )
 }
 
+/// The block shown above the phase body when the base has moved on cleanly but
+/// auto-merge is off, so the branch is left behind. Prompts Claude to weigh the
+/// new commits against its plan and integrate them. Like [`conflict_notice`], it
+/// leads the banner but is never posted to a thread, and clears itself once the
+/// branch is up to date.
+pub fn base_behind_notice(base: &str, number: u64) -> String {
+    format!(
+        "ℹ️ `origin/{base}` has moved on\n\n\
+         New commits have landed on the base branch since the branch for issue \
+         #{number} diverged. Before continuing:\n\n\
+         1. Review what changed: `git log HEAD..origin/{base}` (add `-p` for diffs).\n\
+         2. Decide whether any of it affects your plan or implementation — a \
+         refactor to follow, work that supersedes yours, a new helper to reuse — \
+         and adjust if so.\n\
+         3. Bring the branch up to date (`git merge origin/{base}`, or rebase) and \
+         push (the PR updates automatically).\n\n\
+         Then carry on below."
+    )
+}
+
 /// The block shown above the phase body when ghwf has just auto-merged the base
-/// into a behind-but-clean branch (the `auto_merge_base` config). Informational,
-/// like [`conflict_notice`]: it leads the banner but is never posted to a thread.
+/// into a behind-but-clean branch (the `auto_merge_base` config). Like
+/// [`conflict_notice`], it leads the banner but is never posted to a thread.
 pub fn base_merged_notice(base: &str, number: u64) -> String {
     format!(
         "ℹ️ Brought the branch up to date with `origin/{base}`\n\n\
          The base branch had moved on, so ghwf merged `origin/{base}` into the branch \
-         for issue #{number} (a clean merge) and pushed it. Nothing for you to do — \
-         carry on below."
+         for issue #{number} (a clean merge) and pushed it. Review the commits it \
+         brought in (`git log -p ORIG_HEAD..HEAD`, or inspect the merge commit) and \
+         check whether they change your plan or implementation; adjust if needed. \
+         Then carry on below."
     )
 }
 
@@ -863,11 +885,11 @@ fn blockquote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_comment_body, build_status_comment_body, conflict_notice, extract_marker,
-        hand_off_prompt, hidden_from_digest, pr_overview, render_phase_banner,
-        render_status_comment, render_status_stub, render_work_on, status_primary_is_pr,
-        strip_ghwf_marker, CommentView, DirectiveNote, Marker, NoteKind, OptionSubmission,
-        ReviewCommentView, Transition, Trigger,
+        base_behind_notice, base_merged_notice, build_comment_body, build_status_comment_body,
+        conflict_notice, extract_marker, hand_off_prompt, hidden_from_digest, pr_overview,
+        render_phase_banner, render_status_comment, render_status_stub, render_work_on,
+        status_primary_is_pr, strip_ghwf_marker, CommentView, DirectiveNote, Marker, NoteKind,
+        OptionSubmission, ReviewCommentView, Transition, Trigger,
     };
     use crate::models::{Comment, Head, Issue, PullRequest, ReviewComment, User};
     use crate::state::{Directive, Phase, PrOutcome};
@@ -878,6 +900,28 @@ mod tests {
         assert!(notice.contains("origin/main"));
         assert!(notice.contains("git merge origin/main"));
         assert!(notice.contains("#45"));
+    }
+
+    #[test]
+    fn base_behind_notice_prompts_review_and_integrate() {
+        let notice = base_behind_notice("main", 45);
+        assert!(notice.contains("origin/main"));
+        assert!(notice.contains("#45"));
+        // Names the review step and the integrate step.
+        assert!(notice.contains("git log HEAD..origin/main"));
+        assert!(notice.contains("git merge origin/main"));
+        assert!(notice.contains("plan or implementation"));
+    }
+
+    #[test]
+    fn base_merged_notice_prompts_review_of_merged_commits() {
+        let notice = base_merged_notice("main", 45);
+        assert!(notice.contains("origin/main"));
+        assert!(notice.contains("#45"));
+        // Confirms the merge but now also prompts a review of what came in.
+        assert!(notice.contains("merged"));
+        assert!(notice.contains("ORIG_HEAD..HEAD"));
+        assert!(notice.contains("plan or implementation"));
     }
 
     fn pr(body: Option<&str>, draft: bool) -> PullRequest {

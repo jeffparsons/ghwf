@@ -400,11 +400,12 @@ pub struct WaitState {
     // implement phase. Absent when no PR exists (or for old state files).
     #[serde(default)]
     pub pr_draft: Option<bool>,
-    // Whether `wait`'s last conflict probe saw the branch conflicting with its
-    // base. Tracks the clean->conflict edge across `wait` invocations so a fresh
-    // conflict wakes the session once, not every cycle. Off for old state files.
+    // The branch's sync state against its base as of `wait`'s last probe. Tracks
+    // the edge across `wait` invocations so a fresh advance (clean or
+    // conflicting) wakes the session once, not every cycle; `work-on` seeds it
+    // from the verdict it surfaced. Defaults to up-to-date for old state files.
     #[serde(default)]
-    pub conflict_seen: bool,
+    pub last_base_sync: crate::implement::BaseSync,
 }
 
 /// A comment whose 👍 reactions `wait` polls, with the reaction ids already
@@ -1342,7 +1343,7 @@ mod tests {
         )
         .unwrap();
         assert!(wait.reaction_watches.is_empty());
-        assert!(!wait.conflict_seen);
+        assert_eq!(wait.last_base_sync, crate::implement::BaseSync::UpToDate);
     }
 
     #[test]
@@ -1364,7 +1365,7 @@ mod tests {
                 .into(),
                 options_watches: [("issue".to_string(), OptionsWatch { comment_id: 11 })].into(),
                 pr_draft: Some(true),
-                conflict_seen: true,
+                last_base_sync: crate::implement::BaseSync::Conflict,
             }),
             last_posted: Some(PostedRef {
                 id: 7,
@@ -1379,7 +1380,7 @@ mod tests {
         assert_eq!(wait.comments.get(&1).map(String::as_str), Some("h1"));
         assert_eq!(wait.etags.get("issue").map(String::as_str), Some("W/\"x\""));
         assert_eq!(wait.pr_draft, Some(true));
-        assert!(wait.conflict_seen);
+        assert_eq!(wait.last_base_sync, crate::implement::BaseSync::Conflict);
         let watch = wait.reaction_watches.get("issue").unwrap();
         assert_eq!(watch.comment_id, 9);
         assert!(watch.plus_one_ids.contains(&100));
