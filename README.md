@@ -357,7 +357,11 @@ interactively for other layouts. To discover the options without leaving the
 terminal, `ghwf config ls` lists them (drill into a table with, e.g., `ghwf
 config ls labels`), `ghwf config info <key>` prints one option's full docs, and
 `ghwf config example` writes a fully-filled, annotated `ghwf.toml` to stdout.
-The annotated example below shows what it manages:
+Two commands create the GitHub labels ghwf uses: `ghwf config state-labels`
+(workflow status labels; `ghwf config labels` is a kept alias) and `ghwf config
+priority-labels` (the configured `priority_labels`). Both are idempotent, so
+they double as the way to upsert the labels onto an existing repo or a fresh
+clone. The annotated example below shows what it manages:
 
 ```toml
 # Path to the main git repo (omit or "." if the config sits at the repo root).
@@ -376,8 +380,10 @@ worktrees_dir = "worktrees"
 # `ghwf next` only discovers issues in the configured repo.
 issue_repos = ["StileEducation/documentation", { repo = "StileEducation/wiki", branch_prefix = "wiki" }]
 # Labels marking an issue as urgent, most urgent first (optional; used by
-# `ghwf next`).
-priority_labels = ["urgent", "soon"]
+# `ghwf next`). `ghwf config init` suggests these and offers to create them on
+# GitHub; `ghwf config priority-labels` creates them later (recognised names get
+# a sensible colour, others one derived from the name).
+priority_labels = ["high-priority", "medium-priority"]
 # When true, `ghwf next` only considers issues already assigned to you, ignoring
 # unassigned ones (optional; default false). Suits teams that allocate work by
 # discussion or a manager rather than picking off the list.

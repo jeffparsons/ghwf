@@ -216,7 +216,11 @@ fn render_example() -> String {
     insert(
         &mut doc,
         "priority_labels",
-        toml_edit::value(["urgent", "soon"].into_iter().collect::<toml_edit::Array>()),
+        toml_edit::value(
+            ["high-priority", "medium-priority"]
+                .into_iter()
+                .collect::<toml_edit::Array>(),
+        ),
     );
     insert(
         &mut doc,

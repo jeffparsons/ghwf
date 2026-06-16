@@ -31,7 +31,7 @@ pub struct Config {
     /// bodies. Defaults to `pull-request.md` next to the config.
     pub pr_instructions: Option<PathBuf>,
     /// Workflow status labels, mirrored onto the issue and PR as the workflow
-    /// advances. Absent means the feature is off; `ghwf config labels`
+    /// advances. Absent means the feature is off; `ghwf config state-labels`
     /// bootstraps the section.
     pub labels: Option<LabelsConfig>,
     /// Permission mode passed to launched Claude sessions as
